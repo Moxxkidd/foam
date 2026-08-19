@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 测试与缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 运行时产物:engagement 目录(含工具原始输出/loot/索引库)永不入库
+engagements/
+*.local.scope
+.env
+
+# 系统垃圾
+.DS_Store
