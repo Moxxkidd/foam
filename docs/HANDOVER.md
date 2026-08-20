@@ -13,12 +13,22 @@
   说明)+ 哈希链审计(`guard/audit.py`:append-only JSONL,`verify`
   全链重算,LLM 内容只记哈希与 token 数)。绕过面清单与误判案例见
   `docs/dev-logs/WP-02.md`。
+- 2026-08-20:**WP-01 关闭**——exec 层(`tools/bash.py`:run_command /
+  read_output / list_jobs / kill_job,进程组强杀防孤儿,timeout 默认
+  放宽到 1800s、显式 null 不限时,list_jobs 带超时剩余秒数)+ 智能输出
+  层(`tools/output.py`:合流 + stdout/stderr 分流三文件、三个流式
+  sha256 全量落盘,head+tail 截断视图,字节级分页,ring buffer 有界
+  ——100MB 实测 Python 峰值 0.80MB)。工具 schema 为 provider 中立
+  `{name, description, parameters}` 纯 dict(`TOOL_SCHEMAS` +
+  `BashTool.dispatch`):WP-03 负责翻译、WP-04 直接注册、WP-06 同构。
+  设计取舍与踩坑见 `docs/dev-logs/WP-01.md`。
 
 ## 下一 WP
 
-**WP-01(exec 层 + 智能输出层)**,规格:`docs/work-packages/WP-01.md`。
-无依赖,可直接开工。WP-03 亦无依赖。注意:本工作区可能有 WP-01/WP-03
-的并行进行(未跟踪文件已出现);WP-04 须等 01/03 均关闭。
+**WP-04(agent 主环)只差 WP-03**:WP-01(exec)、WP-02(护栏/审计)
+均已关闭;WP-03(LLM 后端)无依赖,可开工(本工作区有其未跟踪文件,
+可能并行进行中)。WP-05(PTY,依赖 01)与 WP-06(状态层,依赖 01)
+亦已解锁,可开工。
 
 ## WP 依赖速查
 
@@ -46,3 +56,8 @@ WP-13(整合)依赖全部
 5. **护栏语义细节**(WP-02):URL 前缀与 CIDR 是「或」关系——要端口级细
    粒度,scope 里就不能有更宽的 CIDR;`*.example.com` 不匹配裸域;CIDR
    目标必须 `subnet_of` scope 网段。完整绕过面见 `docs/dev-logs/WP-02.md`。
+6. **裸 python 脚本要手动 `PYTHONPATH=src`**(陷阱 4 同源):pytest 靠
+   pyproject `pythonpath=["src"]` 免配置,但直接 `.venv/bin/python` 跑
+   临时脚本时 editable .pth 可能不生效。另:ruff ASYNC230/240 已对
+   `tests/**` 豁免(测试内小文件阻塞读是有意的),源码目录不豁免——
+   WP-05 复用 `tools/output.py` 时保持同步原子写,别在协程里加阻塞调用。

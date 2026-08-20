@@ -45,6 +45,9 @@ packages = ["src/kalicode"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# src 布局下让测试直接导入本包(WP-01 声明:共享 .venv 的 editable .pth
+# 在并发开发时不稳,见 docs/dev-logs/WP-01.md「踩坑」)。
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py312"
@@ -55,5 +58,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
 
 # pytest 代码不可能不用 assert(S101 误报),测试目录豁免;源码目录仍全量受检。
 # (WP-02 添加,见 docs/dev-logs/WP-02.md「对共享/非拥有文件的改动」)
+# 测试里的小文件阻塞读取是有意为之, trio/anyio Path 非依赖目标 → ASYNC230/240 豁免。
+# (WP-01 添加,见 docs/dev-logs/WP-01.md「对共享/非拥有文件的改动」)
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]
+"tests/**" = ["S101", "ASYNC230", "ASYNC240"]
