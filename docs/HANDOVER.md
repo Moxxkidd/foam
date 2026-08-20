@@ -30,6 +30,12 @@
   (`k3`,思考型,reasoning_content 本层 v1 不消费):参数合法 JSON 率
   100%,授权渗透 prompt 审核拦截 0/8,首事件延迟中位约 4.3s。Claude
   端凭据未提供未实测。详见 `docs/dev-logs/WP-03.md`。
+- 2026-08-20:**仓库历史重写**(非 WP 动作,与开发条目正交)——为让
+  GitHub 贡献正确归属,全部 commit 的作者/提交者统一重写为
+  `Moxxkidd <Moxxkidd@users.noreply.github.com>`,5 个 commit 哈希全部
+  变更(重写前后逐对校验 tree 字节一致,内容零变化);旧哈希在仓库跟踪
+  文件中无任何引用,无需替换。本地单一工作区、无其他克隆,无连带影响。
+  此后新 commit 均带正确身份,无需再做此类重写。
 
 ## 下一 WP
 
