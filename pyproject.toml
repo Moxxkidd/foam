@@ -52,3 +52,8 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+
+# pytest 代码不可能不用 assert(S101 误报),测试目录豁免;源码目录仍全量受检。
+# (WP-02 添加,见 docs/dev-logs/WP-02.md「对共享/非拥有文件的改动」)
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
