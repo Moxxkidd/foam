@@ -54,18 +54,33 @@
   会话上限默认 8 按未关闭计,进程组 SIGKILL 回收孤儿,`aclose()` 供
   WP-04 kill switch)。msfconsole/ssh 两项环境门控 skip 待补测,见
   `docs/dev-logs/WP-05.md`。
+- 2026-08-21:**WP-04 关闭**——agent 主环(`agent/loop.py`:消息状态机
+  user→assistant(tool_call)→tool 结果直至 finish;可追加 ToolRegistry
+  (未知工具名/非法参数回 error dict 让模型自我纠正);每条 run_command
+  先过 scope 护栏,拒绝连同纠正说明回消息流;两阶段 context 压缩(先旧
+  tool 结果→占位含落盘路径+sha256,再旧对话,system/ENGAGEMENT.md/
+  objective/最近窗口永不压缩);插话 turn 边界注入、pause/resume、kill
+  立即 cancel 当前 turn 并杀全部活动 job;消化 K3 实测:幻觉执行动作
+  声明纠正(预算 2 次)、MalformedToolCall 空参重建帧+坏 JSON 回灌
+  (连续 3 次熔断)、首事件超时默认 30s;新增审计 kind:run_started/
+  run_finished/loop_correction/llm_retry/context_compressed)。
+  `agent/prompts.py`:授权声明(scope 规则原文+加载时间)、方法论骨架、
+  红线、工具地图注入点,快照测试逐字锁定、零品牌名。`cli.py` 初版:
+  `kalicode run` headless(退出码 0/130/1/2,Ctrl-C 两次语义)。
+  本会话无 LLM 凭据,真实模型 e2e 未跑(见日志「踩坑 5」)。接线点与
+  已知限制见 `docs/dev-logs/WP-04.md`。
 
 ## 下一 WP
 
-**WP-04(agent 主环)依赖已全部就绪**:WP-01(exec)、WP-02(护栏/
-审计)、WP-03(LLM 后端)均已 closed,可开工——注意 WP-03 实测发现
-K3 会偶发「声称完成却不发 tool_call」(幻觉执行),loop 侧需校验。
-本工作区可能有 WP-04 的并行在飞文件(agent/prompts.py 等)。
-WP-07(parse,依赖 06)亦已解锁,可开工。
-**WP-12(e2e 场景二)的 WP-05 依赖已就绪**,但 WP-05 的 msfconsole 验收
-项在 macOS 被门控 skip——WP-12 开工前先在 Kali 补跑
-`tests/test_session.py::test_msfconsole_full_flow` 并把结果补记进
-`docs/dev-logs/WP-05.md`。
+**WP-08(工具地图)、WP-09(TUI)已随 WP-04 关闭解锁;WP-10(CLI 闭环)
+依赖(02/04/06)亦全部就绪**。WP-10 接线要点(详见 WP-04 日志「留给
+后续 WP」):① cli 建目录换 WP-06 `Engagement.create`(布局已与现状
+一致:根下 ENGAGEMENT.md、outputs/、audit.jsonl);② loop 的
+ENGAGEMENT.md 读写占位换 `state/files.py` 接口;③ WP-05 会话工具与
+WP-06 状态工具经 `ToolRegistry.register_module` 直接挂(两者与 WP-01
+schema 同构);④ kill 清理面扩到会话层 `aclose()`(当前只杀 BashTool
+jobs)。WP-07(parse,依赖 06)仍解锁待认领。
+**WP-12 开工前**先在 Kali 补跑 WP-05 的 msfconsole 门控测试(见上条)。
 
 ## WP 依赖速查
 
@@ -114,3 +129,11 @@ WP-13(整合)依赖全部
    「自然退出」要靠 closing 旗标区分——收割协程先醒,直接标 exited 会
    把被杀的会话标错。另:async 等待循环里 `event.clear()` 必须先于读
    数据,否则丢唤醒傻等到超时。
+10. **护栏测试里的引号坑**(WP-04):`echo "recon 127.0.0.1"` 经 shlex
+    分词后 `recon 127.0.0.1` 是**一个词元**,护栏正确地提取不到目标——
+    写护栏相关用例先想词元边界,目标要裸写(`echo recon 127.0.0.1`)。
+11. **压缩/预算测试先算后写**(WP-04):`estimate_tokens` 是字符数/4;
+    keep_recent 默认 6 条会把小对话几乎全保护(无可压对象导致假失败)——
+    构造超限用例时显式传小窗口,并按总字符数/4 精确定预算,别拍脑袋。
+    另:ruff E501 对字符串内长行同样生效,长快照文本拆拼接串(noqa 在
+    字符串里会变成内容,无效)。

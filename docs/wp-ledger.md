@@ -5,7 +5,7 @@
 | WP-01 | exec 层 + 智能输出层 | `tools/bash.py`、`tools/output.py` | 无 | closed | 2026-08-20 | docs/dev-logs/WP-01.md |
 | WP-02 | scope 护栏 v0 + 哈希链审计 | `guard/` | 无 | closed | 2026-08-20 | docs/dev-logs/WP-02.md |
 | WP-03 | LLM 后端(兼容层 + Claude) | `agent/backends/` | 无 | closed | 2026-08-20 | docs/dev-logs/WP-03.md |
-| WP-04 | agent 主环 | `agent/loop.py`、`agent/prompts.py`、`cli.py` 初版 | 01/02/03 | pending | — | — |
+| WP-04 | agent 主环 | `agent/loop.py`、`agent/prompts.py`、`cli.py` 初版 | 01/02/03 | closed | 2026-08-21 | docs/dev-logs/WP-04.md |
 | WP-05 | 持久 PTY 会话层(含 msfconsole) | `tools/session.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-05.md |
 | WP-06 | 状态层(文件仓 + SQLite 索引) | `state/`、`tools/state.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-06.md |
 | WP-07 | parse 增强库 | `tools/parse.py` | 06 | pending | — | — |
@@ -43,3 +43,11 @@
   ANSI 清洗只作用 LLM 视图、落盘原文;会话上限 + 进程组强杀孤儿回收);
   本 WP 测试 46 项全绿 + 2 项环境门控 skip(ssh localhost:本机 sshd 未
   运行;msfconsole:非 Kali,待 Kali 实测补跑),全仓 245 项全绿。
+- 2026-08-21 **WP-04 closed**:agent 主环(agent/loop.py:消息状态机 +
+  可追加 ToolRegistry + run_command 逐条过 scope 护栏 + 两阶段 context
+  压缩 + 插话/pause/kill 控制面;消化 K3 实测:幻觉执行纠正、
+  MalformedToolCall 回灌、首事件超时默认 30s;agent/prompts.py:授权
+  声明/方法论骨架/红线,工具地图注入点,全文快照无品牌名;cli.py
+  初版:headless run 子命令);本 WP 测试 32 项全绿,全仓 277 项全绿
+  (+2 项 WP-05 环境门控 skip);本会话无 LLM 凭据,真实模型 e2e 未跑
+  (fake 后端按 WP-03 实测事件形状合成),有凭据后用 `kalicode run` 补跑。
