@@ -36,13 +36,24 @@
   变更(重写前后逐对校验 tree 字节一致,内容零变化);旧哈希在仓库跟踪
   文件中无任何引用,无需替换。本地单一工作区、无其他克隆,无连带影响。
   此后新 commit 均带正确身份,无需再做此类重写。
+- 2026-08-21:**WP-06 关闭**——状态层(`state/files.py`:engagement
+  目录布局幂等创建/校验,`engagement.json` 记 scope 文件 sha256,
+  `ENGAGEMENT.md` 读写接口留 loop 每轮调用;`state/index.py`:SQLite
+  六表 upsert/关系查询/通用 query;`tools/state.py`:state_query /
+  state_add_note / state_add_loot 三工具,schema 与 WP-01 同构)。
+  **outputs/ 契约**:`Engagement.paths.outputs` 即 WP-01 输出层的
+  output_root,WP-04/WP-10 接线时传入 `BashTool(output_dir=...)`;
+  creds 对 LLM 默认掩码中段(完整值仅在落盘 index.sqlite,WP-10 经
+  索引层取)。详见 `docs/dev-logs/WP-06.md`。
 
 ## 下一 WP
 
 **WP-04(agent 主环)依赖已全部就绪**:WP-01(exec)、WP-02(护栏/
 审计)、WP-03(LLM 后端)均已 closed,可开工——注意 WP-03 实测发现
 K3 会偶发「声称完成却不发 tool_call」(幻觉执行),loop 侧需校验。
-WP-05(PTY,依赖 01)与 WP-06(状态层,依赖 01)亦已解锁,可开工。
+WP-05(PTY,依赖 01)亦已解锁。本工作区可能有 WP-04/WP-05 的并行
+在飞文件(agent/prompts.py、tools/session.py);WP-06 已关闭,
+**WP-07(parse,依赖 06)新解锁**,可开工。
 
 ## WP 依赖速查
 
@@ -80,3 +91,8 @@ WP-13(整合)依赖全部
    `chflags nohidden <pth>` 可修,但任何人重装 editable 会复发——别修
    了,直接用陷阱 6 的 `PYTHONPATH=src`。另:httpx 走 socks5 代理需
    `socksio`(本机 .venv 已装,环境工具非项目依赖)。
+8. **noqa 后不能跟括号说明文字**(WP-02/WP-06 各踩一次):`# noqa: Sxxx(理由)`
+   被 ruff 判非法指令,理由须写成上方独立注释。S105/S106 还会误伤**名字
+   含 secret 的变量/键名**(如 `secret_note` 键)——测试目录已豁免,源码
+   目录起名避开。SQL 白名单拼接(表名/列名常量化、值参数化)触 S608 时
+   用 noqa 并注明依据。

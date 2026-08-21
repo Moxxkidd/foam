@@ -7,7 +7,7 @@
 | WP-03 | LLM 后端(兼容层 + Claude) | `agent/backends/` | 无 | closed | 2026-08-20 | docs/dev-logs/WP-03.md |
 | WP-04 | agent 主环 | `agent/loop.py`、`agent/prompts.py`、`cli.py` 初版 | 01/02/03 | pending | — | — |
 | WP-05 | 持久 PTY 会话层(含 msfconsole) | `tools/session.py` | 01 | pending | — | — |
-| WP-06 | 状态层(文件仓 + SQLite 索引) | `state/`、`tools/state.py` | 01 | pending | — | — |
+| WP-06 | 状态层(文件仓 + SQLite 索引) | `state/`、`tools/state.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-06.md |
 | WP-07 | parse 增强库 | `tools/parse.py` | 06 | pending | — | — |
 | WP-08 | 工具地图(全库盘点注入 prompt) | `agent/toolmap.py` | 04 | pending | — | — |
 | WP-09 | TUI(迎宾屏 → 主界面) | `tui/` | 04 | pending | — | — |
@@ -32,3 +32,8 @@
   本 WP 测试 31 项全绿,全仓 170 项全绿。Kimi K3 实测:tool 参数合法
   JSON 率 100%(15/15),触发率 15/16(A4 一次幻觉执行),渗透类授权
   prompt 审核拦截 0/8;Claude 及其余后端无凭据未实测(如实记录)。
+- 2026-08-21 **WP-06 closed**:状态层(state/files.py engagement 目录布局
+  幂等创建/校验、engagement.json 记 scope sha256、ENGAGEMENT.md 读写接口;
+  state/index.py SQLite 六表 upsert/关系查询;tools/state.py 三工具与
+  WP-01 schema 同构,creds 对 LLM 默认掩码中段有专项测试);本 WP 测试
+  29 项全绿,全仓 245 项全绿(含 WP-04/WP-05 在飞文件,未动未入库)。
