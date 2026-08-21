@@ -45,15 +45,27 @@
   output_root,WP-04/WP-10 接线时传入 `BashTool(output_dir=...)`;
   creds 对 LLM 默认掩码中段(完整值仅在落盘 index.sqlite,WP-10 经
   索引层取)。详见 `docs/dev-logs/WP-06.md`。
+- 2026-08-21:**WP-05 关闭**——持久 PTY 会话层(`tools/session.py`:
+  session_open/send/read/close/list,复用 WP-01 输出层 `split=False`
+  全量落盘 + 流式 sha256,分流字段固定 None;pty 显式取 ctty,ssh
+  `/dev/tty` 密码提示可达;提示识别正则库(msf6/meterpreter/password/
+  ssh yes-no/sqlmap Y-n)命中返回结构化 `waiting_for_input` 事件,尾部
+  锚定 + offset 去重防误报/重复;ANSI 清洗只作用 LLM 视图,落盘原文;
+  会话上限默认 8 按未关闭计,进程组 SIGKILL 回收孤儿,`aclose()` 供
+  WP-04 kill switch)。msfconsole/ssh 两项环境门控 skip 待补测,见
+  `docs/dev-logs/WP-05.md`。
 
 ## 下一 WP
 
 **WP-04(agent 主环)依赖已全部就绪**:WP-01(exec)、WP-02(护栏/
 审计)、WP-03(LLM 后端)均已 closed,可开工——注意 WP-03 实测发现
 K3 会偶发「声称完成却不发 tool_call」(幻觉执行),loop 侧需校验。
-WP-05(PTY,依赖 01)亦已解锁。本工作区可能有 WP-04/WP-05 的并行
-在飞文件(agent/prompts.py、tools/session.py);WP-06 已关闭,
-**WP-07(parse,依赖 06)新解锁**,可开工。
+本工作区可能有 WP-04 的并行在飞文件(agent/prompts.py 等)。
+WP-07(parse,依赖 06)亦已解锁,可开工。
+**WP-12(e2e 场景二)的 WP-05 依赖已就绪**,但 WP-05 的 msfconsole 验收
+项在 macOS 被门控 skip——WP-12 开工前先在 Kali 补跑
+`tests/test_session.py::test_msfconsole_full_flow` 并把结果补记进
+`docs/dev-logs/WP-05.md`。
 
 ## WP 依赖速查
 
@@ -96,3 +108,9 @@ WP-13(整合)依赖全部
    含 secret 的变量/键名**(如 `secret_note` 键)——测试目录已豁免,源码
    目录起名避开。SQL 白名单拼接(表名/列名常量化、值参数化)触 S608 时
    用 noqa 并注明依据。
+9. **PTY 三坑**(WP-05):① 子进程光 setsid 不够,要 `ioctl(0, TIOCSCTTY)`
+   拿控制终端,否则 ssh 读 `/dev/tty` 拿不到密码提示;② PTY EOF 在
+   Linux 报 EIO、macOS 报空读,两种都要按 EOF 处理;③ 「被杀」与
+   「自然退出」要靠 closing 旗标区分——收割协程先醒,直接标 exited 会
+   把被杀的会话标错。另:async 等待循环里 `event.clear()` 必须先于读
+   数据,否则丢唤醒傻等到超时。

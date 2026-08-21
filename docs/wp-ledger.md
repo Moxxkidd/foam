@@ -6,7 +6,7 @@
 | WP-02 | scope 护栏 v0 + 哈希链审计 | `guard/` | 无 | closed | 2026-08-20 | docs/dev-logs/WP-02.md |
 | WP-03 | LLM 后端(兼容层 + Claude) | `agent/backends/` | 无 | closed | 2026-08-20 | docs/dev-logs/WP-03.md |
 | WP-04 | agent 主环 | `agent/loop.py`、`agent/prompts.py`、`cli.py` 初版 | 01/02/03 | pending | — | — |
-| WP-05 | 持久 PTY 会话层(含 msfconsole) | `tools/session.py` | 01 | pending | — | — |
+| WP-05 | 持久 PTY 会话层(含 msfconsole) | `tools/session.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-05.md |
 | WP-06 | 状态层(文件仓 + SQLite 索引) | `state/`、`tools/state.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-06.md |
 | WP-07 | parse 增强库 | `tools/parse.py` | 06 | pending | — | — |
 | WP-08 | 工具地图(全库盘点注入 prompt) | `agent/toolmap.py` | 04 | pending | — | — |
@@ -37,3 +37,9 @@
   state/index.py SQLite 六表 upsert/关系查询;tools/state.py 三工具与
   WP-01 schema 同构,creds 对 LLM 默认掩码中段有专项测试);本 WP 测试
   29 项全绿,全仓 245 项全绿(含 WP-04/WP-05 在飞文件,未动未入库)。
+- 2026-08-21 **WP-05 closed**:持久 PTY 会话层(tools/session.py:
+  session_open/send/read/close/list,复用 WP-01 输出层 split=False 全量
+  落盘 + sha256;提示识别正则库命中返回结构化 waiting_for_input 事件;
+  ANSI 清洗只作用 LLM 视图、落盘原文;会话上限 + 进程组强杀孤儿回收);
+  本 WP 测试 46 项全绿 + 2 项环境门控 skip(ssh localhost:本机 sshd 未
+  运行;msfconsole:非 Kali,待 Kali 实测补跑),全仓 245 项全绿。
