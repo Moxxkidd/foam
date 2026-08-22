@@ -89,22 +89,37 @@
   310 绿 + 3 红,红全部位于 WP-07 在飞文件(test_parse.py,未入库),与
   本 WP 零耦合。Kali 实测覆盖率待补(WP-11 前,与 WP-05 msfconsole 同趟),
   详见 `docs/dev-logs/WP-08.md`。
+- 2026-08-22:**WP-10 关闭**——CLI 闭环(`cli.py` 重写:run 收尾接
+  WP-06 `Engagement.create` 幂等布局 + WP-05 会话/WP-06 状态工具经
+  `ToolRegistry.register_module` 全量注册 + WP-08 工具地图注入 prompt;
+  `resume` 同步 preflight 链验 + objective/scope 对账(sha256 或摘要,
+   drift 拒绝、显式 `--scope` 视为重新授权)+ legacy 目录幂等修复,
+  上下文=system 重建 + ENGAGEMENT.md + resume 简报(非全量回放);
+  `replay` verify 先行,断链报首个断点 seq、绝不回放不可信历史;
+  `report` 中文 markdown 全必备节,凭证全值直接读落盘 index.sqlite
+  (LLM 视图仍掩码),缺件逐级降级不炸;`tui` 占位,入口约定
+  `foam.tui.app:main(args)`)。`cli.py` 所有权 WP-04 → WP-10;loop.py
+  最小改动:ENGAGEMENT.md 读写走 `state/files.py` 接口、kill 清理面
+  扩到 `session.aclose()`。live 证据(真实 K3 + m1-demo 副本):replay
+  31 条链完整、篡改断点 seq=9 精确命中、legacy 报告降级、fresh run
+  6 轮 finished 且护栏真实拦截版本串误判一次(模型据纠正说明改写
+  通过)。详见 `docs/dev-logs/WP-10.md`(含并行窗口:WP-09 在飞
+  hunk 的隔离提交手法)。
 
 ## 下一 WP
 
-**WP-09(TUI)、WP-10(CLI 闭环)依赖全部就绪;WP-08 已随本节更新关闭**。
-WP-10 接线要点(详见 WP-04 日志「留给后续 WP」):① cli 建目录换 WP-06
-`Engagement.create`(布局已与现状一致:根下 ENGAGEMENT.md、outputs/、
-audit.jsonl);② loop 的 ENGAGEMENT.md 读写占位换 `state/files.py` 接口;
-③ WP-05 会话工具与 WP-06 状态工具经 `ToolRegistry.register_module` 直接
-挂(两者与 WP-01 schema 同构);④ kill 清理面扩到会话层 `aclose()`(当前
-只杀 BashTool jobs);⑤ 工具地图:`scan_tools()` → `render_tool_map(scan)`
-传 `build_system_prompt(tool_map_text=...)`,`render_startup_line(scan)`
-打启动日志一行(接口契约见 `docs/dev-logs/WP-08.md`「留给 WP-10」)。
-WP-07(parse,依赖 06)仍解锁待认领(WP-08 关闭时观察到其文件在飞,
-认领前先 `git status` 核实)。
-**Kali 实机补测(WP-11 前一次做完)**:WP-05 的 msfconsole 门控测试 +
-WP-08 的真实盘点覆盖率(两处 dev log 均已留位,结果分别回填)。
+**WP-10 已关闭;M2 门待 WP-09 关闭即触发**(TUI/CLI 演示,对照
+strix/Claude Code 观感;WP-10 的 live 证据已备,见
+`docs/dev-logs/WP-10.md`「live 验证」)。
+- **WP-09(TUI)在飞**:关闭时按约定接线 `foam tui` →
+  `foam.tui.app:main(args)`(cli 占位报错文案即约定原文);loop.py 工作
+  区里的 operator/phase/ReasoningDelta 增量是其提交面(WP-10 关闭时
+  已隔离未动,`git diff` 即全量)。
+- **WP-07(parse,依赖 06)仍解锁待认领**(WP-08/WP-10 关闭时均观察到
+  其文件在飞,认领前先 `git status` 核实);其产出将接上 prompts.py 里
+  「自动入库由解析层后续版本提供」的占位说明。
+- **Kali 实机补测(WP-11 前一次做完)**:WP-05 的 msfconsole 门控测试 +
+  WP-08 的真实盘点覆盖率(两处 dev log 均已留位,结果分别回填)。
 
 ## WP 依赖速查
 
@@ -179,3 +194,14 @@ WP-13(整合)依赖全部
     两行各挂,理由注释仍按陷阱 8 写在上方独立行。另:ruff format 不是
     本仓门槛(已入库文件过半与 format 规范有出入),对齐 `ruff check`
     即可,别跑 format 制造风格孤岛。
+13. **zsh 管道退出码**(WP-10 踩):`cmd | tail; echo $?` 打到的是 tail 的
+    退出码——zsh 用 `$pipestatus`(下标 1 起),bash 的 `${PIPESTATUS[0]}`
+    在 zsh 里是空串。抄录命令退出码当证据前先想这层;另 zsh 里裸
+    `echo ====` 会被当命令解析,分隔线用 `echo ---`。
+14. **篡改类测试先证「真篡改了」**(WP-10 踩):`str.replace` 目标串不
+    存在时是静默空操作——拿「篡改后 replay 报断点」当证据前,先断言
+    `not verify(...)`,否则可能录下一条链仍完整的假证据。
+15. **仓库已搬家**:`~/Documents/kali-code` → `~/Documents/foam`
+    (2026-08-21/22 之交,随定名 Foam)。旧路径是孤儿目录,内有并行
+    会话的零星写入,**勿在旧路径提交任何东西**;所有会话确认 pwd 再
+    动手。

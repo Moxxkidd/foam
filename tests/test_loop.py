@@ -34,7 +34,6 @@ from foam.agent.loop import (
     estimate_tokens,
 )
 from foam.agent.prompts import build_system_prompt
-from foam.cli import main as cli_main
 from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
 from foam.guard.scope import parse_scope, scope_payload
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
@@ -500,6 +499,84 @@ async def test_kill_cancels_turn_and_kills_background_jobs(tmp_path):
     assert verify(env.audit_path)
 
 
+async def test_kill_also_closes_sessions(tmp_path):
+    """WP-10 接线点④:kill 清理面扩到会话层 aclose(),并记进 kill_switch 审计。"""
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.aclose_calls = 0
+
+        async def aclose(self) -> None:
+            self.aclose_calls += 1
+
+    observer = _HookObserver()
+    started = asyncio.Event()
+    observer.action = started.set
+
+    async def hang(_messages):
+        await asyncio.Event().wait()  # 永不返回,直到 run 被 kill cancel
+        return []  # pragma: no cover
+
+    fake_session = FakeSession()
+    env = make_loop(
+        tmp_path,
+        [
+            [ToolCall("tc-1", "run_command", {"command": "echo x"}), Usage(1, 1)],
+            hang,
+        ],
+        loop_kw={"observer": observer, "session": fake_session},
+    )
+    observer.loop = env.loop
+
+    task = asyncio.create_task(env.loop.run("长跑"))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    for _ in range(1000):
+        if env.backend.chat_count >= 2:
+            break
+        await asyncio.sleep(0.005)
+
+    env.loop.kill("测试 kill 带会话")
+    result = await asyncio.wait_for(task, timeout=5)
+    assert result.status == "killed"
+    assert fake_session.aclose_calls == 1
+    kills = [r for r in audit_records(env) if r["kind"] == "kill_switch"]
+    assert kills[0]["payload"]["sessions_aclose"] == "ok"
+    assert verify(env.audit_path)
+
+
+async def test_engagement_interface_reads_wp06_file(tmp_path):
+    """WP-10 接线点②:传入 engagement 时 ENGAGEMENT.md 走 state/files.py 接口。
+
+    初始内容来自 WP-06 布局(create 写入),不是主环模板;模型经 run_command
+    追加后,下一轮仍经 read_progress 重新加载。
+    """
+    from foam.state.files import Engagement
+
+    engagement = Engagement.create(
+        base_dir=tmp_path, objective="记录发现", engagement_id="eng-x"
+    )
+    eng_root = tmp_path / "eng-x"
+    note_cmd = f'printf "\\n## 发现\\n- 端口 23 曾开放\\n" >> {eng_root}/ENGAGEMENT.md'
+    env = make_loop(
+        eng_root,
+        [
+            [ToolCall("tc-w", "run_command", {"command": note_cmd}), Usage(1, 1)],
+            [TextDelta("笔记更新完毕,无进一步动作。"), Usage(2, 2)],
+        ],
+        loop_kw={"engagement": engagement},
+    )
+    result = await env.loop.run("记录发现")
+    assert result.status == "finished"
+
+    text = (eng_root / "ENGAGEMENT.md").read_text(encoding="utf-8")
+    assert text.startswith("# Engagement eng-x")  # WP-06 初始文件,非主环模板
+    assert "端口 23 曾开放" in text  # 模型追加真实落盘
+    second_call = env.backend.calls[1]
+    assert second_call[1].role == "system"
+    assert "端口 23 曾开放" in second_call[1].content  # 每轮经接口重载
+    assert verify(env.audit_path)
+
+
 # ---------------------------------------------------------------------------
 # K3 实测消化:幻觉执行 / MalformedToolCall / 首事件超时
 # ---------------------------------------------------------------------------
@@ -764,90 +841,3 @@ async def test_registry_appendable(tmp_path):
     assert payload == {"ok": True, "echo": "hello"}
     names = [spec.name for spec in env.backend.tools_seen]
     assert "fake_state" in names and "run_command" in names
-
-
-# ---------------------------------------------------------------------------
-# CLI(headless run 子命令)
-# ---------------------------------------------------------------------------
-
-
-def test_cli_run_e2e(tmp_path, capsys):
-    scope_file = tmp_path / "lab.scope"
-    scope_file.write_text("127.0.0.0/8\n", encoding="utf-8")
-    workdir = tmp_path / "eng"
-    backend = FakeBackend(
-        [
-            [ToolCall("tc-1", "run_command", {"command": "echo cli-ok"}), Usage(1, 1)],
-            [TextDelta("命令回显正常,无进一步动作。"), Usage(2, 2)],
-        ]
-    )
-    rc = cli_main(
-        [
-            "run",
-            "--scope",
-            str(scope_file),
-            "--objective",
-            "冒烟测试",
-            "--workdir",
-            str(workdir),
-            "--backend",
-            "openai_compat",
-        ],
-        backend_factory=lambda _args: backend,
-    )
-    assert rc == 0
-    assert verify(workdir / "audit.jsonl")
-    kinds = [
-        json.loads(line)["kind"]
-        for line in (workdir / "audit.jsonl").read_text().splitlines()
-    ]
-    assert kinds[0] == "scope_loaded"
-    assert "run_started" in kinds and kinds[-1] == "run_finished"
-    assert (workdir / "ENGAGEMENT.md").exists()
-    assert len(list((workdir / "outputs").glob("*.log"))) == 1
-    out = capsys.readouterr().out
-    assert "[run finished]" in out
-
-
-def test_cli_missing_scope_file(tmp_path, capsys):
-    rc = cli_main(
-        [
-            "run",
-            "--scope",
-            str(tmp_path / "nope.scope"),
-            "--objective",
-            "x",
-            "--workdir",
-            str(tmp_path / "eng"),
-        ],
-        backend_factory=lambda _args: FakeBackend([]),
-    )
-    assert rc == 2
-    assert "scope 加载失败" in capsys.readouterr().err
-
-
-def test_cli_missing_api_key(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv("FOAM_ANTHROPIC_API_KEY", raising=False)
-    scope_file = tmp_path / "lab.scope"
-    scope_file.write_text("127.0.0.0/8\n", encoding="utf-8")
-    rc = cli_main(
-        [
-            "run",
-            "--scope",
-            str(scope_file),
-            "--objective",
-            "x",
-            "--workdir",
-            str(tmp_path / "eng"),
-            "--backend",
-            "claude",
-        ]
-    )
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "FOAM_ANTHROPIC_API_KEY" in err
-
-
-def test_cli_no_subcommand_prints_help(capsys):
-    assert cli_main([]) == 0
-    assert "run" in capsys.readouterr().out

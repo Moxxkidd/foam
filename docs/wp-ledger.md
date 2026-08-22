@@ -9,9 +9,9 @@
 | WP-05 | 持久 PTY 会话层(含 msfconsole) | `tools/session.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-05.md |
 | WP-06 | 状态层(文件仓 + SQLite 索引) | `state/`、`tools/state.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-06.md |
 | WP-07 | parse 增强库 | `tools/parse.py` | 06 | pending | — | — |
-| WP-08 | 工具地图(全库盘点注入 prompt) | `agent/toolmap.py` | 04 | pending | — | — |
+| WP-08 | 工具地图(全库盘点注入 prompt) | `agent/toolmap.py` | 04 | closed | 2026-08-22 | docs/dev-logs/WP-08.md |
 | WP-09 | TUI(迎宾屏 → 主界面) | `tui/` | 04 | pending | — | — |
-| WP-10 | CLI 闭环(run/resume/replay/report) | `cli.py`、`replay.py` | 02/04/06 | pending | — | — |
+| WP-10 | CLI 闭环(run/resume/replay/report) | `cli.py`、`replay.py` | 02/04/06 | closed | 2026-08-22 | docs/dev-logs/WP-10.md |
 | WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | pending | — | — |
 | WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | pending | — | — |
 | WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | pending | — | — |
@@ -72,3 +72,18 @@
   全保为地板;注入契约经真实 build_system_prompt 走通,零品牌名);本 WP
   测试 16 项全绿,全仓(减 WP-07 在飞文件 test_parse.py)293 项全绿;
   Kali 实测覆盖率待补(WP-11 前,见 docs/dev-logs/WP-08.md)。
+- 2026-08-22 **WP-10 closed**:CLI 闭环(cli.py 重写:run 收尾接 WP-06
+  Engagement.create + WP-05/WP-06 工具经 ToolRegistry 全量注册 + WP-08
+  工具地图注入;resume 同步 preflight——链验/objective 与 scope 对账
+  (sha256 或摘要)/legacy 布局幂等修复,上下文=system 重建 +
+  ENGAGEMENT.md + resume 简报,非全量回放;replay verify 先行,断链报
+  首个断点 seq 绝不回放;report 中文 markdown 全必备节,凭证全值直接
+  读落盘 index.sqlite,缺件逐级降级不炸;tui 占位约定
+  foam.tui.app:main(args);loop.py 最小改动:ENGAGEMENT.md 走
+  state/files.py 接口、kill 清理面扩到 session.aclose());本 WP 相关
+  4 测试文件 53 例全绿,暂存树(=提交快照,不含 WP-07/09 在飞文件)
+  独立验证 314 绿 + 2 环境门控 skip,ruff 全过;live 证据:m1-demo
+  副本 replay/resume/篡改断点 seq=9/legacy 报告 + 真实 K3 fresh run
+  6 轮 finished(护栏真实拦截版本串误判一次,模型据纠正说明改写通过)。
+  另:顺手更正 WP-08 台账表格行 pending→closed(其关闭记录条目本就
+  完整,表格行漏改,已在 WP-10 日志声明)。

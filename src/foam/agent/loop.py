@@ -59,7 +59,9 @@ from foam.guard.audit import (
     llm_meta,
 )
 from foam.guard.scope import GuardDecision, Scope, check_command
+from foam.state.files import Engagement
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
+from foam.tools.session import SessionTool
 
 # ---------------------------------------------------------------------------
 # 常量(设计依据见注释)
@@ -317,7 +319,12 @@ class AgentLoop:
     控制面(由 CLI 信号/TUI 调用,须与本对象同一事件循环):
     - ``interject(text)``:操作员插话,turn 边界注入为 user 消息;
     - ``pause()`` / ``resume()``:turn 边界停住/继续;
-    - ``kill(reason)``:立即 cancel 当前 turn,清理路径杀全部活动 job。
+    - ``kill(reason)``:立即 cancel 当前 turn,清理路径杀全部活动 job、
+      关闭全部 PTY 会话(传入 session 时)。
+
+    WP-10 接线:``engagement``(WP-06)提供时,ENGAGEMENT.md 读写走
+    ``state/files.py`` 接口(初始文件由 ``Engagement.create`` 保证);不传则
+    退回本类的文件读写占位(测试/独立使用)。
     """
 
     def __init__(
@@ -331,6 +338,8 @@ class AgentLoop:
         system_prompt: str,
         registry: ToolRegistry | None = None,
         observer: LoopObserver | None = None,
+        session: SessionTool | None = None,
+        engagement: Engagement | None = None,
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         keep_recent_messages: int = DEFAULT_KEEP_RECENT_MESSAGES,
         first_event_timeout: float = FIRST_EVENT_TIMEOUT_SECONDS,
@@ -352,6 +361,8 @@ class AgentLoop:
             registry.register_module(TOOL_SCHEMAS, bash.dispatch)
         self._registry = registry
         self._observer = observer or LoopObserver()
+        self._session = session
+        self._engagement = engagement
         self._max_context_tokens = max_context_tokens
         self._keep_recent = max(0, keep_recent_messages)
         self._first_event_timeout = first_event_timeout
@@ -740,7 +751,7 @@ class AgentLoop:
     # ---------- 收尾 ----------
 
     async def _finalize_killed(self) -> RunResult:
-        """kill 清理:杀全部活动 job(尽力而为)、写 kill_switch 审计。"""
+        """kill 清理:杀全部活动 job、关闭全部 PTY 会话(均尽力而为)、写审计。"""
         killed_jobs: list[dict[str, Any]] = []
         try:
             jobs = await self._bash.list_jobs()
@@ -757,10 +768,18 @@ class AgentLoop:
                 )
         except (BackendError, OSError, RuntimeError) as exc:
             killed_jobs.append({"error": f"清理异常: {exc!r}"})
-        self._audit.append(
-            KIND_KILL_SWITCH,
-            {"reason": self._kill_reason, "jobs": killed_jobs},
-        )
+        # WP-10 接线:kill 清理面扩到会话层(WP-05 aclose 幂等,重复调用安全)。
+        sessions_aclose: str | None = None
+        if self._session is not None:
+            try:
+                await self._session.aclose()
+                sessions_aclose = "ok"
+            except (OSError, RuntimeError) as exc:
+                sessions_aclose = f"清理异常: {exc!r}"
+        payload: dict[str, Any] = {"reason": self._kill_reason, "jobs": killed_jobs}
+        if sessions_aclose is not None:
+            payload["sessions_aclose"] = sessions_aclose
+        self._audit.append(KIND_KILL_SWITCH, payload)
         return RunResult(
             status="killed",
             summary="",
@@ -860,12 +879,16 @@ class AgentLoop:
             f"{path} (sha256:{sha}),需要时用 read_output 分页读取。"
         )
 
-    # ---------- ENGAGEMENT.md(WP-06 接管前的文件读写占位) ----------
+    # ---------- ENGAGEMENT.md(有 engagement 走 WP-06 接口,否则文件读写占位) ----------
 
     def _engagement_path(self) -> Path:
+        if self._engagement is not None:
+            return self._engagement.paths.progress_md
         return self._workdir / ENGAGEMENT_FILENAME
 
     def _ensure_engagement_file(self) -> None:
+        # 正常路径下初始文件由 Engagement.create(WP-06 布局)或本方法(无
+        # engagement 的独立使用)保证;运行中被误删时统一按模板重建兜底。
         path = self._engagement_path()
         if not path.exists():
             path.write_text(
@@ -877,6 +900,11 @@ class AgentLoop:
             )
 
     def _read_engagement(self) -> str:
+        if self._engagement is not None:
+            try:
+                return self._engagement.read_progress()
+            except FileNotFoundError:
+                pass  # 运行中被误删:落到下方模板重建(与占位路径一致)
         try:
             return self._engagement_path().read_text(encoding="utf-8")
         except FileNotFoundError:

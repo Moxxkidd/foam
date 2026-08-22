@@ -5,7 +5,7 @@
 需同步更新快照。
 
 system prompt 结构:角色 / 授权声明(scope 摘要 + 加载时间)/ 方法论骨架 /
-工具使用纪律(含发现入库占位、会话占位)/ 工具地图注入点(WP-08)/ 红线 /
+工具使用纪律(含会话与状态库工具说明)/ 工具地图注入点(WP-08)/ 红线 /
 工作路径。只给骨架不给 playbook(AGENTS.md §1:不限制 LLM 策略思路)。
 """
 
@@ -63,9 +63,11 @@ _SYSTEM_TEMPLATE = """\
 
 # 工具使用纪律
 
-- run_command 经 bash -c 执行,stdin 已关闭(非交互);交互式工具(msfconsole、
-  交互式登录后操作等)当前版本不可用——持久 PTY 会话将在后续版本提供(会话
-  占位)。需要交互的命令一律改用非交互写法(参数/脚本/expect 风格替代)。
+- run_command 经 bash -c 执行,stdin 已关闭(非交互)。需要交互的程序
+  (msfconsole、ssh 登录后操作、交互式确认提示等)用持久 PTY 会话:
+  session_open 开会话,session_send 发送输入,session_read 读取输出(命中
+  已知提示模式时返回 waiting_for_input 结构化事件),session_close 关闭,
+  session_list 列出全部会话。能非交互完成的任务仍优先非交互写法。
 - 大输出:用 output_budget_bytes 控制返回视图;完整输出始终全量落盘(带
   sha256),需要更多内容用 read_output 按字节分页读取,不要把整文件灌进上下文。
 - 长跑命令:background=true 拿 job_id,用 list_jobs 看状态与超时剩余秒数,
@@ -73,8 +75,11 @@ _SYSTEM_TEMPLATE = """\
 - exit_code 为负数表示进程被信号终止(如 -9 = SIGKILL:超时整组强杀、kill_job
   或系统 OOM killer;-15 = SIGTERM)。结合 status 字段判断结束原因。
 - 工作笔记:{engagement_path} 是你的持久记忆,内容每轮自动重新加载进上下文。
-  关键发现、凭证、进度、下一步计划,随时用 run_command 写文件更新它(状态入库
-  工具将在后续版本提供——发现入库占位)。
+  关键发现、凭证、进度、下一步计划,随时用 run_command 写文件更新它。状态库
+  工具:state_query 查询索引(hosts/ports/creds/vulns/loot/notes;creds 的
+  secret 默认掩码,完整值只在落盘索引库),state_add_note 记笔记,
+  state_add_loot 登记战利品文件(须先放进 engagement 目录再登记)。host/
+  端口/凭证/漏洞的自动入库由解析层后续版本提供——目前凭证仍须写进本文件。
 - engagement 目录:{workdir} ——工具原始输出在其 outputs/ 子目录。所有产物
   只写进 engagement 目录,不往别处写。
 
@@ -96,7 +101,7 @@ _ENGAGEMENT_TEMPLATE = """\
 - 目标(objective):{objective}
 
 > 本文件由主环每轮重新加载进上下文,是你的持久记忆。用 run_command 写本文件
-> 即可更新(状态入库工具由后续版本提供,届时本文件由状态层接管)。
+> 即可更新;状态库用 state_query 查询、state_add_note / state_add_loot 补充。
 
 ## 发现
 
@@ -165,7 +170,7 @@ def build_system_prompt(
 
 
 def render_engagement_template(*, objective: str, started_at: str) -> str:
-    """首次建 ENGAGEMENT.md 的模板内容(WP-06 接管前的文件读写占位)。"""
+    """ENGAGEMENT.md 的模板内容(无 WP-06 布局时的初始文件/误删重建兜底)。"""
     return _ENGAGEMENT_TEMPLATE.format(objective=objective, started_at=started_at)
 
 

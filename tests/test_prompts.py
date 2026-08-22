@@ -68,9 +68,11 @@ _EXPECTED_HEAD = """# 角色
 
 # 工具使用纪律
 
-- run_command 经 bash -c 执行,stdin 已关闭(非交互);交互式工具(msfconsole、
-  交互式登录后操作等)当前版本不可用——持久 PTY 会话将在后续版本提供(会话
-  占位)。需要交互的命令一律改用非交互写法(参数/脚本/expect 风格替代)。
+- run_command 经 bash -c 执行,stdin 已关闭(非交互)。需要交互的程序
+  (msfconsole、ssh 登录后操作、交互式确认提示等)用持久 PTY 会话:
+  session_open 开会话,session_send 发送输入,session_read 读取输出(命中
+  已知提示模式时返回 waiting_for_input 结构化事件),session_close 关闭,
+  session_list 列出全部会话。能非交互完成的任务仍优先非交互写法。
 - 大输出:用 output_budget_bytes 控制返回视图;完整输出始终全量落盘(带
   sha256),需要更多内容用 read_output 按字节分页读取,不要把整文件灌进上下文。
 - 长跑命令:background=true 拿 job_id,用 list_jobs 看状态与超时剩余秒数,
@@ -78,8 +80,11 @@ _EXPECTED_HEAD = """# 角色
 - exit_code 为负数表示进程被信号终止(如 -9 = SIGKILL:超时整组强杀、kill_job
   或系统 OOM killer;-15 = SIGTERM)。结合 status 字段判断结束原因。
 - 工作笔记:/eng/demo/ENGAGEMENT.md 是你的持久记忆,内容每轮自动重新加载进上下文。
-  关键发现、凭证、进度、下一步计划,随时用 run_command 写文件更新它(状态入库
-  工具将在后续版本提供——发现入库占位)。
+  关键发现、凭证、进度、下一步计划,随时用 run_command 写文件更新它。状态库
+  工具:state_query 查询索引(hosts/ports/creds/vulns/loot/notes;creds 的
+  secret 默认掩码,完整值只在落盘索引库),state_add_note 记笔记,
+  state_add_loot 登记战利品文件(须先放进 engagement 目录再登记)。host/
+  端口/凭证/漏洞的自动入库由解析层后续版本提供——目前凭证仍须写进本文件。
 - engagement 目录:/eng/demo ——工具原始输出在其 outputs/ 子目录。所有产物
   只写进 engagement 目录,不往别处写。
 
@@ -126,10 +131,12 @@ def test_system_prompt_contains_authorization_and_redlines():
     for stage in ("侦察", "枚举", "利用", "后利用", "报告"):
         assert stage in prompt
     assert "不是 playbook" in prompt
-    # 工具纪律:大输出分页、发现入库占位、会话占位、信号退出说明
+    # 工具纪律:大输出分页、会话与状态库工具说明(WP-10 接线后替换占位)、
+    # 信号退出说明
     assert "read_output 按字节分页读取" in prompt
-    assert "发现入库占位" in prompt
-    assert "会话" in prompt and "占位" in prompt
+    assert "session_open" in prompt and "waiting_for_input" in prompt
+    assert "state_query" in prompt and "state_add_loot" in prompt
+    assert "secret 默认掩码" in prompt
     assert "SIGKILL" in prompt
 
 
