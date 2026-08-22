@@ -66,11 +66,17 @@
   run_finished/loop_correction/llm_retry/context_compressed)。
   `agent/prompts.py`:授权声明(scope 规则原文+加载时间)、方法论骨架、
   红线、工具地图注入点,快照测试逐字锁定、零品牌名。`cli.py` 初版:
-  `kalicode run` headless(退出码 0/130/1/2,Ctrl-C 两次语义)。
+  `theform run` headless(退出码 0/130/1/2,Ctrl-C 两次语义)。
   真实模型 e2e 已于关闭后补跑(M1 门):K3 六轮跑通 lab 无害链,幻觉
   纠正真实触发一次(设计内误报,模型以真实核验响应),审计链 verify
   通过,零越界零泄漏——证据见 `docs/dev-logs/WP-04.md`「补跑」节。
   接线点与已知限制见同日志。
+- 2026-08-22:**正式定名 The Form**(非 WP 动作,与开发条目正交)——
+  暂用代号「Kali Code」退役。包名 `theform`、命令 `theform`/`tf`、
+  env `THEFORM_*`、家目录 `~/.theform.env`;`__app_name__ = "The Form"`。
+  品牌纪律价值获验证:全仓仅 pyproject/README/`__init__.py`/AGENTS.md
+  §0 四处需手工收口,其余为机械替换;测试快照零品牌串。WP-13 的改名
+  验证项已核销。
 
 ## 下一 WP
 
@@ -116,7 +122,7 @@ WP-13(整合)依赖全部
 3. **WP-03 实测任务**:Kimi K3 对渗透类 prompt 的审核容忍度与 JSON 纪律
    是实测项,被拦就如实记录,**不改写 prompt 去规避审核**。
 4. **共享 .venv 的 editable install 在并行开发时会被踩坏**(`import
-   kalicode` 突然失败):先查 `.venv` 状态,`PYTHONPATH=src` 可绕过;
+   theform` 突然失败):先查 `.venv` 状态,`PYTHONPATH=src` 可绕过;
    pyproject 已配 `pythonpath = ["src"]`(pytest)与 tests 目录 S101 豁免。
    另:本机 pip 走 SOCKS 代理但缺 `pysocks`,联网安装会失败。
 5. **护栏语义细节**(WP-02):URL 前缀与 CIDR 是「或」关系——要端口级细

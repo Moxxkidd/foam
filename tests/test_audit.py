@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-from kalicode.guard import audit
-from kalicode.guard.audit import AuditLog, llm_meta, verify
+from theform.guard import audit
+from theform.guard.audit import AuditLog, llm_meta, verify
 
 
 def _write_records(path, kinds_payloads):

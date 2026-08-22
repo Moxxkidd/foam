@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kalicode.agent.backends.base import (
+from theform.agent.backends.base import (
     BackendError,
     LLMBackend,
     MalformedToolCallError,
@@ -45,12 +45,12 @@ from kalicode.agent.backends.base import (
     ToolSpec,
     Usage,
 )
-from kalicode.agent.prompts import (
+from theform.agent.prompts import (
     ENGAGEMENT_FILENAME,
     build_engagement_message,
     render_engagement_template,
 )
-from kalicode.guard.audit import (
+from theform.guard.audit import (
     KIND_EXEC_RESULT_META,
     KIND_KILL_SWITCH,
     KIND_LLM_EXCHANGE_META,
@@ -58,8 +58,8 @@ from kalicode.guard.audit import (
     AuditLog,
     llm_meta,
 )
-from kalicode.guard.scope import GuardDecision, Scope, check_command
-from kalicode.tools.bash import TOOL_SCHEMAS, BashTool
+from theform.guard.scope import GuardDecision, Scope, check_command
+from theform.tools.bash import TOOL_SCHEMAS, BashTool
 
 # ---------------------------------------------------------------------------
 # 常量(设计依据见注释)

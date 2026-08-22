@@ -2,8 +2,8 @@
 
 import pytest
 
-from kalicode.guard import audit
-from kalicode.guard.scope import (
+from theform.guard import audit
+from theform.guard.scope import (
     check_command,
     extract_targets,
     load_scope,

@@ -15,8 +15,8 @@ import json
 import httpx
 import pytest
 
-from kalicode.agent.backends import claude, openai_compat
-from kalicode.agent.backends.base import (
+from theform.agent.backends import claude, openai_compat
+from theform.agent.backends.base import (
     AuthError,
     ConfigError,
     MalformedToolCallError,

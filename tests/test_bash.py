@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from kalicode.tools.bash import (
+from theform.tools.bash import (
     DEFAULT_OUTPUT_BUDGET_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
     TOOL_SCHEMAS,

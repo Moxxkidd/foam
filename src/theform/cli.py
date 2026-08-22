@@ -21,27 +21,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kalicode import __app_name__, __version__
-from kalicode.agent.backends.base import ConfigError, LLMBackend, ToolCall
-from kalicode.agent.backends.claude import DEFAULT_BASE_URL, ClaudeBackend
-from kalicode.agent.backends.openai_compat import OpenAICompatBackend
-from kalicode.agent.loop import (
+from theform import __app_name__, __version__
+from theform.agent.backends.base import ConfigError, LLMBackend, ToolCall
+from theform.agent.backends.claude import DEFAULT_BASE_URL, ClaudeBackend
+from theform.agent.backends.openai_compat import OpenAICompatBackend
+from theform.agent.loop import (
     AgentLoop,
     LoopObserver,
     RunResult,
 )
-from kalicode.agent.prompts import build_system_prompt
-from kalicode.guard.audit import KIND_SCOPE_LOADED, AuditLog
-from kalicode.guard.scope import GuardDecision, load_scope, scope_payload
-from kalicode.tools.bash import BashTool
+from theform.agent.prompts import build_system_prompt
+from theform.guard.audit import KIND_SCOPE_LOADED, AuditLog
+from theform.guard.scope import GuardDecision, load_scope, scope_payload
+from theform.tools.bash import BashTool
 
 #: openai_compat 的默认模型(WP-03 实测模型);可用 --model 或 env 覆盖。
 DEFAULT_OPENAI_MODEL = "k3"
 #: claude 后端的默认模型;可用 --model 或 env 覆盖。
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
 #: 非密钥配置环境变量(API key 由各后端自己的 env 读取,不经本文件)。
-ENV_BASE_URL = "KALICODE_LLM_BASE_URL"
-ENV_MODEL = "KALICODE_LLM_MODEL"
+ENV_BASE_URL = "THEFORM_LLM_BASE_URL"
+ENV_MODEL = "THEFORM_LLM_MODEL"
 
 #: 退出码
 EXIT_OK = 0
@@ -113,7 +113,7 @@ class _CliObserver(LoopObserver):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="kalicode",
+        prog="theform",
         description=f"{__app_name__} {__version__} —— 授权渗透测试 harness(headless)",
     )
     parser.add_argument(

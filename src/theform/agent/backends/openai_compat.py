@@ -2,7 +2,7 @@
 
 适配目标:Kimi K3(优先实测)、DeepSeek、GLM、OpenRouter 等一切实现了
 OpenAI chat/completions 流式协议的端点。`base_url`/`model` 由调用方配置,
-API key 只从环境变量读取(默认 `KALICODE_LLM_API_KEY`)。
+API key 只从环境变量读取(默认 `THEFORM_LLM_API_KEY`)。
 
 要点:
 - `stream_options.include_usage` 默认开启以取回流末 usage;个别端点不认
@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from kalicode.agent.backends.base import (
+from theform.agent.backends.base import (
     BackendEvent,
     LLMBackend,
     Message,
@@ -42,7 +42,7 @@ from kalicode.agent.backends.base import (
     require_env_key,
 )
 
-ENV_API_KEY = "KALICODE_LLM_API_KEY"
+ENV_API_KEY = "THEFORM_LLM_API_KEY"
 
 
 class _ToolCallBuilder:

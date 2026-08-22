@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from kalicode.tools.session import (
+from theform.tools.session import (
     PROMPT_PATTERNS,
     TOOL_SCHEMAS,
     SessionTool,

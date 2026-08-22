@@ -3,10 +3,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-# 注意:名称为暂用代号,任何阶段可整体改名——见 README「命名纪律」。
-name = "kalicode"
+# 正式定名 The Form(2026-08-22;显示名在 __app_name__,本文件为包名/命令名唯一来源)。
+name = "theform"
 version = "0.0.1"
-description = "A Kali-native LLM harness for authorized security testing (codename; subject to rename)"
+description = "The Form — a Kali-native LLM harness for authorized security testing"
 readme = "README.md"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
@@ -36,11 +36,11 @@ dev = [
 ]
 
 [project.scripts]
-kalicode = "kalicode.cli:main"
-kc = "kalicode.cli:main"
+theform = "theform.cli:main"
+tf = "theform.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/kalicode"]
+packages = ["src/theform"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

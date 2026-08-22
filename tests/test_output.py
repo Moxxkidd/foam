@@ -4,7 +4,7 @@ import hashlib
 
 import pytest
 
-from kalicode.tools.output import (
+from theform.tools.output import (
     OutputRecorder,
     RingBuffer,
     read_page,

@@ -16,7 +16,7 @@ import json
 from collections import deque
 from types import SimpleNamespace
 
-from kalicode.agent.backends.base import (
+from theform.agent.backends.base import (
     LLMBackend,
     MalformedToolCallError,
     Message,
@@ -25,7 +25,7 @@ from kalicode.agent.backends.base import (
     ToolCall,
     Usage,
 )
-from kalicode.agent.loop import (
+from theform.agent.loop import (
     FIRST_EVENT_TIMEOUT_SECONDS,
     AgentLoop,
     LoopObserver,
@@ -33,11 +33,11 @@ from kalicode.agent.loop import (
     describe_exit_code,
     estimate_tokens,
 )
-from kalicode.agent.prompts import build_system_prompt
-from kalicode.cli import main as cli_main
-from kalicode.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
-from kalicode.guard.scope import parse_scope, scope_payload
-from kalicode.tools.bash import TOOL_SCHEMAS, BashTool
+from theform.agent.prompts import build_system_prompt
+from theform.cli import main as cli_main
+from theform.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
+from theform.guard.scope import parse_scope, scope_payload
+from theform.tools.bash import TOOL_SCHEMAS, BashTool
 
 FIXED_TS = "2026-08-21T00:00:00+00:00"
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
@@ -827,7 +827,7 @@ def test_cli_missing_scope_file(tmp_path, capsys):
 
 
 def test_cli_missing_api_key(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv("KALICODE_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("THEFORM_ANTHROPIC_API_KEY", raising=False)
     scope_file = tmp_path / "lab.scope"
     scope_file.write_text("127.0.0.0/8\n", encoding="utf-8")
     rc = cli_main(
@@ -845,7 +845,7 @@ def test_cli_missing_api_key(tmp_path, monkeypatch, capsys):
     )
     assert rc == 2
     err = capsys.readouterr().err
-    assert "KALICODE_ANTHROPIC_API_KEY" in err
+    assert "THEFORM_ANTHROPIC_API_KEY" in err
 
 
 def test_cli_no_subcommand_prints_help(capsys):

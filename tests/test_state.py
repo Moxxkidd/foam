@@ -11,9 +11,9 @@ import sqlite3
 
 import pytest
 
-from kalicode.state.files import LAYOUT, Engagement
-from kalicode.state.index import Index
-from kalicode.tools.state import TOOL_SCHEMAS, StateTool, mask_secret
+from theform.state.files import LAYOUT, Engagement
+from theform.state.index import Index
+from theform.tools.state import TOOL_SCHEMAS, StateTool, mask_secret
 
 TEST_SECRET = "TESTONLY-s3cr3t-P@ssw0rd"  # 合成 fixture 凭据,见契约 §4
 
