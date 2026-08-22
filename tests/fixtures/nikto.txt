@@ -1,0 +1,18 @@
+- Nikto v2.5.0
+---------------------------------------------------------------------------
++ Target IP:          192.0.2.10
++ Target Hostname:    web.example.com
++ Target Port:        80
++ Start Time:         2026-08-22 10:00:00 (GMT8)
+---------------------------------------------------------------------------
++ Server: Apache/2.4.49 (Unix)
++ /: The anti-clickjacking X-Frame-Options header is not present.
++ /: The X-Content-Type-Options header is not set. This could allow the user agent to render the content of the site in a different fashion to the MIME type.
++ Apache/2.4.49 appears to be outdated (current is at least Apache/2.4.54).
++ /admin/: Admin directory found.
++ OSVDB-3092: /manual/: Web server manual found.
++ /config.php.bak: Backup file found. This may contain sensitive information.
++ 7915 requests: 0 error(s) and 6 item(s) reported on remote host
++ End Time:           2026-08-22 10:05:00 (GMT8) (174 seconds)
+---------------------------------------------------------------------------
++ 1 host(s) tested

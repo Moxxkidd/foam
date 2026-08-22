@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<!-- 合成 fixture(RFC 5737 文档段 + example.com),非真实扫描数据 -->
+<nmaprun scanner="nmap" args="nmap -sV -oX - 192.0.2.10-12" start="1755840000" startstr="Fri Aug 22 2026" version="7.94" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="1000" services="1-1000"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1755840001" endtime="1755840012">
+<status state="up" reason="arp-response" reason_ttl="64"/>
+<address addr="192.0.2.10" addrtype="ipv4"/>
+<hostnames>
+<hostname name="web.example.com" type="PTR"/>
+</hostnames>
+<ports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ssh" product="OpenSSH" version="8.9p1 Debian 5" extrainfo="protocol 2.0" method="probed" conf="10"/></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="http" product="Apache httpd" version="2.4.49" method="probed" conf="10"/></port>
+<port protocol="tcp" portid="445"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="microsoft-ds" product="Samba smbd" version="4.6.2" method="probed" conf="10"/></port>
+<port protocol="tcp" portid="3389"><state state="closed" reason="reset" reason_ttl="64"/><service name="ms-wbt-server" method="table" conf="3"/></port>
+</ports>
+<times srtt="1100" rttvar="5000" to="100000"/>
+</host>
+<host starttime="1755840001" endtime="1755840012">
+<status state="up" reason="arp-response" reason_ttl="64"/>
+<address addr="192.0.2.11" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+<ports>
+<port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="ssh" product="OpenSSH" version="7.4" method="probed" conf="10"/></port>
+</ports>
+</host>
+<host starttime="1755840001" endtime="1755840012">
+<status state="down" reason="no-response" reason_ttl="0"/>
+<address addr="192.0.2.12" addrtype="ipv4"/>
+</host>
+<runstats><finished time="1755840012" timestr="Fri Aug 22 2026" elapsed="11.23" summary="Nmap done at Fri Aug 22 2026; 3 IP addresses (2 hosts up) scanned in 11.23 seconds" exit="success"/><hosts up="2" down="1" total="3"/></runstats>
+</nmaprun>

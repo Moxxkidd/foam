@@ -118,6 +118,22 @@
   设计场景)。全仓 337 项在真 Linux 335 过 2 败(即上述两项已修根因),
   Linux PTY EIO-EOF 分支首次在真实 Linux 全绿。详见两份 dev log 的
   「补测」节。
+- 2026-08-22:**WP-07 关闭**——parse 增强库(`tools/parse.py`:
+  解析器注册表 + `maybe_parse` 单入口,**增强而非门槛**——注册表
+  未命中静默走 WP-01 通用路径(不记审计),解析失败记
+  `parse_fallback` debug 审计、绝不抛给 LLM;6 解析器:nmap
+  XML/grepable/文本三格式(grepable 补录无开放端口存活主机、
+  rDNS 回填主机名)、sqlmap(stdout 注入确认 + loot CSV 登记与
+  口令列提 cred)、gobuster/nikto(SSL Info 剔除、Target IP 定
+  facts 归属)/hydra(连字符模块)/whatweb;产出 summary ≤500B
+  (LLM 视图,secret 掩码)+ facts 经 `apply_facts` 喂 WP-06 索引
+  (cred 完整值落盘,报告可见)。ultracode 对抗审查确认 20 项全
+  修(38 项测试全绿);二次复审子代理配额 403 未启动,主会话
+  三项变异抽查补位。**接线点**(后续 WP):`maybe_parse(cmd,
+  output, output_path=…, audit=…)` 返回 None 走通用截断视图,
+  否则 summary 给 LLM、facts 经 `apply_facts(index, …)` 进索引——
+  挂上 loop 命令结果钩子即接上 prompts.py「自动入库由解析层
+  后续版本提供」的占位。详见 `docs/dev-logs/WP-07.md`。
 
 ## 下一 WP
 
@@ -128,9 +144,10 @@ strix/Claude Code 观感;WP-10 的 live 证据已备,见
   `foam.tui.app:main(args)`(cli 占位报错文案即约定原文);loop.py 工作
   区里的 operator/phase/ReasoningDelta 增量是其提交面(WP-10 关闭时
   已隔离未动,`git diff` 即全量)。
-- **WP-07(parse,依赖 06)仍解锁待认领**(WP-08/WP-10 关闭时均观察到
-  其文件在飞,认领前先 `git status` 核实);其产出将接上 prompts.py 里
-  「自动入库由解析层后续版本提供」的占位说明。
+- **WP-07 已随本节更新关闭**(parse 增强库):loop 接线点见「当前
+  状态」WP-07 条——后续 WP(WP-11/13)把 `maybe_parse` 挂进 loop
+  命令结果钩子,即接上 prompts.py「自动入库由解析层后续版本提供」
+  的占位说明。
 - **Kali 实机补测已于 2026-08-22 核销**(见「当前状态」末条);唯一遗留:
   修正版 `test_msfconsole_full_flow` 的 pytest 形态待下次 Kali 会话顺手
   复跑确认(WP-12 开工时一条命令;手工全链已走通)。
@@ -224,3 +241,9 @@ WP-13(整合)依赖全部
     把 `msf6 >` 改回 `msf >`——测试的 wait_pattern/断言别写死版本号
     字面量,用与 PROMPT_PATTERNS 同款的代兼容写法(`msf[56]?`);
     harness 正则库当年就写对了,是测试自己写死了。
+17. **解析器头行过滤前缀要带冒号精确化**(WP-07 踩):skip 前缀
+    `+ Target` 会把同族有效行 `+ Target Port:` 一并吞掉,端口解析
+    静默全丢——凡是「跳过某些头行」的过滤器,前缀精确到字段分隔符
+    (`+ Target IP:`),并给同族有效行配回归测试。另:`urlsplit()`
+    不校验端口,`SplitResult.port` 惰性求值、访问时才抛 ValueError,
+    try 块要包到属性访问而非只包构造。

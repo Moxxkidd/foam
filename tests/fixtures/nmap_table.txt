@@ -1,0 +1,21 @@
+Starting Nmap 7.94 ( https://nmap.org ) at 2026-08-22 10:00 CST
+Nmap scan report for web.example.com (192.0.2.10)
+Host is up (0.0011s latency).
+rDNS record for 192.0.2.10: web.example.com
+
+PORT     STATE SERVICE  VERSION
+22/tcp   open  ssh      OpenSSH 8.9p1 Debian 5 (protocol 2.0)
+80/tcp   open  http     Apache httpd 2.4.49 ((Unix))
+445/tcp  open  microsoft-ds Samba smbd 4.6.2
+3389/tcp closed ms-wbt-server
+MAC Address: 08:00:27:AA:BB:CC (Oracle VirtualBox virtual NIC)
+
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
+
+Nmap scan report for 192.0.2.11
+Host is up (0.00082s latency).
+
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 7.4 (protocol 2.0)
+
+Nmap done: 2 IP addresses (2 hosts up) scanned in 11.23 seconds

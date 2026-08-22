@@ -1,0 +1,21 @@
+WhatWeb report for http://192.0.2.10/
+Status    : 200 OK
+Title     : Test Lab Home
+IP        : 192.0.2.10
+Country   : RESERVED[ZZ]
+
+Summary   : Apache[2.4.49], HTML5, HTTPServer[Unix][Apache/2.4.49], PHP[7.4.3], X-Powered-By[PHP/7.4.3]
+
+Detected Plugins:
+[ Apache ]
+	The Apache HTTP Server Project is an effort to develop and
+	maintain an open-source HTTP server for modern operating
+	systems including UNIX and Windows NT.
+
+	Version      : 2.4.49 (from HTTP Server Header)
+[ PHP ]
+	PHP is a widely-used general-purpose scripting language.
+
+	Version      : 7.4.3
+
+http://192.0.2.10/ [200 OK] Apache[2.4.49], Country[RESERVED][ZZ], HTML5, HTTPServer[Unix][Apache/2.4.49], IP[192.0.2.10], PHP[7.4.3], Title[Test Lab Home], X-Powered-By[PHP/7.4.3]

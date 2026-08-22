@@ -8,7 +8,7 @@
 | WP-04 | agent 主环 | `agent/loop.py`、`agent/prompts.py`、`cli.py` 初版 | 01/02/03 | closed | 2026-08-21 | docs/dev-logs/WP-04.md |
 | WP-05 | 持久 PTY 会话层(含 msfconsole) | `tools/session.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-05.md |
 | WP-06 | 状态层(文件仓 + SQLite 索引) | `state/`、`tools/state.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-06.md |
-| WP-07 | parse 增强库 | `tools/parse.py` | 06 | pending | — | — |
+| WP-07 | parse 增强库 | `tools/parse.py` | 06 | closed | 2026-08-22 | docs/dev-logs/WP-07.md |
 | WP-08 | 工具地图(全库盘点注入 prompt) | `agent/toolmap.py` | 04 | closed | 2026-08-22 | docs/dev-logs/WP-08.md |
 | WP-09 | TUI(迎宾屏 → 主界面) | `tui/` | 04 | pending | — | — |
 | WP-10 | CLI 闭环(run/resume/replay/report) | `cli.py`、`replay.py` | 02/04/06 | closed | 2026-08-22 | docs/dev-logs/WP-10.md |
@@ -94,3 +94,16 @@
   96/137 = 70.1%(which 91 + dpkg 兜底 5),dpkg 断言平台化。全仓 337
   项 335 过 2 败(即上述两项),Linux PTY EIO-EOF 分支首次真 Linux 全绿。
   证据回填 docs/dev-logs/WP-05.md 与 WP-08.md 的「补测」节。
+- 2026-08-22 **WP-07 closed**:parse 增强库(tools/parse.py:解析器
+  注册表 + maybe_parse 单入口,「增强而非门槛」——注册表未命中
+  静默走通用路径不记审计,解析失败记 parse_fallback debug 审计,
+  绝不抛给 LLM;6 解析器:nmap XML/grepable/文本三格式(grepable
+  补录无开放端口存活主机、rDNS 回填)、sqlmap(stdout 注入确认 +
+  loot CSV 登记与口令列提 cred)、gobuster/nikto(SSL Info 剔除、
+  Target IP 定 facts 归属)/hydra(连字符模块)/whatweb;summary
+  ≤500B LLM 视图掩码,facts 经 apply_facts 喂 WP-06 索引,cred
+  完整值落盘)。ultracode 对抗审查 29 agent 确认 20 项全修并配
+  回归测试(21→38 项);二次复审子代理配额 403 未启动,主会话
+  三项变异抽查补位(如实记录,见日志)。本 WP 测试 38 项全绿,
+  全仓 375 项全绿 + 2 环境门控 skip(含 WP-09 在飞文件,未动未
+  入库),ruff 全过。
