@@ -7,6 +7,7 @@ extra_dirs 注入缝完成,不碰真机;真机只跑一致性冒烟(不断言具
 from __future__ import annotations
 
 import re
+import shutil
 
 import pytest
 
@@ -187,8 +188,9 @@ def test_scan_real_machine_smoke():
     assert len(scan.available) == counts["available"]
     assert len(scan.missing) == counts["missing"]
     assert all(s.available for s in scan.available)
-    # 本开发机无 dpkg → 明确降级标记;Kali 补测时此项应翻真(验收 4 待补)
-    assert scan.dpkg_available is False
+    # dpkg 标记与本机实况一致:macOS 开发机为 False,Kali 为 True
+    # (2026-08-22 Kali 补测:dpkg_available=True 实证,验收 4 已核销)
+    assert scan.dpkg_available == (shutil.which("dpkg") is not None)
 
 
 # ---------- 渲染与预算(验收 3) ----------

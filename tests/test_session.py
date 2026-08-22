@@ -469,21 +469,26 @@ _MSFCONSOLE = shutil.which("msfconsole")
     reason="非 Kali 环境无 msfconsole——验收 4 待 Kali 实测补跑(见开发日志)",
 )
 async def test_msfconsole_full_flow(tool):
+    # wait_pattern 必须两代提示符通吃:6.x 早期是 "msf6 > ",6.4.84 起实测改回
+    # "msf > "(Kali 补测落盘原文实证,见 docs/dev-logs/WP-05.md「补测」)。
+    # harness 的 PROMPT_PATTERNS 用 msf[56]? 本就兼容,是这里原先写死了旧字面量。
     s = await tool.session_open("msfconsole -q")  # -q 抑制启动 banner
     sid = s["session_id"]
-    r = await tool.session_read(sid, wait_pattern=r"msf6 >", timeout_seconds=180)
+    r = await tool.session_read(sid, wait_pattern=r"msf[56]? >", timeout_seconds=180)
     assert r["matched"] is True
     assert any(e["prompt_type"] == "msf6" for e in r["events"])
 
     await tool.session_send(sid, "use exploit/multi/handler")
     r = await tool.session_read(
-        sid, wait_pattern=r"msf6 exploit\(multi/handler\) >", timeout_seconds=60
+        sid, wait_pattern=r"msf[56]? exploit\(multi/handler\) >", timeout_seconds=60
     )
     assert r["matched"] is True
     assert any(e["prompt_type"] == "msf6" for e in r["events"])
 
     await tool.session_send(sid, "info")
-    r = await tool.session_read(sid, wait_pattern=r"msf6 exploit", timeout_seconds=60)
+    r = await tool.session_read(
+        sid, wait_pattern=r"msf[56]? exploit", timeout_seconds=60
+    )
     assert "Payload options" in r["new_output"] or "Name:" in r["new_output"]
 
     await tool.session_send(sid, "exit")
