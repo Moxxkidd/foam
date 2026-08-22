@@ -14,6 +14,10 @@
   cancel 当前 turn + 杀全部活动 job)。
 - 消化 WP-03 对 Kimi K3 的实测发现(见各常量注释):幻觉执行纠正、
   MalformedToolCallError 回灌、首事件超时默认 30s(K3 实测 max 16.24s)。
+- WP-09 增量(最小改动,声明见 docs/dev-logs/WP-09.md):ReasoningDelta
+  透传 + on_reasoning_delta/on_phase 钩子(思考审计只记哈希;阶段来自
+  ENGAGEMENT.md 字段,变化才触发);operator 呼号进 operator_interject
+  审计载荷。
 
 审计事件:复用 WP-02 的 scope_loaded/exec_request/exec_denied/exec_result_meta/
 llm_exchange_meta/operator_interject/kill_switch;本 WP 新增 run_started/
@@ -39,6 +43,7 @@ from foam.agent.backends.base import (
     LLMBackend,
     MalformedToolCallError,
     Message,
+    ReasoningDelta,
     RequestTimeoutError,
     TextDelta,
     ToolCall,
@@ -152,6 +157,29 @@ def describe_exit_code(exit_code: Any) -> str | None:
     return note
 
 
+#: 「当前阶段」字段(WP-09 Q3):ENGAGEMENT.md 由模型或 WP-06 update_progress
+#: 维护;兼容「- 最近阶段:X」(update_progress 写法)与「当前阶段:X」两种键名,
+#: 允许 markdown 列表/标题/加粗前缀。不维护工具→阶段推断表,不要求特殊标记。
+_PHASE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*|[-*+]\s*)?(?:\*\*)?(?:最近|当前)阶段(?:\*\*)?\s*[:：]\s*"
+    r"(?P<phase>.+?)\s*$",
+    re.MULTILINE,
+)
+
+
+def extract_phase(engagement_text: str) -> str | None:
+    """从 ENGAGEMENT.md 文本提取当前阶段字段;多次出现取最后(最新维护值)。
+
+    无该字段返回 None——阶段呈现完全由工作笔记驱动(WP-09 Q3)。
+    """
+    phase: str | None = None
+    for match in _PHASE_RE.finditer(engagement_text):
+        value = match.group("phase").strip().strip("*`").strip()
+        if value:
+            phase = value
+    return phase
+
+
 def estimate_tokens(messages: Sequence[Message]) -> int:
     """字符数/4 粗估(规格认可的中文偏乐观估计,压缩阈值据此留余量)。"""
     chars = 0
@@ -262,6 +290,14 @@ class LoopObserver:
     def on_text_delta(self, text: str) -> None:
         pass
 
+    def on_reasoning_delta(self, text: str) -> None:
+        """思考增量(WP-09):思考型模型的 reasoning_content;审计只记哈希。"""
+        pass
+
+    def on_phase(self, phase: str) -> None:
+        """当前阶段变化(WP-09):来自 ENGAGEMENT.md 阶段字段,变化时触发一次。"""
+        pass
+
     def on_tool_call(self, call: ToolCall) -> None:
         pass
 
@@ -340,6 +376,7 @@ class AgentLoop:
         observer: LoopObserver | None = None,
         session: SessionTool | None = None,
         engagement: Engagement | None = None,
+        operator: str = "",  # 操作员呼号(WP-09):进 operator_interject 审计载荷
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         keep_recent_messages: int = DEFAULT_KEEP_RECENT_MESSAGES,
         first_event_timeout: float = FIRST_EVENT_TIMEOUT_SECONDS,
@@ -363,6 +400,8 @@ class AgentLoop:
         self._observer = observer or LoopObserver()
         self._session = session
         self._engagement = engagement
+        self._operator = operator
+        self._last_phase: str | None = None  # 已对外通知的阶段(WP-09)
         self._max_context_tokens = max_context_tokens
         self._keep_recent = max(0, keep_recent_messages)
         self._first_event_timeout = first_event_timeout
@@ -486,6 +525,7 @@ class AgentLoop:
             if self._kill_requested:
                 return await self._finalize_killed()
             self._refresh_engagement_message()
+            self._maybe_emit_phase()
             self._maybe_compress()
             if self._max_rounds and self._rounds >= self._max_rounds:
                 return self._finalize_error(
@@ -606,6 +646,7 @@ class AgentLoop:
     async def _collect_round(self) -> _RoundOutcome:
         agen = self._backend.chat(self._messages, self._registry.specs())
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []  # WP-09:思考增量,审计只记哈希
         tool_calls: list[ToolCall] = []
         usage = Usage()
         malformed: MalformedToolCallError | None = None
@@ -630,6 +671,10 @@ class AgentLoop:
                 if isinstance(event, TextDelta):
                     text_parts.append(event.text)
                     self._observer.on_text_delta(event.text)
+                elif isinstance(event, ReasoningDelta):
+                    # WP-09:思考与正文分离,透传给 observer(TUI 折叠展示)
+                    reasoning_parts.append(event.text)
+                    self._observer.on_reasoning_delta(event.text)
                 elif isinstance(event, ToolCall):
                     tool_calls.append(event)
                 elif isinstance(event, Usage):
@@ -660,6 +705,13 @@ class AgentLoop:
             prompt_tokens=usage.input_tokens or None,
             response_tokens=usage.output_tokens or None,
         )
+        reasoning = "".join(reasoning_parts)
+        if reasoning:
+            # WP-09 定案 Q6:思考内容审计只记哈希与长度,不落原文
+            payload["reasoning_sha256"] = hashlib.sha256(
+                reasoning.encode("utf-8")
+            ).hexdigest()
+            payload["reasoning_chars"] = len(reasoning)
         self._audit.append(KIND_LLM_EXCHANGE_META, payload)
         return _RoundOutcome(
             text=text, tool_calls=tool_calls, usage=usage, malformed=malformed
@@ -733,7 +785,10 @@ class AgentLoop:
     def _drain_interjections(self) -> None:
         while self._interjections:
             text = self._interjections.popleft()
-            self._audit.append(KIND_OPERATOR_INTERJECT, {"text": text})
+            self._audit.append(
+                KIND_OPERATOR_INTERJECT,
+                {"text": text, "operator": self._operator},  # WP-09:呼号入载荷
+            )
             self._messages.append(Message.user(f"【操作员插话】{text}"))
 
     async def _pause_if_requested(self) -> None:
@@ -917,6 +972,17 @@ class AgentLoop:
             self._messages[1] = Message.system(
                 build_engagement_message(self._read_engagement())
             )
+
+    def _maybe_emit_phase(self) -> None:
+        """WP-09 Q3:提取工作笔记「当前阶段」字段,变化时经 observer 通知。
+
+        读取源与 _refresh_engagement_message 一致(占位/WP-06 接口两态兼容);
+        只在变化(含首次出现)时触发,字段消失不回退已通知的阶段。
+        """
+        phase = extract_phase(self._read_engagement())
+        if phase and phase != self._last_phase:
+            self._last_phase = phase
+            self._observer.on_phase(phase)
 
     # ---------- 小工具 ----------
 

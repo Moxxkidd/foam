@@ -1,0 +1,215 @@
+/* WP-09 深色主题(一套,不做主题系统)。
+   语义色(D4):阶段 cyan / 成功 green / 失败 red / 警告 yellow / 思考 gray /
+   插话 blue;所有状态同时有文字标记(不只靠颜色)。 */
+
+Screen {
+    background: #0d1117;
+    color: #e6edf3;
+}
+
+/* ---------- 迎宾屏 ---------- */
+
+WelcomeScreen {
+    align: center middle;
+}
+
+#gate {
+    width: auto;
+    height: auto;
+    align: center middle;
+}
+
+#wm-logo {
+    text-align: center;
+}
+
+#wm-version {
+    color: #8b949e;
+    text-align: center;
+}
+
+#wm-meta {
+    color: #e6edf3;
+    text-align: center;
+    margin-top: 1;
+}
+
+#wm-redline {
+    color: #d29922;
+    text-align: center;
+    margin: 1 0;
+}
+
+#callsign {
+    width: 42;
+    border: solid #30363d;
+    background: #161b22;
+}
+
+#callsign:focus {
+    border: solid #56d4dd;
+}
+
+#gate-error {
+    color: #f85149;
+    text-align: center;
+}
+
+#wm-hint {
+    color: #8b949e;
+    text-align: center;
+    margin-top: 1;
+}
+
+/* ---------- 顶栏 ---------- */
+
+#statusbar {
+    height: 1;
+    background: #161b22;
+    padding: 0 1;
+}
+
+#sb-left {
+    width: auto;
+    color: #8b949e;
+    text-style: bold;
+}
+
+#sb-center {
+    width: 1fr;
+    text-align: center;
+    color: #8b949e;
+}
+
+#sb-right {
+    width: auto;
+    text-align: right;
+}
+
+/* ---------- 主区/侧栏布局 ---------- */
+
+#main {
+    height: 1fr;
+}
+
+#narrative {
+    width: 1fr;
+    padding: 0 1;
+    scrollbar-color: #30363d;
+}
+
+#sidebar {
+    width: 30;
+    background: #161b22;
+    border-left: solid #30363d;
+    padding: 0 1;
+}
+
+.side-title {
+    color: #56d4dd;
+    text-style: bold;
+    margin-top: 1;
+}
+
+/* ---------- 叙述流块 ---------- */
+
+.stream {
+    color: #e6edf3;
+}
+
+.phase-divider {
+    color: #56d4dd;
+    text-style: bold;
+    text-align: center;
+    margin-top: 1;
+}
+
+.notice {
+    padding: 0 1;
+}
+
+.notice.ok { color: #3fb950; }
+.notice.fail { color: #f85149; }
+.notice.warn { color: #d29922; }
+.notice.dim { color: #8b949e; }
+.notice.phase { color: #56d4dd; }
+.notice.blue { color: #58a6ff; }
+
+/* ---------- 思考块(gray,默认折叠) ---------- */
+
+.thinking {
+    border-left: solid #30363d;
+    padding-left: 1;
+}
+
+.thinking:focus {
+    border-left: solid #8b949e;
+}
+
+.thinking-header {
+    color: #8b949e;
+}
+
+.thinking-body {
+    color: #8b949e;
+    text-style: italic;
+    background: #161b22;
+    padding: 0 1;
+}
+
+/* ---------- 工具卡(紧凑流) ---------- */
+
+.toolcard {
+    border-left: solid #30363d;
+    padding-left: 1;
+}
+
+.toolcard:focus {
+    border-left: solid #e6edf3;
+}
+
+.toolcard.running .card-header { color: #e6edf3; }
+.toolcard.ok .card-header { color: #3fb950; }
+.toolcard.fail .card-header { color: #f85149; }
+.toolcard.warn .card-header { color: #d29922; }
+.toolcard.denied .card-header {
+    color: #f85149;
+    text-style: bold;
+}
+
+.card-body {
+    color: #c9d1d9;
+    background: #161b22;
+    padding: 0 1;
+}
+
+/* ---------- kill 确认条 ---------- */
+
+#killbar {
+    background: #f85149;
+    color: #0d1117;
+    text-style: bold;
+    padding: 0 1;
+}
+
+/* ---------- 输入坞 ---------- */
+
+#inputdock {
+    height: auto;
+}
+
+#completion {
+    max-height: 7;
+    background: #161b22;
+    border: solid #30363d;
+    padding: 0 1;
+}
+
+#input {
+    border: solid #30363d;
+    background: #161b22;
+}
+
+#input:focus {
+    border: solid #56d4dd;
+}

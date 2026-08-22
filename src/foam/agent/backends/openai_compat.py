@@ -10,6 +10,8 @@ API key 只从环境变量读取(默认 `FOAM_LLM_API_KEY`)。
   字段为 0)。
 - assistant 历史消息的 `content` 在携带 tool_calls 时按 OpenAI 惯例置
   null;`extra_body` 可附加 provider 特有参数(如 temperature)。
+- 思考型模型(K3 等)流式 delta 里的 `reasoning_content` 解析为
+  ReasoningDelta 事件(WP-09);端点不上报该字段时行为与此前完全一致。
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from foam.agent.backends.base import (
     Message,
     ModerationError,
     RateLimitError,
+    ReasoningDelta,
     StreamError,
     TextDelta,
     ToolCall,
@@ -216,6 +219,10 @@ class OpenAICompatBackend(LLMBackend):
 
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    # 思考型模型(K3 等)的思考增量;与正文分离(WP-09)
+                    yield ReasoningDelta(text=str(reasoning))
                 content = delta.get("content")
                 if content:
                     yield TextDelta(text=str(content))

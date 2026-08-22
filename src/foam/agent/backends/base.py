@@ -2,11 +2,13 @@
 
 归一化约定(模型/provider 差异不泄漏到上层):
 
-- 事件流只有三种事件:`TextDelta`(文本增量)、`ToolCall`(完整工具调用帧,
-  `arguments` 必为合法 JSON 对象)、`Usage`(token 用量,流末恰好一次)。
-- 事件顺序:文本增量按到达顺序产出;工具调用在流结束时按 provider 顺序
-  一次性产出;`Usage` 最后。provider 的常规行为是先文本后工具调用,两种
-  后端在此常规路径上产出完全一致的事件序列。
+- 事件流有四种事件:`TextDelta`(正文增量)、`ToolCall`(完整工具调用帧,
+  `arguments` 必为合法 JSON 对象)、`Usage`(token 用量,流末恰好一次)、
+  `ReasoningDelta`(思考增量;仅思考型模型/provider 上报时出现,WP-09 新增,
+  Claude 端 v1 不发)。思考与正文分离,上层可折叠展示,审计只记哈希。
+- 事件顺序:思考/正文增量按到达顺序产出;工具调用在流结束时按 provider
+  顺序一次性产出;`Usage` 最后。provider 的常规行为是先(思考→)文本后
+  工具调用,两种后端在此常规路径上产出完全一致的事件序列。
 - 消息模型与 OpenAI/Anthropic 两家 API 对齐:system/user/assistant/tool
   四种角色,assistant 可携带 `tool_calls`,tool 角色携带 `tool_call_id`。
 
@@ -42,6 +44,17 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ReasoningDelta:
+    """思考增量事件(WP-09):思考型模型(如 K3)的 reasoning_content 片段。
+
+    与正文增量(TextDelta)严格分离:TUI 折叠展示,审计只记哈希不记内容
+    (loop 侧落实)。provider 不上报思考流时该事件永不出现。
+    """
+
+    text: str
+
+
+@dataclass(frozen=True)
 class ToolCall:
     """完整工具调用帧(流式片段已在后端内拼合、参数已解析为 dict)。
 
@@ -62,13 +75,15 @@ class Usage:
     output_tokens: int = 0
 
 
-BackendEvent = TextDelta | ToolCall | Usage
+BackendEvent = TextDelta | ReasoningDelta | ToolCall | Usage
 
 
 def event_to_dict(event: BackendEvent) -> dict[str, Any]:
     """事件的规范化可序列化形式(契约测试与将来 replay 的比对基准)。"""
     if isinstance(event, TextDelta):
         return {"type": "text_delta", "text": event.text}
+    if isinstance(event, ReasoningDelta):
+        return {"type": "reasoning_delta", "text": event.text}
     if isinstance(event, ToolCall):
         return {
             "type": "tool_call",

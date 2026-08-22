@@ -313,17 +313,22 @@ def test_resume_missing_dir(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# tui 占位 / --help(验收 4)
+# tui 入口(WP-09 已接线)/ --help(验收 4)
 # ---------------------------------------------------------------------------
 
 
-def test_tui_placeholder_clear_error(tmp_path, capsys):
+def test_tui_entry_wired_config_error(tmp_path, capsys, monkeypatch):
+    """WP-09 已提供 foam.tui.app:main;缺 base_url 时 rc 2 + 明确报错。
+
+    (原为 tui 占位报错测试;WP-09 关闭时按入口约定更新——monkeypatch 清
+    env 防开发机 FOAM_LLM_BASE_URL 泄漏导致真拉起 TUI。)
+    """
+    monkeypatch.delenv("FOAM_LLM_BASE_URL", raising=False)
     scope_file = write_scope(tmp_path)
     rc = cli_main(["tui", "--scope", str(scope_file)])
     assert rc == 2
     err = capsys.readouterr().err
-    assert "TUI 尚未就绪" in err
-    assert "foam.tui.app" in err  # 入口约定写进报错,WP-09 按此接线
+    assert "FOAM_LLM_BASE_URL" in err  # 到达 main():scope 通过、后端装配报错
 
 
 def test_help_all_subcommands(capsys):

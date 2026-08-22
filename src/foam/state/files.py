@@ -211,6 +211,17 @@ class Engagement:
             self._write_metadata(meta)
         return meta
 
+    def set_operator(self, operator: str) -> dict[str, Any]:
+        """记录操作员呼号(WP-09 迎宾屏收集,写 engagement.json;幂等覆盖)。
+
+        呼号同时进 loop 的 operator_interject 审计载荷(loop 构造参数),
+        本字段是 engagement 元数据侧的可对账落点。
+        """
+        meta = self.metadata()
+        meta["operator"] = operator
+        self._write_metadata(meta)
+        return meta
+
     # ---------- ENGAGEMENT.md(loop 每轮调用的读写接口) ----------
 
     @property

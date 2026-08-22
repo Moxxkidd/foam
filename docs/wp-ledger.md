@@ -10,7 +10,7 @@
 | WP-06 | 状态层(文件仓 + SQLite 索引) | `state/`、`tools/state.py` | 01 | closed | 2026-08-21 | docs/dev-logs/WP-06.md |
 | WP-07 | parse 增强库 | `tools/parse.py` | 06 | closed | 2026-08-22 | docs/dev-logs/WP-07.md |
 | WP-08 | 工具地图(全库盘点注入 prompt) | `agent/toolmap.py` | 04 | closed | 2026-08-22 | docs/dev-logs/WP-08.md |
-| WP-09 | TUI(迎宾屏 → 主界面) | `tui/` | 04 | pending | — | — |
+| WP-09 | TUI(迎宾屏 → 主界面) | `tui/` | 04 | closed | 2026-08-22 | docs/dev-logs/WP-09.md |
 | WP-10 | CLI 闭环(run/resume/replay/report) | `cli.py`、`replay.py` | 02/04/06 | closed | 2026-08-22 | docs/dev-logs/WP-10.md |
 | WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | pending | — | — |
 | WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | pending | — | — |
@@ -21,7 +21,7 @@
 | 门 | 标志 | 门口动作 | 状态 |
 |---|---|---|---|
 | M1 | WP-04 关闭 | 能力演示:真实 K3 后端 `foam run` 跑通 lab scope 内无害链(补 WP-04 未跑的真实模型 e2e);方向复评 | **已通过(2026-08-21)**:演示补跑通过(exit 0/finished/6 轮,审计链 verify 通过,幻觉纠正真实触发一次且模型以核验响应,零越界零泄漏,证据见 docs/dev-logs/WP-04.md「补跑」节)+ 方向复评**放行**;WP-08/09/10 开闸 |
-| M2 | WP-09+10 关闭 | TUI/CLI 可演示,对照 strix/Claude Code 观感打分;方向复评 | 待触发 |
+| M2 | WP-09+10 关闭 | TUI/CLI 可演示,对照 strix/Claude Code 观感打分;方向复评 | **已触发(2026-08-22 WP-09 关闭)**:观感自查证据 docs/dev-logs/WP-09.md 验收 3;门口动作(观感打分 + 方向复评)待执行 |
 | M3 | WP-11+12 关闭 | 双场景实弹;对照唯一目标复评:1+1≫2?全库工具真被用上? | 待触发 |
 | M4 | WP-13 关闭 | 发布评审 | 待触发 |
 
@@ -107,3 +107,18 @@
   三项变异抽查补位(如实记录,见日志)。本 WP 测试 38 项全绿,
   全仓 375 项全绿 + 2 环境门控 skip(含 WP-09 在飞文件,未动未
   入库),ruff 全过。
+- 2026-08-22 **WP-09 closed**:TUI(tui/:迎宾屏纯呼号门[空呼号拒入、
+  呼号三去向 engagement.json operator+审计载荷+~/.foam 预填] →
+  主界面[叙述流:思考块折叠/工具卡紧凑流+六类异常自展开/ENGAGEMENT.md
+  阶段分隔条;侧栏:阶段/索引/token 预算条/jobs/sessions;双通道控制面:
+  插话+七斜杠命令补全,Ctrl-X 二次确认 kill、Ctrl-P 暂停、F2 侧栏,
+  无 `!` shell 前缀];`foam tui` 经 foam.tui.app:main(args) 按 WP-10
+  约定接线,cli 零改动)。ReasoningDelta 链路(base/openai_compat/loop
+  三处声明增量)思考流上屏、审计只记 sha256+chars;loop 另增
+  extract_phase/on_phase 与 operator 入 operator_interject 载荷;
+  state/files.py 增 set_operator;tests/test_cli.py 占位测试按约定
+  更新 1 个(均见日志声明节)。观感自查(验收 3,对照 strix/Claude
+  Code 逐屏文字描述)入日志,M2 门核心证据。本 WP 23 项 + cli 接线
+  13 项全绿,全仓 375 项全绿 + 2 环境门控 skip(WP-07 已先关闭入库,
+  提交面即 git diff 全量),ruff 全过。textual 踩坑 11 条入日志
+  (switch_screen 自死锁/Widget.name/MessagePump._running 等)。

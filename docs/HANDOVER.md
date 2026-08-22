@@ -134,21 +134,28 @@
   否则 summary 给 LLM、facts 经 `apply_facts(index, …)` 进索引——
   挂上 loop 命令结果钩子即接上 prompts.py「自动入库由解析层
   后续版本提供」的占位。详见 `docs/dev-logs/WP-07.md`。
+- 2026-08-22:**WP-09 关闭**——TUI(`tui/`:迎宾屏纯呼号门[scope/backend
+  走 CLI 参数,空呼号拒入;呼号三去向:engagement.json `operator` +
+  operator_interject 审计载荷 + `~/.foam/config.json` 预填] → 主界面
+  [叙述流:折叠思考块/工具卡紧凑流+六类异常自展开/ENGAGEMENT.md 阶段
+  分隔条;侧栏:阶段/索引/token 预算条/jobs/sessions(<110 列自动隐藏,
+  F2 唤出);双通道控制面:插话 + `/` 七命令补全,Ctrl-X 二次确认 kill、
+  Ctrl-P 暂停;无 `!` shell 前缀])。`foam tui` 按 WP-10 约定接
+  `foam.tui.app:main(args)`,cli 零改动;思考流走新增的
+  ReasoningDelta 链路上屏,审计只记 sha256+chars。观感自查(对照
+  strix/Claude Code 逐屏文字描述)与 textual 踩坑 11 条见
+  `docs/dev-logs/WP-09.md`;**M2 门已触发,门口动作待执行**。
 
 ## 下一 WP
 
-**WP-10 已关闭;M2 门待 WP-09 关闭即触发**(TUI/CLI 演示,对照
-strix/Claude Code 观感;WP-10 的 live 证据已备,见
-`docs/dev-logs/WP-10.md`「live 验证」)。
-- **WP-09(TUI)在飞**:关闭时按约定接线 `foam tui` →
-  `foam.tui.app:main(args)`(cli 占位报错文案即约定原文);loop.py 工作
-  区里的 operator/phase/ReasoningDelta 增量是其提交面(WP-10 关闭时
-  已隔离未动,`git diff` 即全量)。
-- **WP-07 已随本节更新关闭**(parse 增强库):loop 接线点见「当前
-  状态」WP-07 条——后续 WP(WP-11/13)把 `maybe_parse` 挂进 loop
-  命令结果钩子,即接上 prompts.py「自动入库由解析层后续版本提供」
-  的占位说明。
-- **Kali 实机补测已于 2026-08-22 核销**(见「当前状态」末条);唯一遗留:
+**WP-07/08/09/10 全部关闭;M2 门已触发(2026-08-22),门口动作
+(观感打分 + 方向复评)待执行**——证据:WP-09 观感自查(验收 3,
+`docs/dev-logs/WP-09.md`)+ WP-10 live 证据(`docs/dev-logs/WP-10.md`
+「live 验证」)。M2 放行后 WP-11/12(双场景实弹)开闸。
+- **WP-07 接线点**:后续 WP(WP-11/13)把 `maybe_parse` 挂进 loop 命令
+  结果钩子,即接上 prompts.py「自动入库由解析层后续版本提供」的占位
+  说明;TUI 侧栏索引计数随入库链路有数。
+- **Kali 实机补测已于 2026-08-22 核销**(见「当前状态」);唯一遗留:
   修正版 `test_msfconsole_full_flow` 的 pytest 形态待下次 Kali 会话顺手
   复跑确认(WP-12 开工时一条命令;手工全链已走通)。
 
@@ -169,7 +176,7 @@ WP-13(整合)依赖全部
   finished/6 轮/审计链完整/幻觉纠正真实触发一次/零越界零泄漏,证据
   见 `docs/dev-logs/WP-04.md`「补跑」节)+ 方向复评结论:**放行**。
   WP-08/09/10 开闸(WP-07 此前已解锁)。
-- M2 = WP-09+10 关闭(TUI/CLI 演示,对照 strix/Claude Code 观感)。
+- M2 = WP-09+10 关闭(TUI/CLI 演示,对照 strix/Claude Code 观感)。**已触发(2026-08-22)**,门口动作待执行。
 - M3 = WP-11+12 关闭(双场景实弹,对照唯一目标:1+1≫2?)。
 - M4 = WP-13 关闭(发布评审)。
 门口产出三选一:放行 / 规格更正当 / 砍后续 WP;不开新坑;波次中途
@@ -247,3 +254,12 @@ WP-13(整合)依赖全部
     (`+ Target IP:`),并给同族有效行配回归测试。另:`urlsplit()`
     不校验端口,`SplitResult.port` 惰性求值、访问时才抛 ValueError,
     try 块要包到属性访问而非只包构造。
+18. **textual 组件命名先 grep 框架源码**(WP-09 连踩三处):`Widget.name`
+    是只读 property(赋值即 AttributeError);`MessagePump._running` 是
+    泵状态字段(自定义同名标志在挂载时被覆写,spinner 失控);
+    `Widget._render()` 是框架取 Visual 的内部方法(自定义同名「重绘」
+    返回 None 直接渲染崩溃)。另:`await switch_screen()` 写在被换下
+    屏幕自己的消息处理器里会自死锁(走 `app.run_worker`);焦点在
+    Input 时 ctrl+x/c/p 被 cut/copy/命令面板遮蔽,安全类快捷键必须
+    `priority=True`。完整 11 条见 `docs/dev-logs/WP-09.md`「textual
+    踩坑」。
