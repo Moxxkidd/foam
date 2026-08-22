@@ -64,3 +64,11 @@
   初版:headless run 子命令);本 WP 测试 32 项全绿,全仓 277 项全绿
   (+2 项 WP-05 环境门控 skip);本会话无 LLM 凭据,真实模型 e2e 未跑
   (fake 后端按 WP-03 实测事件形状合成),有凭据后用 `foam run` 补跑。
+- 2026-08-22 **WP-08 closed**:工具地图(agent/tool_catalog.py 静态目录
+  7 组 137 工具,name 即 which/路径/dpkg 探测键,死链从结构上不可能;
+  agent/toolmap.py 三级探测命中即停——which → 常见目录(含 /opt 目录形态)
+  → dpkg -l 包名兜底,缺失只标注附 apt 包名、绝不自动装;地图文本 ≤2KB
+  四级降级(3 全文 → 0 只余可用名),current_phase 组细节升一级,可用名
+  全保为地板;注入契约经真实 build_system_prompt 走通,零品牌名);本 WP
+  测试 16 项全绿,全仓(减 WP-07 在飞文件 test_parse.py)293 项全绿;
+  Kali 实测覆盖率待补(WP-11 前,见 docs/dev-logs/WP-08.md)。

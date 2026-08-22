@@ -78,18 +78,33 @@
   品牌纪律价值获验证:全仓仅 pyproject/README/`__init__.py`/AGENTS.md
   §0 四处需手工收口,其余为机械替换;测试快照零品牌串。WP-13 的改名
   验证项已核销。
+- 2026-08-22:**WP-08 关闭**——工具地图(`agent/tool_catalog.py`:静态
+  目录 7 组 137 工具,name 即 which/路径/dpkg 探测键,死链从结构上不可能;
+  `agent/toolmap.py`:which → 常见目录(含 /opt 目录形态)→ `dpkg -l`
+  包名兜底,三级探测命中即停,缺失只标注附 apt 包名、绝不自动装;地图
+  文本 ≤2KB 四级降级(3 全文 → 0 只余可用名),`current_phase` 组细节升
+  一级,可用名全保为地板;注入契约经真实 `build_system_prompt` 走通,零
+  品牌名)。cli 接线接口(scan_tools/render_tool_map/render_startup_line)
+  已备,接线本身属 WP-10(见下节⑤)。本 WP 测试 16 项全绿;关闭时全仓
+  310 绿 + 3 红,红全部位于 WP-07 在飞文件(test_parse.py,未入库),与
+  本 WP 零耦合。Kali 实测覆盖率待补(WP-11 前,与 WP-05 msfconsole 同趟),
+  详见 `docs/dev-logs/WP-08.md`。
 
 ## 下一 WP
 
-**WP-08(工具地图)、WP-09(TUI)已随 WP-04 关闭解锁;WP-10(CLI 闭环)
-依赖(02/04/06)亦全部就绪**。WP-10 接线要点(详见 WP-04 日志「留给
-后续 WP」):① cli 建目录换 WP-06 `Engagement.create`(布局已与现状
-一致:根下 ENGAGEMENT.md、outputs/、audit.jsonl);② loop 的
-ENGAGEMENT.md 读写占位换 `state/files.py` 接口;③ WP-05 会话工具与
-WP-06 状态工具经 `ToolRegistry.register_module` 直接挂(两者与 WP-01
-schema 同构);④ kill 清理面扩到会话层 `aclose()`(当前只杀 BashTool
-jobs)。WP-07(parse,依赖 06)仍解锁待认领。
-**WP-12 开工前**先在 Kali 补跑 WP-05 的 msfconsole 门控测试(见上条)。
+**WP-09(TUI)、WP-10(CLI 闭环)依赖全部就绪;WP-08 已随本节更新关闭**。
+WP-10 接线要点(详见 WP-04 日志「留给后续 WP」):① cli 建目录换 WP-06
+`Engagement.create`(布局已与现状一致:根下 ENGAGEMENT.md、outputs/、
+audit.jsonl);② loop 的 ENGAGEMENT.md 读写占位换 `state/files.py` 接口;
+③ WP-05 会话工具与 WP-06 状态工具经 `ToolRegistry.register_module` 直接
+挂(两者与 WP-01 schema 同构);④ kill 清理面扩到会话层 `aclose()`(当前
+只杀 BashTool jobs);⑤ 工具地图:`scan_tools()` → `render_tool_map(scan)`
+传 `build_system_prompt(tool_map_text=...)`,`render_startup_line(scan)`
+打启动日志一行(接口契约见 `docs/dev-logs/WP-08.md`「留给 WP-10」)。
+WP-07(parse,依赖 06)仍解锁待认领(WP-08 关闭时观察到其文件在飞,
+认领前先 `git status` 核实)。
+**Kali 实机补测(WP-11 前一次做完)**:WP-05 的 msfconsole 门控测试 +
+WP-08 的真实盘点覆盖率(两处 dev log 均已留位,结果分别回填)。
 
 ## WP 依赖速查
 
@@ -158,3 +173,9 @@ WP-13(整合)依赖全部
     构造超限用例时显式传小窗口,并按总字符数/4 精确定预算,别拍脑袋。
     另:ruff E501 对字符串内长行同样生效,长快照文本拆拼接串(noqa 在
     字符串里会变成内容,无效)。
+12. **noqa 要挂在诊断锚定行**(陷阱 8 变体,WP-08 踩):同一调用
+    `subprocess.run(["dpkg", "-l"], …)` 的 S603 锚在调用行、S607 锚在
+    参数列表行——合写 `# noqa: S603 S607` 在调用行盖不住 S607,须拆成
+    两行各挂,理由注释仍按陷阱 8 写在上方独立行。另:ruff format 不是
+    本仓门槛(已入库文件过半与 format 规范有出入),对齐 `ruff check`
+    即可,别跑 format 制造风格孤岛。
