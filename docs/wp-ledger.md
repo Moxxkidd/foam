@@ -87,3 +87,10 @@
   6 轮 finished(护栏真实拦截版本串误判一次,模型据纠正说明改写通过)。
   另:顺手更正 WP-08 台账表格行 pending→closed(其关闭记录条目本就
   完整,表格行漏改,已在 WP-10 日志声明)。
+- 2026-08-22 **Kali 实机补测核销**(非 WP 动作):WP-05 验收 3(ssh
+  localhost)真跑通过;验收 4(msfconsole)真跑——提示库无碍,测试
+  wait_pattern 写死 `msf6 >`(本机 6.4.84 已改回 `msf >`,落盘实证),
+  已修两代兼容并经 Kali 侧手工全链 4.4s 走通。WP-08 验收 4:覆盖率
+  96/137 = 70.1%(which 91 + dpkg 兜底 5),dpkg 断言平台化。全仓 337
+  项 335 过 2 败(即上述两项),Linux PTY EIO-EOF 分支首次真 Linux 全绿。
+  证据回填 docs/dev-logs/WP-05.md 与 WP-08.md 的「补测」节。
