@@ -106,7 +106,9 @@
   通过)。详见 `docs/dev-logs/WP-10.md`(含并行窗口:WP-09 在飞
   hunk 的隔离提交手法)。
 - 2026-08-22:**Kali 实机补测核销**(非 WP 动作,WP-05/WP-08 待补测项
-  同趟完成;Kali 侧 agent 执行,结果经转交回填)——WP-05:ssh localhost
+  同趟完成;Kali 侧 agent 执行,原始记录已入库
+  `docs/dev-logs/Kali-补测.md`;环境 Kali Rolling **arm64** / Python
+  3.13.7,组件比开发机新)——WP-05:ssh localhost
   真跑通过;msfconsole 真跑,提示识别库两代兼容无碍,是测试
   wait_pattern 写死旧字面量 `msf6 >`(本机 metasploit 6.4.84 已改回
   `msf >`,落盘原文实证),已修 `msf[56]?` 并经 Kali 侧手工全链 4.4s
