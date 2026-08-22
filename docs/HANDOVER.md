@@ -105,6 +105,17 @@
   6 轮 finished 且护栏真实拦截版本串误判一次(模型据纠正说明改写
   通过)。详见 `docs/dev-logs/WP-10.md`(含并行窗口:WP-09 在飞
   hunk 的隔离提交手法)。
+- 2026-08-22:**Kali 实机补测核销**(非 WP 动作,WP-05/WP-08 待补测项
+  同趟完成;Kali 侧 agent 执行,结果经转交回填)——WP-05:ssh localhost
+  真跑通过;msfconsole 真跑,提示识别库两代兼容无碍,是测试
+  wait_pattern 写死旧字面量 `msf6 >`(本机 metasploit 6.4.84 已改回
+  `msf >`,落盘原文实证),已修 `msf[56]?` 并经 Kali 侧手工全链 4.4s
+  走通(pytest 形态留下次 Kali 会话顺手复跑,WP-12 开工时做掉)。
+  WP-08:覆盖率 **96/137 = 70.1%**(which 91 + dpkg 兜底 5),dpkg 断言
+  改平台自适应;缺失 41 多为 Go 系新工具(apt 可装,正是缺失标注的
+  设计场景)。全仓 337 项在真 Linux 335 过 2 败(即上述两项已修根因),
+  Linux PTY EIO-EOF 分支首次在真实 Linux 全绿。详见两份 dev log 的
+  「补测」节。
 
 ## 下一 WP
 
@@ -118,8 +129,9 @@ strix/Claude Code 观感;WP-10 的 live 证据已备,见
 - **WP-07(parse,依赖 06)仍解锁待认领**(WP-08/WP-10 关闭时均观察到
   其文件在飞,认领前先 `git status` 核实);其产出将接上 prompts.py 里
   「自动入库由解析层后续版本提供」的占位说明。
-- **Kali 实机补测(WP-11 前一次做完)**:WP-05 的 msfconsole 门控测试 +
-  WP-08 的真实盘点覆盖率(两处 dev log 均已留位,结果分别回填)。
+- **Kali 实机补测已于 2026-08-22 核销**(见「当前状态」末条);唯一遗留:
+  修正版 `test_msfconsole_full_flow` 的 pytest 形态待下次 Kali 会话顺手
+  复跑确认(WP-12 开工时一条命令;手工全链已走通)。
 
 ## WP 依赖速查
 
@@ -204,4 +216,9 @@ WP-13(整合)依赖全部
 15. **仓库已搬家**:`~/Documents/kali-code` → `~/Documents/foam`
     (2026-08-21/22 之交,随定名 Foam)。旧路径是孤儿目录,内有并行
     会话的零星写入,**勿在旧路径提交任何东西**;所有会话确认 pwd 再
-    动手。
+    动手。(补记 2026-08-22:现 `kali-code` 已改为指向 `foam` 的符号
+    链接,旧路径落笔实际进活仓;唯一工作路径仍一律用 `foam`。)
+16. **交互工具提示符跨版本漂移**(WP-05 Kali 补测踩):metasploit 6.4.84
+    把 `msf6 >` 改回 `msf >`——测试的 wait_pattern/断言别写死版本号
+    字面量,用与 PROMPT_PATTERNS 同款的代兼容写法(`msf[56]?`);
+    harness 正则库当年就写对了,是测试自己写死了。
