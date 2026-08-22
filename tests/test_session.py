@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from theform.tools.session import (
+from foam.tools.session import (
     PROMPT_PATTERNS,
     TOOL_SCHEMAS,
     SessionTool,

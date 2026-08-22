@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from theform.state.index import (
+from foam.state.index import (
     DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
     QUERY_KINDS,
@@ -26,7 +26,7 @@ from theform.state.index import (
 )
 
 if TYPE_CHECKING:
-    from theform.state.files import Engagement
+    from foam.state.files import Engagement
 
 #: state_query 的 kind 取值(索引层六类 + 攻击面汇总)。
 QUERY_KIND_NAMES = sorted([*QUERY_KINDS, "attack_surface"])

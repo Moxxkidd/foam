@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from theform.guard.scope import Scope
+from foam.guard.scope import Scope
 
 #: 工作笔记文件名(engagement 目录根下);WP-06 接管状态层后仍以此文件为入口。
 ENGAGEMENT_FILENAME = "ENGAGEMENT.md"

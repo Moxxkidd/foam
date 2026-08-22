@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from theform.tools.bash import (
+from foam.tools.bash import (
     DEFAULT_OUTPUT_BUDGET_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
     TOOL_SCHEMAS,

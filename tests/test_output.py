@@ -4,7 +4,7 @@ import hashlib
 
 import pytest
 
-from theform.tools.output import (
+from foam.tools.output import (
     OutputRecorder,
     RingBuffer,
     read_page,

@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from theform.guard import audit as _audit_mod
+from foam.guard import audit as _audit_mod
 
 if TYPE_CHECKING:
-    from theform.guard.audit import AuditLog
+    from foam.guard.audit import AuditLog
 
 # 取目标值的 flag(值可以是 IP/主机名/URL,单段主机名也收)。
 TARGET_FLAGS = frozenset(

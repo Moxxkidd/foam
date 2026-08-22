@@ -5,8 +5,8 @@
 
 ## 0. 命名纪律
 
-项目正式定名 **The Form**(2026-08-22,此前为暂用代号「Kali Code」)。
-品牌字符串只允许出现在 `pyproject.toml` 与 `src/theform/__init__.py` 的
+项目正式定名 **Foam**(2026-08-22,此前为暂用代号「Kali Code」)。
+品牌字符串只允许出现在 `pyproject.toml` 与 `src/foam/__init__.py` 的
 `__app_name__` 常量;其余代码、注释、文档一律称「本项目」。写文档时禁止
 出现品牌名——此纪律在改名中已被验证价值(全仓仅 3 处许可位置需手工
 收口),定名后继续遵守,防止碎片化与未来的二次改名成本。
@@ -51,7 +51,7 @@
 
 - 本项目仅服务**明确授权**的目标;scope 护栏是产品底线,任何 WP 不得削弱
   护栏来让测试或演示通过。
-- 密钥只走环境变量(`THEFORM_LLM_API_KEY` 等);任何代码、日志、文档、
+- 密钥只走环境变量(`FOAM_LLM_API_KEY` 等);任何代码、日志、文档、
   测试、fixture 不得出现真实 key/token。
 - 测试 fixture 里的凭据必须是明显合成的(example.com / TESTONLY)。
 - engagement 运行时产物(工具原始输出、loot、索引库)永不入库

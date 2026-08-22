@@ -16,7 +16,7 @@ import json
 from collections import deque
 from types import SimpleNamespace
 
-from theform.agent.backends.base import (
+from foam.agent.backends.base import (
     LLMBackend,
     MalformedToolCallError,
     Message,
@@ -25,7 +25,7 @@ from theform.agent.backends.base import (
     ToolCall,
     Usage,
 )
-from theform.agent.loop import (
+from foam.agent.loop import (
     FIRST_EVENT_TIMEOUT_SECONDS,
     AgentLoop,
     LoopObserver,
@@ -33,11 +33,11 @@ from theform.agent.loop import (
     describe_exit_code,
     estimate_tokens,
 )
-from theform.agent.prompts import build_system_prompt
-from theform.cli import main as cli_main
-from theform.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
-from theform.guard.scope import parse_scope, scope_payload
-from theform.tools.bash import TOOL_SCHEMAS, BashTool
+from foam.agent.prompts import build_system_prompt
+from foam.cli import main as cli_main
+from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
+from foam.guard.scope import parse_scope, scope_payload
+from foam.tools.bash import TOOL_SCHEMAS, BashTool
 
 FIXED_TS = "2026-08-21T00:00:00+00:00"
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
@@ -827,7 +827,7 @@ def test_cli_missing_scope_file(tmp_path, capsys):
 
 
 def test_cli_missing_api_key(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv("THEFORM_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("FOAM_ANTHROPIC_API_KEY", raising=False)
     scope_file = tmp_path / "lab.scope"
     scope_file.write_text("127.0.0.0/8\n", encoding="utf-8")
     rc = cli_main(
@@ -845,7 +845,7 @@ def test_cli_missing_api_key(tmp_path, monkeypatch, capsys):
     )
     assert rc == 2
     err = capsys.readouterr().err
-    assert "THEFORM_ANTHROPIC_API_KEY" in err
+    assert "FOAM_ANTHROPIC_API_KEY" in err
 
 
 def test_cli_no_subcommand_prints_help(capsys):

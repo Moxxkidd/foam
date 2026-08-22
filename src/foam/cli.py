@@ -21,27 +21,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from theform import __app_name__, __version__
-from theform.agent.backends.base import ConfigError, LLMBackend, ToolCall
-from theform.agent.backends.claude import DEFAULT_BASE_URL, ClaudeBackend
-from theform.agent.backends.openai_compat import OpenAICompatBackend
-from theform.agent.loop import (
+from foam import __app_name__, __version__
+from foam.agent.backends.base import ConfigError, LLMBackend, ToolCall
+from foam.agent.backends.claude import DEFAULT_BASE_URL, ClaudeBackend
+from foam.agent.backends.openai_compat import OpenAICompatBackend
+from foam.agent.loop import (
     AgentLoop,
     LoopObserver,
     RunResult,
 )
-from theform.agent.prompts import build_system_prompt
-from theform.guard.audit import KIND_SCOPE_LOADED, AuditLog
-from theform.guard.scope import GuardDecision, load_scope, scope_payload
-from theform.tools.bash import BashTool
+from foam.agent.prompts import build_system_prompt
+from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog
+from foam.guard.scope import GuardDecision, load_scope, scope_payload
+from foam.tools.bash import BashTool
 
 #: openai_compat 的默认模型(WP-03 实测模型);可用 --model 或 env 覆盖。
 DEFAULT_OPENAI_MODEL = "k3"
 #: claude 后端的默认模型;可用 --model 或 env 覆盖。
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
 #: 非密钥配置环境变量(API key 由各后端自己的 env 读取,不经本文件)。
-ENV_BASE_URL = "THEFORM_LLM_BASE_URL"
-ENV_MODEL = "THEFORM_LLM_MODEL"
+ENV_BASE_URL = "FOAM_LLM_BASE_URL"
+ENV_MODEL = "FOAM_LLM_MODEL"
 
 #: 退出码
 EXIT_OK = 0
@@ -113,7 +113,7 @@ class _CliObserver(LoopObserver):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="theform",
+        prog="foam",
         description=f"{__app_name__} {__version__} —— 授权渗透测试 harness(headless)",
     )
     parser.add_argument(

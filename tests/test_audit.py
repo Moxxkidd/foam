@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-from theform.guard import audit
-from theform.guard.audit import AuditLog, llm_meta, verify
+from foam.guard import audit
+from foam.guard.audit import AuditLog, llm_meta, verify
 
 
 def _write_records(path, kinds_payloads):

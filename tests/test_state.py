@@ -11,9 +11,9 @@ import sqlite3
 
 import pytest
 
-from theform.state.files import LAYOUT, Engagement
-from theform.state.index import Index
-from theform.tools.state import TOOL_SCHEMAS, StateTool, mask_secret
+from foam.state.files import LAYOUT, Engagement
+from foam.state.index import Index
+from foam.tools.state import TOOL_SCHEMAS, StateTool, mask_secret
 
 TEST_SECRET = "TESTONLY-s3cr3t-P@ssw0rd"  # 合成 fixture 凭据,见契约 §4
 

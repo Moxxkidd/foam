@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 
-from theform.agent.backends.base import (
+from foam.agent.backends.base import (
     BackendEvent,
     LLMBackend,
     Message,
@@ -44,7 +44,7 @@ from theform.agent.backends.base import (
     require_env_key,
 )
 
-ENV_API_KEY = "THEFORM_ANTHROPIC_API_KEY"
+ENV_API_KEY = "FOAM_ANTHROPIC_API_KEY"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 DEFAULT_MAX_TOKENS = 8192

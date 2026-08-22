@@ -6,14 +6,14 @@ EXPECTED_SYSTEM_PROMPT 并在开发日志留痕。
 
 from __future__ import annotations
 
-from theform import __app_name__
-from theform.agent.prompts import (
+from foam import __app_name__
+from foam.agent.prompts import (
     TOOL_MAP_PLACEHOLDER,
     build_engagement_message,
     build_system_prompt,
     render_engagement_template,
 )
-from theform.guard.scope import parse_scope
+from foam.guard.scope import parse_scope
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n*.example.com\nhttp://127.0.0.1:3000/\n"
 FIXED = {

@@ -3,10 +3,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-# 正式定名 The Form(2026-08-22;显示名在 __app_name__,本文件为包名/命令名唯一来源)。
-name = "theform"
+# 正式定名 Foam(2026-08-22;显示名在 __app_name__,本文件为包名/命令名唯一来源)。
+name = "foam"
 version = "0.0.1"
-description = "The Form — a Kali-native LLM harness for authorized security testing"
+description = "Foam — a Kali-native LLM harness for authorized security testing"
 readme = "README.md"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
@@ -36,11 +36,11 @@ dev = [
 ]
 
 [project.scripts]
-theform = "theform.cli:main"
-tf = "theform.cli:main"
+foam = "foam.cli:main"
+fm = "foam.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/theform"]
+packages = ["src/foam"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

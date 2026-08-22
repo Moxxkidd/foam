@@ -15,8 +15,8 @@ import json
 import httpx
 import pytest
 
-from theform.agent.backends import claude, openai_compat
-from theform.agent.backends.base import (
+from foam.agent.backends import claude, openai_compat
+from foam.agent.backends.base import (
     AuthError,
     ConfigError,
     MalformedToolCallError,

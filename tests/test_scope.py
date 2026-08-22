@@ -2,8 +2,8 @@
 
 import pytest
 
-from theform.guard import audit
-from theform.guard.scope import (
+from foam.guard import audit
+from foam.guard.scope import (
     check_command,
     extract_targets,
     load_scope,
