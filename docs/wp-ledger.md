@@ -21,7 +21,7 @@
 | 门 | 标志 | 门口动作 | 状态 |
 |---|---|---|---|
 | M1 | WP-04 关闭 | 能力演示:真实 K3 后端 `foam run` 跑通 lab scope 内无害链(补 WP-04 未跑的真实模型 e2e);方向复评 | **已通过(2026-08-21)**:演示补跑通过(exit 0/finished/6 轮,审计链 verify 通过,幻觉纠正真实触发一次且模型以核验响应,零越界零泄漏,证据见 docs/dev-logs/WP-04.md「补跑」节)+ 方向复评**放行**;WP-08/09/10 开闸 |
-| M2 | WP-09+10 关闭 | TUI/CLI 可演示,对照 strix/Claude Code 观感打分;方向复评 | **已触发(2026-08-22 WP-09 关闭)**:观感自查证据 docs/dev-logs/WP-09.md 验收 3;门口动作(观感打分 + 方向复评)待执行 |
+| M2 | WP-09+10 关闭 | TUI/CLI 可演示,对照 strix/Claude Code 观感打分;方向复评 | **已触发(2026-08-22 WP-09 关闭)**:观感自查证据 docs/dev-logs/WP-09.md 验收 3;门口动作(观感打分 + 方向复评)待执行。**更正当:loop 常驻待命(2026-08-24 落地)**——终答后 idle 待命、插话唤醒续段(声明与验收见 docs/dev-logs/WP-09.md 更正当节) |
 | M3 | WP-11+12 关闭 | 双场景实弹;对照唯一目标复评:1+1≫2?全库工具真被用上? | 待触发 |
 | M4 | WP-13 关闭 | 发布评审 | 待触发 |
 
@@ -122,3 +122,15 @@
   13 项全绿,全仓 375 项全绿 + 2 环境门控 skip(WP-07 已先关闭入库,
   提交面即 git diff 全量),ruff 全过。textual 踩坑 11 条入日志
   (switch_screen 自死锁/Widget.name/MessagePump._running 等)。
+- 2026-08-24 **WP-09 更正当:loop 常驻待命(idle-wake 连续对话)**:
+  总指挥 M2 门口裁决否掉「终态后输入被丢弃」,TUI 须连续对话。动
+  两个已关闭 WP 的面,按纪律在 WP-09 日志更正当节声明影响面:
+  loop.py(WP-04)纯增量 8 hunk——构造参数 `wait_on_finish=False`
+  默认 headless 语义逐 bit 不变;为真时终答不返回,置 `idle` 待命
+  阻塞在既有插话队列,`interject()` 补 `_wake.set()` 唤醒续段;
+  rounds/token 累计延续,`max_rounds` 改按待命段计(新
+  `_segment_rounds`,唤醒清零);待命不写 run_finished,kill 走既有
+  清理面;tui/(本包)TUIConfig 默认 True、顶栏「待命」、placeholder
+  三态、终态提示去重(截图级观感修复);engagement.json objective
+  永远首条消息不变更。验收 1-3 新测试 3 项;WP-04 的 24 项测试零
+  改动通过;全仓 378 项全绿 + 2 环境门控 skip,ruff 全过。

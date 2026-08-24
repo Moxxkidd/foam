@@ -12,6 +12,11 @@
 - 生命周期:首条消息时建 Engagement(WP-06)→ AuditLog(scope_loaded)→
   loop_factory 装配 → asyncio 任务跑 loop;退出时若 run 在活动先 kill
   (走 loop 的正常清理:杀 job/写 kill_switch 审计),再收 backend/会话。
+- 连续对话(WP-09 更正当 2026-08-24):``TUIConfig.wait_on_finish`` 默认
+  True——模型终答后 loop 转 idle 待命(不收尾、不写 run_finished),
+  输入框普通文本经 ``loop.interject`` 唤醒续段;顶栏显「待命」,
+  placeholder 随之切换。真终态(killed/error)的「run 已结束」提示
+  只发一次,placeholder 更新在一处。
 """
 
 from __future__ import annotations
@@ -85,6 +90,14 @@ KILL_CONFIRM_SECONDS = 5.0
 #: 侧栏/预算轮询间隔(秒)。
 PANEL_REFRESH_SECONDS = 2.0
 
+#: 输入框 placeholder 三态(WP-09 更正当:文案只在这一处定义,状态驱动切换)。
+#: run 活动(插话/命令)。
+_PLACEHOLDER_RUNNING = "插话进队列,或 / 命令"
+#: idle 待命(连续对话:输入即插话唤醒续段)。
+_PLACEHOLDER_IDLE = "待命;输入继续,/status 回顾,Ctrl-X kill"
+#: 真终态(killed/error;wait_on_finish 下 finished 不经过此处)。
+_PLACEHOLDER_ENDED = "run 已结束;/status 回顾,Ctrl-Q 退出"
+
 #: 主环纠正原因的中文标签(叙述流警告块用)。
 _CORRECTION_LABELS = {
     "no_tool_call_action_claim": (
@@ -126,6 +139,9 @@ class TUIConfig:
     - ``loop_factory``:loop 装配钩子,None 用 :func:`default_loop_factory`
       (与 headless 一致的 exec 层装配);WP-10 挂会话/状态工具时传入自定义
       factory,无需改动本包任何文件。
+    - ``wait_on_finish``:传给 loop 的待命开关(WP-09 更正当);TUI 是连续
+      对话场景,默认 True——终答转 idle 待命,插话续段;headless 默认
+      False 不受影响。
     """
 
     scope: Scope
@@ -136,6 +152,7 @@ class TUIConfig:
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     first_event_timeout: float = FIRST_EVENT_TIMEOUT_SECONDS
     max_rounds: int = 0
+    wait_on_finish: bool = True
     loop_factory: LoopFactory | None = None
     config_home: str | Path | None = None
 
@@ -206,6 +223,7 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
         max_context_tokens=config.max_context_tokens,
         first_event_timeout=config.first_event_timeout,
         max_rounds=config.max_rounds,
+        wait_on_finish=config.wait_on_finish,  # WP-09 更正当:连续对话待命
     )
     return RunHandle(loop=loop, bash=bash, sessions=session, engagement=engagement)
 
@@ -374,6 +392,7 @@ class MainScreen(Screen):
         self._kill_armed = False
         self._kill_timer = None
         self._sidebar_override: bool | None = None  # None=按宽度自动(D3)
+        self._end_hint_shown = False  # 「run 已结束」提示只发一次(更正当)
 
     # ---------- 布局 ----------
 
@@ -420,6 +439,12 @@ class MainScreen(Screen):
 
     def on_status_msg(self, msg: StatusMsg) -> None:
         self.statusbar.set_status(msg.status)
+        # WP-09 更正当:placeholder 随 loop 状态切换(待命↔活动);终态文案
+        # 由 on_run_finished_msg 一次落定,这里不碰。
+        if msg.status == "idle":
+            self.input_dock.input_box.placeholder = _PLACEHOLDER_IDLE
+        elif msg.status == "running":
+            self.input_dock.input_box.placeholder = _PLACEHOLDER_RUNNING
 
     def on_narrative_msg(self, msg: NarrativeMsg) -> None:
         self.narrative.feed_text(msg.text)
@@ -484,9 +509,7 @@ class MainScreen(Screen):
         else:
             self.statusbar.set_status("error")
             self.narrative.add_notice("error", f"run 异常终止:{msg.fatal}")
-        self.input_dock.input_box.placeholder = (
-            "run 已结束;/status 回顾,Ctrl-Q 退出"
-        )
+        self.input_dock.input_box.placeholder = _PLACEHOLDER_ENDED
         self.run_worker(self.refresh_panels())
 
     # ---------- 操作员输入(Q4 双通道) ----------
@@ -818,9 +841,11 @@ class TuiApp(App[None]):
             return
         loop = self.active_loop
         if loop is None:
-            main.narrative.add_notice(
-                "info", "run 已结束;/status 回顾,Ctrl-Q 退出"
-            )
+            # 真终态后的文本:提示只发一次(更正当,截图级观感——重复刷屏),
+            # 常态指引由 placeholder(_PLACEHOLDER_ENDED)承担。
+            if not main._end_hint_shown:
+                main._end_hint_shown = True
+                main.narrative.add_notice("info", _PLACEHOLDER_ENDED)
             return
         loop.interject(text)
         main.narrative.add_notice(
@@ -869,7 +894,7 @@ class TuiApp(App[None]):
         self._audit = audit
         self.run_handle = handle
         main.statusbar.set_engagement(engagement.paths.root.name, self.operator)
-        main.input_dock.input_box.placeholder = "插话进队列,或 / 命令"
+        main.input_dock.input_box.placeholder = _PLACEHOLDER_RUNNING
         self._run_task = asyncio.create_task(self._run_to_end(handle, objective))
 
     async def _run_to_end(self, handle: RunHandle, objective: str) -> None:

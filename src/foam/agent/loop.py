@@ -18,6 +18,11 @@
   透传 + on_reasoning_delta/on_phase 钩子(思考审计只记哈希;阶段来自
   ENGAGEMENT.md 字段,变化才触发);operator 呼号进 operator_interject
   审计载荷。
+- WP-09 更正当(2026-08-24,声明见 docs/dev-logs/WP-09.md 更正当节):
+  构造参数 ``wait_on_finish=True`` 时,无工具调用的终答不收尾——置
+  ``idle`` 待命、阻塞在插话队列,插话唤醒作为新 user 消息续段;
+  rounds/token 累计延续,``max_rounds`` 按待命段重新计;待命不写
+  run_finished,kill 走既有清理面。默认 False,headless 语义不变。
 
 审计事件:复用 WP-02 的 scope_loaded/exec_request/exec_denied/exec_result_meta/
 llm_exchange_meta/operator_interject/kill_switch;本 WP 新增 run_started/
@@ -382,6 +387,7 @@ class AgentLoop:
         first_event_timeout: float = FIRST_EVENT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
         max_rounds: int = 0,  # 0 = 不限;headless 兜底阀,正常靠 finish/kill
+        wait_on_finish: bool = False,  # True:终答不返回,idle 待命等插话续段
     ) -> None:
         if first_event_timeout <= 0:
             raise ValueError("首事件超时必须为正(默认 30s,见 K3 实测)")
@@ -407,6 +413,7 @@ class AgentLoop:
         self._first_event_timeout = first_event_timeout
         self._max_retries = max_retries
         self._max_rounds = max_rounds
+        self._wait_on_finish = wait_on_finish
 
         self._messages: list[Message] = []
         self._objective = ""
@@ -418,6 +425,7 @@ class AgentLoop:
         self._run_task: asyncio.Task[None] | None = None
         self._status = "idle"
         self._rounds = 0
+        self._segment_rounds = 0  # max_rounds 按待命段计(WP-09 更正当)
         self._total_input = 0
         self._total_output = 0
         # tool_call_id → (output_path, sha256):压缩占位要用的落盘线索
@@ -440,6 +448,7 @@ class AgentLoop:
         text = text.strip()
         if text:
             self._interjections.append(text)
+            self._wake.set()  # 唤醒 idle 待命(WP-09 更正当);pause 等待有复查,误唤醒安全
 
     def pause(self) -> None:
         """请求暂停:当前 turn 跑完后停在下一边界。"""
@@ -527,7 +536,7 @@ class AgentLoop:
             self._refresh_engagement_message()
             self._maybe_emit_phase()
             self._maybe_compress()
-            if self._max_rounds and self._rounds >= self._max_rounds:
+            if self._max_rounds and self._segment_rounds >= self._max_rounds:
                 return self._finalize_error(
                     f"达到最大轮数上限 {self._max_rounds},run 终止(可调 --max-rounds)"
                 )
@@ -574,6 +583,14 @@ class AgentLoop:
                     )
                     self._observer.on_correction("no_tool_call_action_claim")
                     self._messages.append(Message.user(_CLAIM_CORRECTION_TEXT))
+                    continue
+                if self._wait_on_finish and not self._kill_requested:
+                    # WP-09 更正当:终答不收尾,idle 待命等插话续段(run 未
+                    # 结束,不写 run_finished;kill 走既有清理面)。
+                    await self._idle_wait()
+                    if self._kill_requested:
+                        return await self._finalize_killed()
+                    self._segment_rounds = 0  # max_rounds 按待命段重新计
                     continue
                 return RunResult(
                     status="finished",
@@ -683,6 +700,7 @@ class AgentLoop:
             await agen.aclose()
 
         self._rounds += 1
+        self._segment_rounds += 1  # 待命段内轮数(WP-09 更正当)
         self._total_input += usage.input_tokens
         self._total_output += usage.output_tokens
         text = "".join(text_parts)
@@ -799,6 +817,17 @@ class AgentLoop:
             self._wake.clear()
             if not (self._pause_requested and not self._kill_requested):
                 break  # 与 resume()/kill() 的竞态:clear 后复查再等待
+            await self._wake.wait()
+        if not self._kill_requested:
+            self._set_status("running")
+
+    async def _idle_wait(self) -> None:
+        """wait_on_finish:终答后不收尾,待命等插话(run 未结束,不写 run_finished)。"""
+        self._set_status("idle")
+        while not self._interjections and not self._kill_requested:
+            self._wake.clear()
+            if self._interjections or self._kill_requested:
+                break  # 与 interject()/kill() 的竞态:clear 后复查再等待
             await self._wake.wait()
         if not self._kill_requested:
             self._set_status("running")

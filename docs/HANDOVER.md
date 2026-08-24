@@ -145,6 +145,15 @@
   ReasoningDelta 链路上屏,审计只记 sha256+chars。观感自查(对照
   strix/Claude Code 逐屏文字描述)与 textual 踩坑 11 条见
   `docs/dev-logs/WP-09.md`;**M2 门已触发,门口动作待执行**。
+- 2026-08-24:**WP-09 更正当落地——loop 常驻待命(idle-wake 连续
+  对话)**。M2 门口裁决否掉「终态后输入被丢弃」:loop 增
+  `wait_on_finish`(默认 False,headless 语义不变;TUI 经
+  `TUIConfig` 默认 True),终答后置 `idle` 待命、阻塞在既有插话
+  队列,插话唤醒续段;rounds/token 累计延续,`max_rounds` 按待命
+  段计;待命不写 run_finished,kill 走既有清理面;engagement.json
+  objective 永远首条消息。顶栏加「待命」,终态「run 已结束」提示
+  去重。声明/验收/语义定案见 `docs/dev-logs/WP-09.md` 更正当节;
+  WP-04 既有 24 项测试零改动通过,全仓 378+2 skip。
 
 ## 下一 WP
 
@@ -263,3 +272,10 @@ WP-13(整合)依赖全部
     Input 时 ctrl+x/c/p 被 cut/copy/命令面板遮蔽,安全类快捷键必须
     `priority=True`。完整 11 条见 `docs/dev-logs/WP-09.md`「textual
     踩坑」。
+19. **待命/初始同名字典值:等待迁移序列,不等瞬时值**(WP-09 更正当):
+    loop 构造初始 `_status` 本就叫 `"idle"`,idle-wake 待命态按规格
+    也叫 `"idle"`——`wait_for(loop.status == "idle")` 在 run 启动前
+    即命中,断言打在 loop 跑起来之前。等 `observer.on_status` 的
+    迁移序列(如 `["running", "idle"]`)或加业务守卫(`_rounds >= 1
+    and status == "idle"`)。凡给状态机新增与既有值同名的状态,检查
+    所有「等待某状态」的调用点是否其实想等「迁移到某状态」。

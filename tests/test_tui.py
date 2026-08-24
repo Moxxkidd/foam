@@ -10,6 +10,10 @@
 - 验收 6:ReasoningDelta 链路——fake 后端 → loop 透传 → observer 钩子;
   审计只有 sha256/字符数,无任何明文(openai_compat 解析用 httpx
   MockTransport,合成 key 走 monkeypatch)。
+- 更正当(2026-08-24)验收 1-3:idle 待命两段式(token 累计延续、待命无
+  run_finished)、待命 kill 清理审计、TUI 待命提交路径(插话唤醒 +
+  「已结束」提示去重)。``make_config`` 默认 ``wait_on_finish=False``
+  保持既有 23 项断言语义;待命测试显式传 True。
 
 scope 文本与命令全部为合成/无害(echo/ls 不存在目录/越界目标只到护栏)。
 """
@@ -36,7 +40,13 @@ from foam.agent.backends.base import (
     Usage,
     event_to_dict,
 )
-from foam.agent.loop import AgentLoop, LoopObserver, ToolRegistry, extract_phase
+from foam.agent.loop import (
+    KIND_RUN_FINISHED,
+    AgentLoop,
+    LoopObserver,
+    ToolRegistry,
+    extract_phase,
+)
 from foam.agent.prompts import build_system_prompt
 from foam.guard.audit import (
     KIND_KILL_SWITCH,
@@ -116,6 +126,9 @@ def make_config(tmp_path: Path, script, **overrides) -> TUIConfig:
         "model_label": "k3-fake",
         "engagements_dir": tmp_path / "engagements",
         "config_home": tmp_path / "home",
+        # 更正当:TUI 真实默认是 True(连续对话);测试基座默认 False,
+        # 让既有断言 finished 终态的用例语义不变,待命用例显式传 True。
+        "wait_on_finish": False,
     }
     if callable(script):
 
@@ -403,6 +416,101 @@ async def test_loop_without_reasoning_has_no_reasoning_fields(tmp_path):
     raw = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "reasoning_sha256" not in raw
     assert "reasoning_chars" not in raw
+
+
+# ---------------------------------------------------------------------------
+# 更正当(2026-08-24):loop 常驻待命(idle-wake 连续对话)
+# ---------------------------------------------------------------------------
+
+
+def _audit_kinds(path: Path) -> list[str]:
+    return [
+        json.loads(line)["kind"]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+async def test_loop_idle_wake_two_segments(tmp_path):
+    """更正当验收 1:终答 → idle 待命(无 run_finished)→ 插话唤醒续段;
+    rounds/token 累计延续,objective 不变。"""
+    script = [
+        [TextDelta("第一段结论。"), Usage(3, 2)],  # 无工具调用 → idle 待命
+        [
+            TextDelta("继续挖。\n"),
+            ToolCall(
+                id="c1", name="run_command", arguments={"command": "echo two"}
+            ),
+            Usage(5, 4),
+        ],
+        [TextDelta("第二段结论。"), Usage(2, 1)],  # 再次终答 → 再待命
+    ]
+    loop, audit, observer = _make_loop_env(tmp_path, script, wait_on_finish=True)
+    task = asyncio.create_task(loop.run("obj"))
+
+    # 第一段终答 → idle 待命:run 未返回,审计无 run_finished(run 未结束)
+    # (待命与构造初始态同字符串「idle」,等 on_status 迁移序列而非瞬时值)
+    await wait_for(lambda: observer.statuses == ["running", "idle"])
+    assert loop.status == "idle"
+    assert not task.done()
+    assert KIND_RUN_FINISHED not in _audit_kinds(tmp_path / "audit.jsonl")
+
+    # 插话唤醒 → 第二段(工具轮 + 终答轮)→ 再待命
+    loop.interject("keep going")
+    await wait_for(lambda: loop._rounds >= 3 and loop.status == "idle")
+    assert not task.done()
+    assert observer.statuses == ["running", "idle", "running", "idle"]
+    # rounds/token 累计延续不归零(3 轮 = 1 + 2)
+    assert loop._rounds == 3
+    assert loop._total_input == 3 + 5 + 2
+    assert loop._total_output == 2 + 4 + 1
+    # 插话作为新 user 消息进上下文;objective 仍是首条消息,不变更
+    user_texts = [m.content for m in loop.messages if m.role == "user"]
+    assert user_texts[0] == "obj"
+    assert any("【操作员插话】keep going" in (c or "") for c in user_texts)
+    assert loop._objective == "obj"
+    # 待命期间始终无 run_finished;插话审计在第二段边界落下
+    kinds = _audit_kinds(tmp_path / "audit.jsonl")
+    assert KIND_RUN_FINISHED not in kinds
+    assert KIND_OPERATOR_INTERJECT in kinds
+
+    loop.kill("收工")
+    result = await asyncio.wait_for(task, timeout=5)
+    assert result.status == "killed"
+    assert result.rounds == 3  # killed 结果同样带累计轮数
+    audit.close()
+
+
+async def test_loop_kill_from_idle_cleanup_audit(tmp_path):
+    """更正当验收 2:idle 待命时 kill → killed + 既有清理面审计齐全。"""
+    script = [[TextDelta("结论。"), Usage(1, 1)]]
+    loop, audit, observer = _make_loop_env(tmp_path, script, wait_on_finish=True)
+    task = asyncio.create_task(loop.run("obj"))
+    await wait_for(lambda: observer.statuses == ["running", "idle"])
+    assert KIND_RUN_FINISHED not in _audit_kinds(tmp_path / "audit.jsonl")
+
+    loop.kill("操作员收工")
+    result = await asyncio.wait_for(task, timeout=5)
+    assert result.status == "killed"
+    assert loop.status == "killed"
+    audit.close()
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    kinds = [r["kind"] for r in records]
+    assert KIND_KILL_SWITCH in kinds
+    kill_rec = records[kinds.index(KIND_KILL_SWITCH)]
+    assert kill_rec["payload"]["reason"] == "操作员收工"
+    # killed 的收尾审计是 WP-04 既有语义;且只出现在 kill 之后(待命期间无)
+    assert kinds[-1] == KIND_RUN_FINISHED
+    assert kinds.index(KIND_KILL_SWITCH) < kinds.index(KIND_RUN_FINISHED)
+    final_rec = records[-1]
+    assert final_rec["payload"]["status"] == "killed"
+    assert observer.statuses == ["running", "idle", "killed"]
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +904,107 @@ async def start_run_and_wait_no_input(app: TuiApp, main):
             for w in main.narrative.children
         )
     )
+
+
+async def test_tui_idle_submit_goes_to_interject(tmp_path):
+    """更正当验收 3:idle 待命时输入文本 → loop 收到插话(呼号载荷)→
+    审计 operator_interject + 叙述流插话卡,无「已结束」提示;真终态后
+    「run 已结束」只发一次(观感去重)。"""
+    script = [
+        [TextDelta("初步结论。"), Usage(3, 2)],  # 段 1 终答 → idle 待命
+        [
+            TextDelta("继续挖。\n"),
+            ToolCall(
+                id="c1",
+                name="run_command",
+                arguments={"command": "echo deeper"},
+            ),
+            Usage(5, 4),
+        ],
+        [TextDelta("补充结论。"), Usage(2, 1)],  # 段 2 终答 → 再待命
+    ]
+    app = TuiApp(make_config(tmp_path, script, wait_on_finish=True))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        main = await enter_main(app, pilot)
+        await pilot.press(*"recon lab")
+        await pilot.press("enter")
+        await wait_for(lambda: app.run_handle is not None)
+        loop = app.run_handle.loop
+        # 段 1 跑完进待命(初始构造态也叫 idle,用 rounds 守卫区别)
+        await wait_for(lambda: loop._rounds >= 1 and loop.status == "idle")
+
+        # 待命状态面:顶栏「待命」+ placeholder 待命文案;run 未收尾
+        await wait_for(
+            lambda: "待命" in str(main.query_one("#sb-right").render())
+        )
+        assert main.input_dock.input_box.placeholder.startswith("待命")
+        assert "Ctrl-X kill" in main.input_dock.input_box.placeholder
+        assert app._final_result is None
+
+        def ended_notices() -> list:
+            return [
+                w
+                for w in main.narrative.children
+                if isinstance(w, NoticeBlock) and "已结束" in w.content
+            ]
+
+        assert ended_notices() == []  # 待命不是终态,不得出现「已结束」
+
+        # 输入普通文本(ASCII:pilot.press 不支持 CJK)→ 插话唤醒续段
+        await pilot.press(*"keep digging")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: any(
+                isinstance(w, NoticeBlock)
+                and w.kind == "interject"
+                and "keep digging" in w.content
+                for w in main.narrative.children
+            )
+        )
+        await wait_for(lambda: loop._rounds >= 3 and loop.status == "idle")
+        # 段 2 真跑了工具(卡片在),token 累计 = 两段之和
+        assert any(
+            "echo deeper" in c.query_one(".card-header").content
+            for c in narrative_blocks(main, ToolCard)
+        )
+        assert loop._total_input == 3 + 5 + 2
+        assert loop._total_output == 2 + 4 + 1
+        # 审计:operator_interject 含呼号载荷;仍无 run_finished、无「已结束」
+        interjects = [
+            r
+            for r in audit_records(app)
+            if r["kind"] == KIND_OPERATOR_INTERJECT
+        ]
+        assert len(interjects) == 1
+        assert interjects[0]["payload"]["text"] == "keep digging"
+        assert interjects[0]["payload"]["operator"] == "nightowl"
+        assert KIND_RUN_FINISHED not in [
+            r["kind"] for r in audit_records(app)
+        ]
+        assert ended_notices() == []
+        # objective 不变更:engagement.json 仍是首条消息
+        meta_json = json.loads(
+            app.engagement.paths.metadata.read_text(encoding="utf-8")
+        )
+        assert meta_json["objective"] == "recon lab"
+
+        # 待命态 Ctrl-X 两次 → kill(真终态)
+        await pilot.press("ctrl+x")
+        await pilot.pause(0.1)
+        await pilot.press("ctrl+x")
+        await wait_for(lambda: app._final_result is not None)
+        assert app._final_result.status == "killed"
+        assert main.input_dock.input_box.placeholder.startswith("run 已结束")
+
+        # 真终态后再输入:「run 已结束」提示只发一次,不重复刷屏
+        await pilot.press(*"hello again")
+        await pilot.press("enter")
+        await wait_for(lambda: len(ended_notices()) == 1)
+        await pilot.press(*"and again")
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        assert len(ended_notices()) == 1
 
 
 async def test_sidebar_autohide_below_110_cols_and_f2(tmp_path):

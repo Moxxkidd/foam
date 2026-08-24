@@ -583,8 +583,10 @@ class SidebarPane(VerticalScroll):
 # ---------------------------------------------------------------------------
 
 #: run 状态的「文字标记 + 色调」表(D4;侧栏/通知块同理)。
+#: idle = loop 待命态(WP-09 更正当:终答后等插话续段);run 前的初始
+#: 状态在 compose 里写死「待机」,不走本表——两者文案有意区分。
 _STATUS_STYLES: dict[str, tuple[str, str]] = {
-    "idle": ("○ 待机", "dim"),
+    "idle": ("○ 待命", "dim"),
     "running": ("● 运行中", "green"),
     "paused": ("⏸ 已暂停", "yellow"),
     "killed": ("■ 已 kill", "red"),
@@ -606,7 +608,8 @@ class StatusBar(Horizontal):
     def compose(self):
         yield Static(self._left, id="sb-left", markup=False)
         yield Static("", id="sb-center", markup=False)
-        yield Static(Text(_STATUS_STYLES["idle"][0], style="dim"), id="sb-right")
+        # run 前初始态写死「待机」;loop 的 idle 是待命态(_STATUS_STYLES)。
+        yield Static(Text("○ 待机", style="dim"), id="sb-right")
 
     def set_engagement(self, engagement_id: str, operator: str) -> None:
         self._engagement = engagement_id
