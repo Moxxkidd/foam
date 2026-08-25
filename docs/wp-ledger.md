@@ -12,7 +12,7 @@
 | WP-08 | 工具地图(全库盘点注入 prompt) | `agent/toolmap.py` | 04 | closed | 2026-08-22 | docs/dev-logs/WP-08.md |
 | WP-09 | TUI(迎宾屏 → 主界面) | `tui/` | 04 | closed | 2026-08-22 | docs/dev-logs/WP-09.md |
 | WP-10 | CLI 闭环(run/resume/replay/report) | `cli.py`、`replay.py` | 02/04/06 | closed | 2026-08-22 | docs/dev-logs/WP-10.md |
-| WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | pending | — | — |
+| WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | closed | 2026-08-25 | docs/dev-logs/WP-11.md |
 | WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | pending | — | — |
 | WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | pending | — | — |
 
@@ -134,3 +134,16 @@
   三态、终态提示去重(截图级观感修复);engagement.json objective
   永远首条消息不变更。验收 1-3 新测试 3 项;WP-04 的 24 项测试零
   改动通过;全仓 378 项全绿 + 2 环境门控 skip,ruff 全过。
+- 2026-08-25 **WP-11 closed**:e2e 场景一——容器靶场 Web 全链。任务一
+  parse 接线(loop.py 声明改动:run_command 终态挂钩子,命中换 LLM
+  视图为解析摘要 + facts 经 apply_facts 入索引,未命中/失败静默;
+  prompts.py 占位句退役;tools/state.py +3 行只读 index property、
+  tui/app.py +1 行接线,均声明)。任务二实弹(Juice Shop @
+  127.0.0.1:3000,`foam run` K3,18 轮 5m57s,token 317,641/13,095):
+  全程零人工零插话,登录绕过 + UNION 注入实际利用,Users 表 23 行
+  dump 与 PoC 两档 loot 登记可核,审计链 replay 校验通过,报告入库
+  docs/e2e/scenario1-report.md。未达标不隐瞒:索引 hosts/ports/creds/
+  vulns=0(nmap 被模型 tail 截断 + 手工成果无登记工具)、sqlmap 未
+  选用、claim-correction 总结误触发 4 次、heredoc 护栏 fail-closed
+  2 次自救——详见 docs/dev-logs/WP-11.md 与 HANDOVER 已知问题。
+  本 WP 测试 5 项全绿,全仓 383 项全绿 + 2 环境门控 skip,ruff 全过。

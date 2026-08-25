@@ -344,6 +344,7 @@ def _assemble_runtime(
         observer=observer,
         session=session,
         engagement=engagement,
+        index=state.index,  # WP-11:解析层 facts 与 state 工具共用同一连接
         max_rounds=args.max_rounds,
         **loop_kwargs,
     )

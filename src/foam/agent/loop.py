@@ -70,7 +70,10 @@ from foam.guard.audit import (
 )
 from foam.guard.scope import GuardDecision, Scope, check_command
 from foam.state.files import Engagement
+from foam.state.index import Index
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
+from foam.tools.output import read_page
+from foam.tools.parse import apply_facts, maybe_parse
 from foam.tools.session import SessionTool
 
 # ---------------------------------------------------------------------------
@@ -89,6 +92,10 @@ DEFAULT_KEEP_RECENT_MESSAGES = 6
 DEFAULT_MAX_RETRIES = 3
 #: 单条 tool 结果的字符上限(防模型用 read_output 一页拉回整文件灌爆上下文)。
 MAX_TOOL_RESULT_CHARS = 200_000
+#: 解析层(WP-11 接线)读取落盘输出的字节预算。预算内读全文(解析器按
+#: 完整输出设计,截断视图会丢中间段);超限退 output_view(head+tail 两端
+#: 完整,与 LLM 同视图)——解析是增强不是门槛,绝不为它拉爆内存。
+PARSE_TEXT_BUDGET_BYTES = 1_048_576
 #: 连续 MalformedToolCall 回灌纠正的上限,超过判定模型无法自愈,结束 run。
 MAX_CONSECUTIVE_MALFORMED = 3
 #: 连续「幻觉执行」纠正的上限,超过接受 finish(防止纠正死循环)。
@@ -366,6 +373,10 @@ class AgentLoop:
     WP-10 接线:``engagement``(WP-06)提供时,ENGAGEMENT.md 读写走
     ``state/files.py`` 接口(初始文件由 ``Engagement.create`` 保证);不传则
     退回本类的文件读写占位(测试/独立使用)。
+
+    WP-11 接线:run_command 终态输出过解析层(WP-07)——命中即把 LLM
+    视图换成解析摘要,facts 经 ``apply_facts`` 入 ``index``(提供时);
+    未命中/失败静默走通用截断视图(解析是增强不是门槛)。
     """
 
     def __init__(
@@ -381,6 +392,7 @@ class AgentLoop:
         observer: LoopObserver | None = None,
         session: SessionTool | None = None,
         engagement: Engagement | None = None,
+        index: Index | None = None,  # WP-11:解析层 facts 入库;None = 只换视图
         operator: str = "",  # 操作员呼号(WP-09):进 operator_interject 审计载荷
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         keep_recent_messages: int = DEFAULT_KEEP_RECENT_MESSAGES,
@@ -406,6 +418,7 @@ class AgentLoop:
         self._observer = observer or LoopObserver()
         self._session = session
         self._engagement = engagement
+        self._index = index
         self._operator = operator
         self._last_phase: str | None = None  # 已对外通知的阶段(WP-09)
         self._max_context_tokens = max_context_tokens
@@ -757,19 +770,74 @@ class AgentLoop:
             note = describe_exit_code(result.get("exit_code"))
             if note:
                 result["exit_note"] = note
-            self._audit.append(
-                KIND_EXEC_RESULT_META,
-                {
-                    "job_id": result.get("job_id"),
-                    "status": result.get("status"),
-                    "exit_code": result.get("exit_code"),
-                    "duration_ms": result.get("duration_ms"),
-                    "sha256": result.get("sha256"),
-                    "output_path": result.get("output_path"),
-                    "total_bytes": result.get("total_bytes"),
-                },
-            )
+            parsed_meta = self._maybe_parse_result(command, result)
+            payload: dict[str, Any] = {
+                "job_id": result.get("job_id"),
+                "status": result.get("status"),
+                "exit_code": result.get("exit_code"),
+                "duration_ms": result.get("duration_ms"),
+                "sha256": result.get("sha256"),
+                "output_path": result.get("output_path"),
+                "total_bytes": result.get("total_bytes"),
+            }
+            if parsed_meta is not None:
+                payload["parsed"] = parsed_meta
+            self._audit.append(KIND_EXEC_RESULT_META, payload)
         return result
+
+    # ---------- 解析层钩子(WP-11 接线;增强而非门槛) ----------
+
+    #: 只解析终态命令的输出;background 的 running 态无产出可解析。
+    _PARSEABLE_STATUSES = frozenset({"completed", "timeout", "killed"})
+
+    def _maybe_parse_result(
+        self, command: str, result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """run_command 成功后过解析层:命中换 LLM 视图 + facts 入库。
+
+        返回记进 exec_result_meta 的元信息;未命中/解析失败(解析层已
+        保证静默)返回 None,result 保持通用截断视图不动。
+        """
+        if result.get("status") not in self._PARSEABLE_STATUSES:
+            return None
+        parsed = maybe_parse(
+            command,
+            self._load_parse_text(result),
+            output_path=result.get("output_path"),
+            audit=self._audit,
+        )
+        if parsed is None:
+            return None
+        # 替代通用截断视图(取舍见 docs/dev-logs/WP-11.md):摘要是解析器
+        # 按完整输出提炼的亮点,严格优于 head+tail 机械截断;原文已落盘,
+        # output_path/sha256 仍在结果里,模型可 read_output 分页核对。
+        result["output_view"] = f"[解析摘要:{parsed.tool}]\n{parsed.summary}"
+        meta: dict[str, Any] = {
+            "tool": parsed.tool,
+            "summary_bytes": len(parsed.summary.encode("utf-8")),
+            "facts": len(parsed.facts),
+        }
+        if self._index is not None:
+            meta["facts_applied"] = apply_facts(self._index, parsed.facts)
+        return meta
+
+    def _load_parse_text(self, result: dict[str, Any]) -> str:
+        """解析用文本:落盘全文(≤ 预算)优先,读失败/超限退 output_view。"""
+        view = result.get("output_view")
+        if not isinstance(view, str):
+            view = ""
+        path = result.get("output_path")
+        total = result.get("total_bytes")
+        if (
+            isinstance(path, str)
+            and isinstance(total, int)
+            and 0 <= total <= PARSE_TEXT_BUDGET_BYTES
+        ):
+            try:
+                return read_page(Path(path), 0, PARSE_TEXT_BUDGET_BYTES).text
+            except (OSError, ValueError):
+                pass  # 读失败静默退视图文本——解析永不为门槛
+        return view
 
     def _tool_result_content(self, call: ToolCall, result: dict[str, Any]) -> str:
         path, sha = result.get("output_path"), result.get("sha256")

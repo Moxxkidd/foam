@@ -154,6 +154,12 @@ class StateTool:
     def close(self) -> None:
         self._index.close()
 
+    @property
+    def index(self) -> Index:
+        """只读暴露索引(WP-11 声明的增量):loop 解析钩子与本工具共用
+        同一连接,所有权/生命周期仍归 StateTool(close 在本类)。"""
+        return self._index
+
     def __enter__(self) -> StateTool:
         return self
 

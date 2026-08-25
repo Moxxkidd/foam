@@ -154,17 +154,37 @@
   objective 永远首条消息。顶栏加「待命」,终态「run 已结束」提示
   去重。声明/验收/语义定案见 `docs/dev-logs/WP-09.md` 更正当节;
   WP-04 既有 24 项测试零改动通过,全仓 378+2 skip。
+- 2026-08-25:**WP-11 关闭**——e2e 场景一(容器靶场 Web 全链) +
+  parse 接线落地。任务一:loop.py 声明改动,run_command 终态挂
+  `maybe_parse` 钩子——命中换 LLM 视图为解析摘要、facts 经
+  `apply_facts` 入索引(终态才解析、≤1MiB 读落盘全文、无 index
+  只换视图);prompts.py 占位句退役(六家解析器自动入库如实描述);
+  `tools/state.py` +3 行只读 `index` property、`tui/app.py` +1 行
+  接线(均声明,全仓测试零影响)。任务二实弹:Juice Shop @
+  127.0.0.1:3000,`foam run` K3 一次启动到底,18 轮 5m57s,token
+  317,641/13,095,零人工零插话;登录绕过 + UNION 注入实际利用,
+  Users 表 23 行 dump 与 PoC 两档 loot 登记可核,审计链 replay
+  校验通过,报告入库 `docs/e2e/scenario1-report.md`。**未达标如实
+  收录**(M3 输入,见「下一 WP」):索引 hosts/ports/creds/vulns=0、
+  sqlmap 未选用、claim-correction 总结误触发 4 次。详见
+  `docs/dev-logs/WP-11.md`。
 
 ## 下一 WP
 
-**M2 门已放行(2026-08-25,见「里程碑门」);WP-11(容器靶场 Web 全链
-e2e)与 WP-12(Metasploitable2 + msf shell e2e,需 Kali 环境)开闸**。
-- **WP-07 接线点**:后续 WP(WP-11/13)把 `maybe_parse` 挂进 loop 命令
-  结果钩子,即接上 prompts.py「自动入库由解析层后续版本提供」的占位
-  说明;TUI 侧栏索引计数随入库链路有数。
-- **Kali 实机补测已于 2026-08-22 核销**(见「当前状态」);唯一遗留:
-  修正版 `test_msfconsole_full_flow` 的 pytest 形态待下次 Kali 会话顺手
-  复跑确认(WP-12 开工时一条命令;手工全链已走通)。
+**WP-11 已关闭;M3 门待 WP-12 关闭即触发**(双场景实弹复评:
+1+1≫2?全库工具真被用上?)。
+- **WP-12(Metasploitable2 + msf shell e2e)待认领,需 Kali 环境**;
+  顺手核销唯一遗留:修正版 `test_msfconsole_full_flow` 的 pytest
+  形态复跑(一条命令,手工全链已走通)。环境探针可照抄
+  `tests/e2e/probe_scenario1.sh` 模式。
+- **WP-11 留下的已知问题(M3 复评输入,不在 WP-12 顺手修)**:
+  ① creds/vulns 仅经解析 facts 入库,state 工具面无 add_vuln/
+  add_cred——curl 等手工成果无处登记(场景一索引四表为空的主因);
+  ② claim-correction 启发式对「总结历史动作」稳定误触发(场景一
+  18 轮中 4 次,多耗约 3.5 万输入 token),候选方向:豁免无新动作
+  声明的总结段;③ 模型自截断输出(`| tail -20`)使解析器
+  no_match——prompts 可引导「扫描类命令保持完整输出」。
+- **Kali 实机补测已于 2026-08-22 核销**(见「当前状态」)。
 
 ## WP 依赖速查
 
@@ -281,3 +301,8 @@ WP-13(整合)依赖全部
     迁移序列(如 `["running", "idle"]`)或加业务守卫(`_rounds >= 1
     and status == "idle"`)。凡给状态机新增与既有值同名的状态,检查
     所有「等待某状态」的调用点是否其实想等「迁移到某状态」。
+20. **shell 拼后缀多字节符号会粘进变量名**(WP-11 踩):`"$t✓"` 被
+    POSIX 解析成变量 `t✓`(`set -u` 下直接 fatal)——拼接一律
+    `${t}…`。同族:本机 `ALL_PROXY` 指向死代理时 agent 的 curl 全军
+    覆没而 LLM API 恰可直连——跑 e2e 的环境处理见
+    `docs/e2e/scenario1-setup.md`「代理坑」。

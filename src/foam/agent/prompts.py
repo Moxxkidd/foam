@@ -78,8 +78,11 @@ _SYSTEM_TEMPLATE = """\
   关键发现、凭证、进度、下一步计划,随时用 run_command 写文件更新它。状态库
   工具:state_query 查询索引(hosts/ports/creds/vulns/loot/notes;creds 的
   secret 默认掩码,完整值只在落盘索引库),state_add_note 记笔记,
-  state_add_loot 登记战利品文件(须先放进 engagement 目录再登记)。host/
-  端口/凭证/漏洞的自动入库由解析层后续版本提供——目前凭证仍须写进本文件。
+  state_add_loot 登记战利品文件(须先放进 engagement 目录再登记)。
+  nmap/sqlmap/gobuster/nikto/hydra/whatweb 的命令输出会被解析层自动
+  入库:摘要直接出现在工具结果里,主机/端口/凭证/漏洞/loot 自动进
+  索引(凭证完整值落盘,视图掩码);解析未命中走通用截断视图,不影响
+  命令执行。其他工具输出与杂项发现仍须手动写进本文件或 state_add_note。
 - engagement 目录:{workdir} ——工具原始输出在其 outputs/ 子目录。所有产物
   只写进 engagement 目录,不往别处写。
 

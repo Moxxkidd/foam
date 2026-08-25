@@ -219,6 +219,7 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
         observer=ctx.observer,
         session=session,
         engagement=engagement,
+        index=state.index,  # WP-11 声明的一行接线:解析层 facts 入库(TUI 同享)
         operator=ctx.operator,
         max_context_tokens=config.max_context_tokens,
         first_event_timeout=config.first_event_timeout,
