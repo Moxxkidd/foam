@@ -147,3 +147,28 @@
   选用、claim-correction 总结误触发 4 次、heredoc 护栏 fail-closed
   2 次自救——详见 docs/dev-logs/WP-11.md 与 HANDOVER 已知问题。
   本 WP 测试 5 项全绿,全仓 383 项全绿 + 2 环境门控 skip,ruff 全过。
+- 2026-08-26 **WP-12 closed**:e2e 场景二——Metasploitable2 容器 +
+  msfconsole 交互拿 shell(Kali 实弹,Mac 经 SSH BatchMode 协调;
+  Kali 侧 ~/foam 为 rsync 副本无 .git,关闭 commit 在 Mac 侧仓做)。
+  交付:tests/e2e/probe_scenario2.sh(只读探针:容器/IP/探活/scope
+  逐行一致/工具面/env 存在性,exit 0 实录)、docs/e2e/
+  scenario2-setup.md(含 ms2 镜像必须 -dit 的坑)、scopes/ms2.scope
+  (shared 新增授权证据,写死 172.17.0.3/32,日志已声明)。
+  实弹(foam run,k3-256k,29 轮 6m33.7s,token 290,166/5,227,
+  零人工零插话零 kill):nmap 全端口 25 口(解析层自动入库 hosts 1/
+  ports 25 带指纹,WP-11 索引空表缺口未复现)→ 模型无剧本自选
+  UnrealIRCd 后门 → 持久 PTY 驱动 msfconsole use/set/exploit 一击
+  成功 → root shell 内 id/uname 取证(uid=0 输出在 loot 行 42/70,
+  路径可核)→ 转录落 loot 登记;审计链 replay 49 条完整 exit 0。
+  验收 3 生产实证:真实转录字节离线复演 detect_prompt 12 命中/6
+  位置(含 6.4.84 无版本号 msf >,陷阱 16 再坐实);run 收尾
+  aclose() 正确回收 msfconsole。失败形态如实:exploit 失败 0、
+  护栏拒绝 2(版本号误判越界 IP 新形态)、msf 用法插曲 1、
+  claim-correction 总结误触发 1(模型以真实二次核验响应)、
+  provider 审核 0。未达标不隐瞒 6+1 条(会话操作不入审计链/
+  提示事件不落盘/loot 登记尺寸快照/盘点漂移 93/137/进展占位符/
+  creds+vulns 无登记面 + 非本 run msf 进程残留观察)见
+  docs/dev-logs/WP-12.md 与 HANDOVER 已知问题。顺手项:修正版
+  msf/dpkg 两测试 pytest 形态 Kali 复跑 2 passed,回填 WP-05/WP-08
+  补测节。engagement 产物 gitignored 不入库(已回收 Mac 核验)。
+  **M3 门随之触发,门口动作待总指挥执行。**

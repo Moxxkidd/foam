@@ -168,23 +168,48 @@
   收录**(M3 输入,见「下一 WP」):索引 hosts/ports/creds/vulns=0、
   sqlmap 未选用、claim-correction 总结误触发 4 次。详见
   `docs/dev-logs/WP-11.md`。
+- 2026-08-26:**WP-12 关闭**——e2e 场景二(Metasploitable2 容器 +
+  msfconsole 交互拿 shell,Kali 实弹,Mac 经 SSH 协调)。`foam run`
+  k3-256k 一次启动到底:29 轮 6m33.7s,token 290,166/5,227,零人工
+  零插话;nmap 全端口(25 口,解析层自动入库 hosts 1/ports 25——
+  WP-11 的索引空表缺口未复现)→ 模型**自选** UnrealIRCd 后门(非
+  剧本首选 vsftpd)→ 持久 PTY 驱动 msfconsole use/set×4/exploit
+  **一击成功** → root shell 内 id/uname 取证 → 转录落 loot 并登记,
+  审计链 replay 49 条完整。结构化提示识别生产实证:真实转录字节
+  离线复演 12 命中(含 6.4.84 无版本号 `msf >`,陷阱 16 再坐实)。
+  顺手核销:修正版 msf/dpkg 两测试 pytest 形态 Kali 复跑 2 passed
+  (回填 WP-05/WP-08 补测节)。**未达标如实收录**(M3 输入):会话
+  操作不入审计链、提示事件不落盘、loot 登记尺寸快照语义、工具盘点
+  漂移 93/137、护栏把笔记里版本号误识别为越界 IP 的新误报形态(2 次
+  fail-closed,模型改写自救)。详见 `docs/dev-logs/WP-12.md`。
+  **M3 门随之触发,门口动作待总指挥执行**。
 
 ## 下一 WP
 
-**WP-11 已关闭;M3 门待 WP-12 关闭即触发**(双场景实弹复评:
-1+1≫2?全库工具真被用上?)。
-- **WP-12(Metasploitable2 + msf shell e2e)待认领,需 Kali 环境**;
-  顺手核销唯一遗留:修正版 `test_msfconsole_full_flow` 的 pytest
-  形态复跑(一条命令,手工全链已走通)。环境探针可照抄
-  `tests/e2e/probe_scenario1.sh` 模式。
-- **WP-11 留下的已知问题(M3 复评输入,不在 WP-12 顺手修)**:
+**WP-12 已关闭;M3 门已触发(WP-11+12 双场景实弹俱闭),门口动作
+待总指挥执行**(双场景复评:1+1≫2?全库工具真被用上?两场景实际
+用上的工具:场景一 nmap/ffuf/curl/python3/sha256sum,场景二
+nmap/msfconsole/grep/cat/cp/hostname)。
+- **WP-13(整合)待认领,依赖全部**;改名验证项已于定名日核销。
+- **M3 复评输入(已知问题汇总,WP-11 三条 + WP-12 五条)**:
   ① creds/vulns 仅经解析 facts 入库,state 工具面无 add_vuln/
-  add_cred——curl 等手工成果无处登记(场景一索引四表为空的主因);
-  ② claim-correction 启发式对「总结历史动作」稳定误触发(场景一
-  18 轮中 4 次,多耗约 3.5 万输入 token),候选方向:豁免无新动作
-  声明的总结段;③ 模型自截断输出(`| tail -20`)使解析器
-  no_match——prompts 可引导「扫描类命令保持完整输出」。
-- **Kali 实机补测已于 2026-08-22 核销**(见「当前状态」)。
+  add_cred——手工成果无处登记(场景一索引四表空的主因;场景二
+  同缺口但无需凭证);② claim-correction 启发式对「总结历史动作」
+  稳定误触发(场景一 4 次、场景二 1 次;场景二的误报促成真实二次
+  核验),候选方向:豁免无新动作声明的总结段;③ 模型自截断输出
+  (`| tail -20`)使解析器 no_match(场景二未复现)——prompts 可引导
+  「扫描类命令保持完整输出」;④ **PTY 会话操作(session_open/send/
+  read/list)不入审计链**,replay 时间线在纯会话阶段只剩 LLM 交换
+  元记录——会话审计 kind 是否补,门口裁决;⑤ 结构化提示事件
+  (events/matched)只喂模型不落盘(CLI 渲染亦无 prompt_type)——
+  验收引用要靠运行日志+转录+离线复演补强;⑥ loot 索引登记尺寸为
+  登记时刻快照(终态文件可被后续重拷撑大),语义待门口定夺;⑦
+  **护栏目标提取把版本号(`4.7p1`/`3.2.8.1`)误判为越界 IP**
+  (场景二 heredoc 笔记两次 fail-closed)——WP-02 提取器新误报形态;
+  ⑧ ENGAGEMENT.md「进展」占位文案与 loop.py:172 注释口径不一
+  (WP-06 模板 nit)。
+- **Kali 实机补测已于 2026-08-22 核销**;msf/dpkg 两测试 pytest 形态
+  复跑已于 2026-08-26 核销(WP-12 顺手项,2 passed)。
 
 ## WP 依赖速查
 
@@ -306,3 +331,32 @@ WP-13(整合)依赖全部
     `${t}…`。同族:本机 `ALL_PROXY` 指向死代理时 agent 的 curl 全军
     覆没而 LLM API 恰可直连——跑 e2e 的环境处理见
     `docs/e2e/scenario1-setup.md`「代理坑」。
+21. **macOS 自带 rsync 是 openrsync,缺省目标=cwd,会删家目录**
+    (2026-08-26 协调层操作事故):同步命令里 `'--exclude=X' /path/src`
+    的空格被粘贴吞掉 → 本地源路径粘进 exclude,只剩一个远程参数当源;
+    GNU rsync 缺目标只列文件,**openrsync 缺目标默认 DEST=当前目录**,
+    `--delete` 把家目录当镜像目标删了 39.2 万条(已在 /tmp 实测复现)。
+    教训(给用户/agent 的任何 rsync 命令都按此办):① 源/目标用变量
+    分行写并加源标记闸门(如 `[ -f "$SRC/pyproject.toml" ]`);② 永远
+    先 `-n` 演习,删除清单人工过目再实传;③ `--delete` 与缺省路径
+    行为的组合是雷区。
+    补记(同日第二次踩,零损失):**zsh 在赋值语句里会展开冒号后的 `~`**
+    ——`DST=doma@host:~/foam/` 被本地展开成 `doma@host:/Users/an/foam/`
+    (zshexpn:赋值词中 `:`/`=` 后的 ~ 做 tilde expansion),远端收到
+    错误的绝对路径。命令行内联写法不展开,一进变量赋值就展开。远端
+    路径一律写绝对路径(`doma@host:/home/doma/foam/`)或对 ~ 加引号。
+22. **docker 两坑(WP-12 踩)**:① 镜像 CMD 以交互 shell 收尾时(如
+    `sh -c "services.sh && bash"`)裸 `docker run -d` 无 TTY/STDIN,
+    bash 即退、容器 `Exited (0)` 假死——日志里服务明明全起来了;
+    必须 `-dit`(ms2 靶场实测,见 `docs/e2e/scenario2-setup.md`)。
+    ② docker CLI 对无响应 daemon **无限阻塞**(macOS 开发机实测探针
+    卡死)——自动化/探针里一律给上界(`timeout 15 docker`;macOS 无
+    timeout(1),脚本先判 `command -v timeout` 再决定包不包)。
+23. **zsh 的 env 落点是 `~/.zshenv`,且折行会酿事故**(WP-12 踩):
+    非交互 SSH 远端命令(`ssh host 'cmd'`)不读 bashrc/profile,但
+    zsh 对所有 shell 形态都 source `~/.zshenv`——跨机注入 env 只认
+    它。回填时若编辑器/粘贴把长行硬折行:孤儿的 `export ` 行会在
+    source 时**打印全部导出变量**(污染每次 SSH 输出,含敏感变量名
+    值),带前导空格的 `  FOO=bar` 静默不生效。改 zshenv 用行号手术
+    或整体重写,改完 `ssh host 'env | grep -c FOAM'` 类只数不印值
+    的方式验证。
