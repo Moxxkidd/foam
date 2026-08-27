@@ -13,7 +13,7 @@
 | WP-09 | TUI(迎宾屏 → 主界面) | `tui/` | 04 | closed | 2026-08-22 | docs/dev-logs/WP-09.md |
 | WP-10 | CLI 闭环(run/resume/replay/report) | `cli.py`、`replay.py` | 02/04/06 | closed | 2026-08-22 | docs/dev-logs/WP-10.md |
 | WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | closed | 2026-08-25 | docs/dev-logs/WP-11.md |
-| WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | pending | — | — |
+| WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | closed | 2026-08-26 | docs/dev-logs/WP-12.md |
 | WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | pending | — | — |
 
 ## 里程碑门(milestone;挂牌不改 WP 制,见 HANDOVER 同名节)
@@ -22,7 +22,7 @@
 |---|---|---|---|
 | M1 | WP-04 关闭 | 能力演示:真实 K3 后端 `foam run` 跑通 lab scope 内无害链(补 WP-04 未跑的真实模型 e2e);方向复评 | **已通过(2026-08-21)**:演示补跑通过(exit 0/finished/6 轮,审计链 verify 通过,幻觉纠正真实触发一次且模型以核验响应,零越界零泄漏,证据见 docs/dev-logs/WP-04.md「补跑」节)+ 方向复评**放行**;WP-08/09/10 开闸 |
 | M2 | WP-09+10 关闭 | TUI/CLI 可演示,对照 strix/Claude Code 观感打分;方向复评 | **已通过(2026-08-25)**:更正当「loop 常驻待命」落地过验(4c19e02,声明与验收见 docs/dev-logs/WP-09.md 更正当节);总指挥实机演示(k3-256k 连续对话、观感与响应速度)打分通过 + 方向复评**放行**;WP-11/12 开闸 |
-| M3 | WP-11+12 关闭 | 双场景实弹;对照唯一目标复评:1+1≫2?全库工具真被用上? | 待触发 |
+| M3 | WP-11+12 关闭 | 双场景实弹;对照唯一目标复评:1+1≫2?全库工具真被用上? | **已通过(2026-08-26)**:双场景实弹俱闭,监理独立复验(两场景审计链 replay 均 exit 0,loot/索引/算术逐项重算一致);复评:1+1≫2 成立(ffuf 自荐、UnrealIRCd 四选一、msf PTY 全链实证),工具使用面如实记录(两场景 ~11 种);总指挥裁决**放行**,WP-13 开闸;已知问题 8 条 + sqlmap 演示项挂账随 WP-13 候选(不改既有验收口径) |
 | M4 | WP-13 关闭 | 发布评审 | 待触发 |
 
 门口纪律:产出三选一——放行 / 规格更正当 / 砍后续 WP;不开新坑(新想法
