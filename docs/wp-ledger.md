@@ -14,7 +14,7 @@
 | WP-10 | CLI 闭环(run/resume/replay/report) | `cli.py`、`replay.py` | 02/04/06 | closed | 2026-08-22 | docs/dev-logs/WP-10.md |
 | WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | closed | 2026-08-25 | docs/dev-logs/WP-11.md |
 | WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | closed | 2026-08-26 | docs/dev-logs/WP-12.md |
-| WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | pending | — | — |
+| WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | closed | 2026-08-27 | docs/dev-logs/WP-13.md |
 
 ## 里程碑门(milestone;挂牌不改 WP 制,见 HANDOVER 同名节)
 
@@ -172,3 +172,27 @@
   msf/dpkg 两测试 pytest 形态 Kali 复跑 2 passed,回填 WP-05/WP-08
   补测节。engagement 产物 gitignored 不入库(已回收 Mac 核验)。
   **M3 门随之触发,门口动作待总指挥执行。**
+- 2026-08-27 **WP-13 closed**:总体整合 + 发布准备(最终整合 WP,
+  关闭即触发 M4)。交付:docs/spec-verification.md(13 份规格 63 条
+  验收条款逐条核销:✅62 + 🟡1[WP-03 其余后端无凭据未实测,v1
+  并案] + ❌0;M3 挂账 9 条全部落位条款旁注;M1–M3 门口记录齐全
+  核对通过)、docs/known-issues.md(已知问题总表 14 条 + 非问题
+  澄清 4)、docs/demo/walkthrough.md + scenario2-report.md(演示
+  材料,取规格允许的操作记录文本路线,未重新实弹)、README 终版
+  (零品牌串 + 命名纪律等价声明,收口旧 README 品牌串 2 处)、
+  HANDOVER 追加「v1 立项清单」节(规格点名 5 项 + M3 挂账 9 条 +
+  在册项合并 14 项,P0–P3 排序)。验收实录:①双场景 replay 复核
+  56/49 条双 exit 0,与 M3 监理复验一致;②全新环境安装:Kali
+  rolling arm64 干净目录 pipx install(自 git HEAD archive,~/foam
+  rsync 副本全程未碰)→ foam/fm 可用、双场景 replay exit 0、真实
+  后端冒烟经已安装包直调(reply='就绪',first-event 6.73s,
+  reasoning 流 142 字符,usage in=91/out=47,env 取 ~/.zshenv 三
+  变量);Mac 对照组干净 clone + Homebrew py3.12 venv pip install
+  (需摘除失效代理 env,陷阱 4/20 族)双 replay exit 0;系统
+  py3.9 被 requires-python 版本地板正确拒装(如实收录);③发布
+  checklist 逐项打勾或 v1 去向(日志汇总表:pipx 实测/依赖 Kali
+  源可得性/GPL·许可证/.gitignore/密钥/品牌占位);④密钥扫描当前
+  树 + 全 29 commit 历史零命中(3 处 TESTONLY 合成 fixture 豁免);
+  ⑤本日志 + 台账。全仓 383 passed + 2 skipped(40.82s,exit 0),
+  ruff 全过;代码零改动(关闭 commit 仅文档面)。**M4 门随之触发,
+  门口动作待总指挥执行。**
