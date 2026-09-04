@@ -453,3 +453,8 @@ WP-13(整合)依赖全部
     值),带前导空格的 `  FOO=bar` 静默不生效。改 zshenv 用行号手术
     或整体重写,改完 `ssh host 'env | grep -c FOAM'` 类只数不印值
     的方式验证。
+
+## 当前状态(2026-09-04 协调层记录两条,总指挥拍板)
+
+1. **Kali 凭据边界放宽(2026-08-31 拍板)**:允许 Kali 侧配置 GitHub read-only deploy key(仅 foam 单仓、禁 write、禁 PAT/账号级 token),Kali 本地 agent 可自助 `git pull` + `pipx install --force .` 更新;落地形态:~/foam-dev = deploy key 克隆,~/update-foam.sh 一键更新;~/foam(rsync 镜像)退役,闸门版 rsync 保留为无凭据后备通道。其余纪律不变(密钥只走 env、不给其他机器 SSH 凭据)。
+2. **基准评测搁置(2026-09-04 拍板)**:CyberGym-E2E / ExploitBench 因成本(amd64 云机 + token + 工期)放弃;战绩表走全本地免费路线——存量 Juice Shop(WP-11)+ MS2(WP-12)两行,补跑 sqlmap 场(顺带销 v1-P3)+ 全库盲选场;第三方判分缺口由对比臂(同模型裸 CLI vs Foam)+ 证据层(审计链+回放)+ 可复现发布(靶场 compose/objective/产出全公开)补。演示叙事主轴 =「LLM 与 Kali 工具库有机结合」,审计回放定位为证据层。
