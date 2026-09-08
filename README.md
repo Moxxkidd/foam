@@ -1,139 +1,84 @@
 # Foam
 
-Foam 是一个 **Kali 原生的 LLM 渗透 harness**:让大模型与 Kali 整个工具
-生态有机结合——不是把几个工具包成僵硬的模板,而是给 LLM 一个为重型安全
-工具专门设计的运行环境。类比:Claude Code 之于软件工程,Foam 之于
-**明确授权**的安全测试。
+给大模型一把 Kali 的钥匙。
 
-差异化锚点:
+不是把 nmap、msfconsole 包成几个僵硬模板让模型填空——是把**整个**
+Kali 工具库直接交给 LLM:它自己看工具地图挑工具、自己开 bash 跑、
+自己处理几百 MB 的输出、自己在 msfconsole 里一个命令一个命令敲。
+人只干一件事:写清楚授权范围,然后看戏。
 
-- **自由 bash + 智能输出层**:LLM 经 bash 使用 Kali 里任何工具;输出
-  全量落盘并记 sha256,LLM 视图 head+tail 截断(100MB 级输出内存有界)。
-- **持久 PTY 交互会话**:msfconsole/ssh 这类交互工具的一等公民;内置
-  提示识别(password 提示、yes/no、msf 提示符、sqlmap Y/n),命中即给
-  LLM 结构化「等待输入」事件。
-- **解析增强 + 状态索引**:nmap/sqlmap/gobuster/nikto/hydra/whatweb 输出
-  自动解析入 SQLite 索引(hosts/ports/creds/vulns/loot/notes);增强而非
-  门槛——不认识的工具走通用路径照跑。
-- **scope 硬护栏**:每条命令先过授权范围校验;越界拒绝并给 LLM 可行动
-  的纠正说明,拒绝与放行全程进审计。
-- **全程哈希链审计可回放**:append-only JSONL,语义字段级防篡改,篡改即
-  断链;`replay` 校验先行、只读重放,绝不回放不可信历史。
+类比:Claude Code 之于写代码,Foam 之于**明确授权**的渗透测试。
 
-## 法律与边界
+## 凭什么说它行
 
-Foam 仅服务于**你对目标拥有明确书面授权**的安全测试、教学与靶场演练。
-scope 护栏是产品底线而非可选项。使用者对目标选择与合规负全责。
+先看战绩,再听吹:
 
-## 运行环境
+| 靶场 | 它自己打出来的链 | 花了多少 | 结果 |
+|---|---|---|---|
+| Juice Shop(容器) | nmap → ffuf(自己从工具地图翻出来的)→ SQLi 绕过登录 → UNION 注入 | 18 轮 / 5m57s | Users 表 23 行,拖走 |
+| Metasploitable2 | nmap → 四个洞选了 UnrealIRCd(不是剧本指定的)→ 开 msfconsole 交互打完 | 29 轮 / 6m34s | root shell |
+| HTB Meow(真实外网) | nmap → nc 探测卡死,自己诊断「得用交互会话」→ 切 PTY 开 telnet → root 空密码 | 15 轮 / 8m53s | root flag |
 
-- Kali Linux(裸机/VM;实弹与安装实测:Kali rolling arm64,Python 3.13.7),
-  Python ≥ 3.12。运行时依赖仅三条:httpx / rich / textual(均在 Kali 官方源)。
-- LLM 后端二选一(密钥只走环境变量,永不入仓):
-  - `openai_compat`(默认):`FOAM_LLM_API_KEY` + `FOAM_LLM_BASE_URL` +
-    `FOAM_LLM_MODEL`——OpenAI 兼容端点万能适配,实弹用的是 Kimi K3 系。
-  - `claude`:`FOAM_ANTHROPIC_API_KEY`(Anthropic Messages,httpx 直连)。
+三场全程零人工插手,零提示该用什么工具。每一场的审计链都能
+`foam replay` 逐条重放校验——不信自己验。完整战绩表:
+**docs/track-record.md**。
 
-## 安装
+当然也有丢人的事,都在 docs/known-issues.md 里写着:护栏误拦过、
+索引漏登过、审计链在纯会话阶段断过档。哪条修了哪条没修,白纸黑字。
+
+## 四个安身立命的东西
+
+- **自由 bash + 智能输出层**:模型想用啥工具用啥,不用等我适配。
+  输出再大也不怕——全量落盘记 sha256,模型只看掐头去尾的视图,
+  100MB 输出内存占用不到 1MB(实测)。
+- **持久 PTY 会话**:msfconsole、ssh、sqlmap 的交互提示(password、
+  Y/n、`msf >`)都能识别,模型像人一样「等提示符出现再敲下一句」。
+  Meow 那场就是靠这个:nc 卡死,它自己判断「这活得交互着干」,
+  换 PTY 重开 telnet 一把过。
+- **scope 硬护栏**:每条命令先过授权校验,越界直接拒,拒绝和放行
+  全进审计。这是底线,不是卖点。
+- **哈希链审计**:每个动作 append-only 落链,改一个字就断链。
+  打完仗能逐帧回放:模型每一步想了什么、干了什么、被拦了什么。
+
+## 法律与边界(这段不是玩笑)
+
+只准打你有**明确书面授权**的目标:自己的靶场、授权测试、教学环境。
+护栏防的是误伤,防不了存心越界的人——目标选错了,责任全是你的。
+
+## 跑起来
+
+Kali Linux,Python ≥ 3.12,运行时依赖就三条(httpx/rich/textual,
+Kali 官方源全有)。密钥只走环境变量,永不入仓。
 
 ```bash
-git clone <repo> && cd foam
-pipx install .        # 推荐;Kali 源内自带 pipx
-# 或:python3 -m venv .venv && .venv/bin/pip install .
+git clone https://github.com/Moxxkidd/foam && cd foam
+pipx install .
+
+# 写授权范围(每行一个:CIDR / 主机名 / 通配域 / URL)
+printf '192.168.56.0/24\n' > my.scope
+
+# 开跑
+export FOAM_LLM_API_KEY=... FOAM_LLM_BASE_URL=... FOAM_LLM_MODEL=...
+foam run --scope my.scope \
+  --objective "对 scope 内主机做侦察,汇总存活主机与开放服务"
+
+# 打完回放+出报告
+foam replay engagements/<id>
+foam report engagements/<id> --out report.md
 ```
 
-命令:`foam`(短别名 `fm`)。全新环境安装实测(Kali pipx / Mac venv 双
-平台,含双场景 replay 与真实后端冒烟)见 `docs/demo/walkthrough.md` §3。
+全屏 TUI 也有:`foam tui --scope my.scope`,objective 就是首条消息,
+随时插话,Ctrl-C 一键 kill switch。
 
-## Quickstart
+## 现状
 
-1. 写 scope 授权文件(每行一个:CIDR / 主机名 / `*.` 通配域 / URL 前缀;
-   示例见 `scopes/lab.scope`):
-
-   ```bash
-   printf '192.168.56.0/24\n' > my.scope
-   ```
-
-2. headless 跑一个 objective:
-
-   ```bash
-   foam run --scope my.scope \
-     --objective "对 scope 内主机做侦察,汇总存活主机与开放服务" \
-     --backend openai_compat
-   ```
-
-3. 回放与报告:
-
-   ```bash
-   foam replay engagements/<id>     # 哈希链校验先行,链断拒放
-   foam report engagements/<id> --out report.md
-   ```
-
-4. 全屏 TUI(连续对话、思考块折叠、紧凑工具卡、侧栏状态、插话与斜杠命令):
-
-   ```bash
-   foam tui --scope my.scope --backend openai_compat   # objective = 主界面首条消息
-   ```
-
-5. 中断与恢复:Ctrl-C 一次 = kill switch(杀活动 job/会话、写审计、退出码
-   130),再按一次强制退出;`foam resume engagements/<id>` 从审计链校验过的
-   现场继续(最近 N 轮简报,非全量回放)。
-
-## 双场景实弹摘要
-
-2026-08-25/26,Kimi K3 系后端,`foam run` 一次启动到底,全程零人工触碰、
-零插话;2026-08-27 双场景 replay 复核双双 exit 0。
-
-| 场景 | 链(模型自主,无剧本) | 收官 | 指标 |
-|---|---|---|---|
-| 场景一:容器靶场 Web 全链(Juice Shop @ 127.0.0.1:3000) | nmap → ffuf(工具地图自荐)→ 登录 SQLi auth bypass → 搜索接口 UNION 注入 → Users 表 23 行 dump 与 PoC 两档 loot | finished,审计链 56 条 | 18 轮 / 5m57s / token 输入 317,641 / 输出 13,095 |
-| 场景二:Metasploitable2 + msfconsole(172.17.0.3) | nmap 全端口 25 口(解析层自动入库 hosts 1/ports 25)→ **自选** UnrealIRCd 后门(非剧本首选)→ 持久 PTY 驱动 msfconsole use/set×4/exploit 一击成功 → root shell 内 id/uname 取证落 loot | finished,审计链 49 条 | 29 轮 / 6m33.7s / token 输入 290,166 / 输出 5,227 |
-
-- 报告与走查:`docs/e2e/scenario1-report.md`、`docs/demo/scenario2-report.md`、
-  `docs/demo/walkthrough.md`
-- 未达标项不隐瞒(索引缺口、护栏误报形态、会话审计断档等):
-  `docs/known-issues.md`
-
-**第三场实弹(2026-09-08,HTB 真实外网靶机)**:Starting Point「Meow」,
-nmap 全端口 → nc 探测挂起自主诊断 → 切持久 PTY 驱动 telnet → login 提示
-识别 → root 空密码登录取 flag;15 轮 / 8m53s / token 输入 102,052 /
-输出 2,398,零插话零纠正;28 条审计链经安装体独立复核 PASS。
-汇总战绩表与证据指针:**`docs/track-record.md`**;报告与截图:
-`docs/demo/htb-meow-20260908/`(公开版 IP/flag 脱敏)。
-
-## 命令速览
-
-| 命令 | 作用 |
-|---|---|
-| `foam run` | headless 跑一个 objective(新 engagement;`--max-rounds`/`--max-context-tokens` 等兜底阀可调) |
-| `foam tui` | 全屏 TUI(迎宾呼号门 → 主界面;scope/backend 走参数,objective 走首条消息) |
-| `foam resume <dir>` | 链验 + objective/scope 对账后从现场继续(drift 拒绝,显式 `--scope` 视为重新授权) |
-| `foam replay <dir>` | 哈希链校验 + 只读重放审计时间线(链断报首个断点 seq) |
-| `foam report <dir>` | 中文 markdown 报告(索引库 + ENGAGEMENT.md + 审计链;凭证节为全值,注意去向) |
-
-`fm` 为等价短别名。engagement 运行时产物(工具原始输出/loot/索引库)
-永不入库(`.gitignore` 拦截)。
-
-## 文档地图
-
-- 交接与当前状态:`docs/HANDOVER.md`(含 23 条已知陷阱、里程碑门、v1 立项清单)
-- **实弹战绩表:`docs/track-record.md`**
-- 工作包台账:`docs/wp-ledger.md`(13 份规格状态 + M1–M4 门口记录)
-- 规格与核销:`docs/work-packages/WP-01`–`WP-13`;逐条核销表 `docs/spec-verification.md`
-- 开发日志:`docs/dev-logs/`(每 WP 一份,含真实命令输出)
-- 场景与演示:`docs/e2e/`(环境准备 + 场景一报告)、`docs/demo/`(走查 + 场景二报告 + HTB Meow 实弹)
-- 已知问题总表:`docs/known-issues.md`
-
-## 状态与路线图
-
-**v0.1.0(2026-09-08 封包)**:13/13 工作包全部关闭,里程碑门 M1–M4
-全放行;三场实弹(容器 ×2 + HTB 真实外网靶机 ×1)战绩在册。后续分两条线:
-**v0.1.x 维护批**(实弹反复证实的审计/核验缺口:会话操作审计补齐、
-`foam verify` CLI、结项证据页、网络探测自重超时引导)+ **v0.2 波次**
-(nftables 网络级出口护栏、多后端 failover、报告模板化、meterpreter
-语义层、跨 engagement 经验库等)——完整清单与处置见
-`docs/HANDOVER.md`「v1 立项清单」节。
+**v0.1.0(2026-09-08 封包)**:13 个工作包全关,383 测试全绿。
+后面两条线:v0.1.x 修实战暴露的审计缺口(会话操作进审计链、
+`foam verify` 一键核验、结项自动出证据页);v0.2 上大件
+(nftables 网络级护栏、多后端 failover、报告模板化……)。
+清单全文在 docs/HANDOVER.md——那份文档还记着开发过程踩过的
+23 条坑,比 README 好看。
 
 ## License
 
-GPL-3.0-only,见 `LICENSE`。
+GPL-3.0。拿去打该打的靶子。
