@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 # 正式定名 Foam(2026-08-22;显示名在 __app_name__,本文件为包名/命令名唯一来源)。
 name = "foam"
-version = "0.0.1"
+version = "0.1.0"
 description = "Foam — a Kali-native LLM harness for authorized security testing"
 readme = "README.md"
 license = "GPL-3.0-only"

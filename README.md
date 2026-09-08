@@ -94,6 +94,13 @@ pipx install .        # 推荐;Kali 源内自带 pipx
 - 未达标项不隐瞒(索引缺口、护栏误报形态、会话审计断档等):
   `docs/known-issues.md`
 
+**第三场实弹(2026-09-08,HTB 真实外网靶机)**:Starting Point「Meow」,
+nmap 全端口 → nc 探测挂起自主诊断 → 切持久 PTY 驱动 telnet → login 提示
+识别 → root 空密码登录取 flag;15 轮 / 8m53s / token 输入 102,052 /
+输出 2,398,零插话零纠正;28 条审计链经安装体独立复核 PASS。
+汇总战绩表与证据指针:**`docs/track-record.md`**;报告与截图:
+`docs/demo/htb-meow-20260908/`(公开版 IP/flag 脱敏)。
+
 ## 命令速览
 
 | 命令 | 作用 |
@@ -110,19 +117,22 @@ pipx install .        # 推荐;Kali 源内自带 pipx
 ## 文档地图
 
 - 交接与当前状态:`docs/HANDOVER.md`(含 23 条已知陷阱、里程碑门、v1 立项清单)
+- **实弹战绩表:`docs/track-record.md`**
 - 工作包台账:`docs/wp-ledger.md`(13 份规格状态 + M1–M4 门口记录)
 - 规格与核销:`docs/work-packages/WP-01`–`WP-13`;逐条核销表 `docs/spec-verification.md`
 - 开发日志:`docs/dev-logs/`(每 WP 一份,含真实命令输出)
-- 场景与演示:`docs/e2e/`(环境准备 + 场景一报告)、`docs/demo/`(走查 + 场景二报告)
+- 场景与演示:`docs/e2e/`(环境准备 + 场景一报告)、`docs/demo/`(走查 + 场景二报告 + HTB Meow 实弹)
 - 已知问题总表:`docs/known-issues.md`
 
 ## 状态与路线图
 
-Pre-alpha(v0.0.1):13/13 工作包全部关闭,里程碑门 M1–M4 全放行,项目
-发布就绪。v1 立项方向(完整优先级排序见 `docs/HANDOVER.md`「v1 立项
-清单」):nftables 网络级出口护栏、会话操作审计补齐、护栏目标提取器
-改进、state 登记面补全、claim-correction 误报治理、多后端 failover、
-报告模板化、meterpreter 语义层、跨 engagement 经验库……
+**v0.1.0(2026-09-08 封包)**:13/13 工作包全部关闭,里程碑门 M1–M4
+全放行;三场实弹(容器 ×2 + HTB 真实外网靶机 ×1)战绩在册。后续分两条线:
+**v0.1.x 维护批**(实弹反复证实的审计/核验缺口:会话操作审计补齐、
+`foam verify` CLI、结项证据页、网络探测自重超时引导)+ **v0.2 波次**
+(nftables 网络级出口护栏、多后端 failover、报告模板化、meterpreter
+语义层、跨 engagement 经验库等)——完整清单与处置见
+`docs/HANDOVER.md`「v1 立项清单」节。
 
 ## License
 
