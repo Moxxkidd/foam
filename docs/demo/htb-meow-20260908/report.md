@@ -14,6 +14,9 @@
 - 目标由用户口头指定,scope 文件 `scopes/htb-meow.scope` 仅含
   `10.129.x.x 一条;foam 启动时加载(`[scope] 1 条规则已加载`),
   每次执行经护栏校验,日志可见 `[guard] 放行:10.129.x.x 逐条记录。
+  > 注记(2026-09-11):上述 `scopes/htb-meow.scope` 未随仓库入库
+  > (仓内 `scopes/` 仅 `lab.scope`、`ms2.scope`);本报告复核不依赖
+  > 该文件——证据层为正文截图(§3)与 §4 的 sha256 清单。
 - 网络:HTB VPN(us-starting-point-2,tun0 10.10.x.x,仅靶机网段路由)。
 
 ## 2. 攻击链(foam 自主决策,无剧本)
@@ -33,17 +36,17 @@
 
 ## 3. foam 运行详细记录(截图)
 
-![s1](screenshots/s1.png)
+![s1](s1.png)
 
 图 1 —— 启动(scope 加载、护栏声明、工具盘点 96/137 注入)→ nmap →
 nc 挂起诊断 → PTY 会话建立 → login 识别 → 发送 root → 读取 flag 指令。
 
-![s2](screenshots/s2.png)
+![s2](s2.png)
 
 图 2 —— loot 登记、渗透笔记、`ENGAGEMENT.md` 完成总结(攻击路径/战果
 表)、`[run finished] 15 轮`、flag 文件与 sha256 核验。
 
-![s3](screenshots/s3.png)
+![s3](s3.png)
 
 图 3 —— telnet 会话**落盘原文**(`Trying`→`Connected`→`Meow login:
 root`→Ubuntu banner→eth0=10.129.x.x 审计链 verify PASS。

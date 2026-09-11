@@ -212,7 +212,8 @@ def test_render_wordmark_uses_app_name_constant():
 
 
 def test_no_hardcoded_brand_string_in_tui_sources():
-    """验收 5:tui/ 全部源码/样式 grep 无品牌字串(只能经 __app_name__)。"""
+    """验收 5:tui/ 全部源码/样式 grep 无品牌字串(只能经 __app_name__)。
+    品牌纪律已退役(2026-08-27),本测试作为品牌防回归契约保留。"""
     tui_dir = Path(foam.tui.__file__).parent
     offenders = []
     for path in sorted(tui_dir.iterdir()):

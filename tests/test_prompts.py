@@ -144,7 +144,8 @@ def test_system_prompt_contains_authorization_and_redlines():
 
 
 def test_system_prompt_has_no_brand_name():
-    """品牌名禁令(AGENTS.md §0):prompt 里不得出现品牌字符串,连平台名也不提。"""
+    """品牌名禁令:纪律已退役(2026-08-27,见 AGENTS.md §0 历史注记),本测试
+    作为品牌防回归契约保留——prompt 里不得出现品牌字符串,连平台名也不提。"""
     prompt = build_default()
     assert __app_name__ not in prompt
     assert "kali" not in prompt.lower()

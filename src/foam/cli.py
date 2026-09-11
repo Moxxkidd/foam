@@ -9,12 +9,12 @@
 - replay:先校验哈希链(WP-02 语义),链断报断点 seq 并中止;完整才只读
   重放元信息时间线。
 - report:中文 markdown(目标/范围/时间线/发现含证据/凭证全值/loot/插话)。
-- tui:WP-09 在飞——占位接线,包未就绪给明确报错;入口约定
+- tui:全屏 TUI(WP-09 已交付)——模块不可导入时给明确报错;入口约定
   ``foam.tui.app:main(args)``(args 含 --scope/--backend/--model/--base-url/
   --workdir;objective 由 TUI 主界面输入框首条消息提供,见 WP-09 定案 Q1)。
 
 退出码:0 = finished/成功;130 = killed(含 Ctrl-C);1 = error(含审计链
-校验未通过);2 = 参数/配置/前置条件错误(缺文件、TUI 未就绪等)。
+校验未通过);2 = 参数/配置/前置条件错误(缺文件、TUI 依赖缺失等)。
 密钥只走环境变量(各后端自己的 env key);本文件不接触 key 本体。
 
 本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)。
@@ -253,9 +253,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     tui = sub.add_parser(
         "tui",
-        help="全屏 TUI(WP-09 在飞;未就绪时给出明确报错)",
-        description="TUI 入口(WP-09):scope/backend 走本命令参数,objective "
-        "由主界面输入框首条消息提供。",
+        help="全屏 TUI(textual 界面;依赖缺失时给出明确报错)",
+        description="TUI 入口(WP-09 定案):scope/backend 走本命令参数,"
+        "objective 由主界面输入框首条消息提供。",
     )
     tui.add_argument("--scope", required=True, help="scope 授权范围文件路径")
     tui.add_argument("--workdir", default=None, help="engagement 目录(同 run)")
@@ -265,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
-# 装配(run/resume 共用;tui 就绪后也可复用)
+# 装配(run/resume 共用;tui 亦可复用)
 # ---------------------------------------------------------------------------
 
 
@@ -707,15 +707,19 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
 
 def _cmd_tui(args: argparse.Namespace) -> int:
-    """WP-09 占位接线:包未就绪给明确报错;入口约定 foam.tui.app:main(args)。"""
+    """TUI 入口接线(WP-09 定案):入口约定 foam.tui.app:main(args)。
+
+    ImportError 兜底为合理防御(2026-09-11 注):TUI 已交付,此处失败意味
+    textual 依赖缺失或安装损坏,按可行动指引报错。
+    """
     try:
         from foam.tui.app import main as tui_main
     except ImportError:
         print(
-            "[错误] TUI 尚未就绪:foam.tui.app 不存在(WP-09 在飞)。\n"
-            "入口约定:foam.tui.app:main(args)——args 携带 --scope/--backend/"
-            "--model/--base-url/--workdir 与 loop 参数;objective 由 TUI 主界面"
-            "输入框首条消息提供(WP-09 定案 Q1)。\n"
+            "[错误] TUI 模块不可导入:foam.tui.app 加载失败"
+            "(textual 依赖缺失或安装损坏)。\n"
+            "处置:重装本项目及其依赖(如 pip install --force-reinstall .),"
+            "确认 textual 可导入后重试。\n"
             f"当前可用:`{__app_name__.lower()} run` 的 headless 模式。",
             file=sys.stderr,
         )
