@@ -473,3 +473,27 @@ WP-13(整合)依赖全部
 - **下一动作**:v0.1.x 维护批开闸随时(首选 = 会话审计 kind,维护批
   第 1 项);战绩表下一行候选 = Appointment(SQLi,现 VPN 零成本)或
   sqlmap 场(v0.2 第 15 项合并执行)。
+
+## 当前状态(2026-09-12)
+
+- **v0.1.1(P0 门面清账,2026-09-11)**:版本号补同步、TUI 过期文案、
+  Meow 截图死链、HANDOVER 计数订正(本文件上方两处 2026-09-11 订正
+  注记即随该批落地)。仓库现版本 v0.1.1,清账后 HEAD 3b0a9b0。
+- **P1-1 配置持久化(本批)**:后端/模型/base-url 持久化落地——新模块
+  `src/foam/config.py`:`~/.foam/config.json` 存命名 profile(白名单仅
+  backend/model/base_url 三项,任何 key/token/secret 字样键一律剔除;
+  写入后 0600;与既有 operator 键合并共存),`.env` 解析注入环境变量
+  (不覆盖已存在键;畸形行中文警告逐行 stderr;文件不存在静默容忍)
+  ——.gitignore 列了 `.env` 却无任何代码读它的用户陷阱就此修复。CLI
+  (run/resume/tui)增 `--profile` / `--save-profile`:`--save-profile`
+  在装配成功后才落盘(坏配置不落盘),保存即设为 active(记住上次
+  选择);解析优先级 CLI 参数 > 环境变量(FOAM_LLM_MODEL /
+  FOAM_LLM_BASE_URL)> profile(`--profile` 指定,否则 active)>
+  内置默认,`--backend` 默认值改 None 以区分「没给」与「显式给」
+  (backend 仍无 env 通道)。启动可见性:profile 生效打印
+  `[config] profile '名字':backend=… model=…`;`.env` 注入打印
+  `[config] .env 注入 N 个变量:键名列表`(只列键名,绝不打印值)。
+  测试新增 `tests/test_config.py`,含红线测试(profile 塞入 api_key
+  值后,落盘 JSON 全文 grep 不含该值)。**红线不变**:API key 只走
+  环境变量,foam 读 `.env` 但永不写它;无 profile、无 `.env`、无
+  flag 时行为与此前逐字节一致。

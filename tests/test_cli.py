@@ -2,6 +2,8 @@
 
 - fake 后端脚本化驱动(与 test_loop 同模式,本文件自带一份保持自包含);
   engagement 全部落在 tmp_path,不碰仓库内真实 engagement。
+- autouse fixture 把 HOME 隔离到 tmp_path(2026-09-12 第三轮):消除真实
+  ~/.foam/config.json 串扰(active_profile 会往 stdout 混入 [config] 行)。
 - 验收 3:resume 后 system 消息含 ENGAGEMENT.md 内容;缺 audit.jsonl 报错明确。
 - 验收 4:全子命令 --help 可用;品牌名只经 __app_name__ 常量,源码无硬编码。
 """
@@ -20,6 +22,17 @@ from foam.cli import main as cli_main
 from foam.guard.audit import verify
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path, monkeypatch):
+    """HOME 隔离到 tmp_path(2026-09-12 第三轮,autouse)。
+
+    消除真实 ~/.foam/config.json 串扰隐患:在配了 active_profile 的机器上,
+    resolve_backend_args 会把 [config] profile 行混进 stdout,污染本文件
+    多处 stdout 断言;隔离后每个测试都是干净 HOME。
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 class FakeBackend(LLMBackend):

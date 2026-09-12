@@ -71,6 +71,31 @@ foam report engagements/<id> --out report.md
 全屏 TUI:`foam tui --scope my.scope`(objective 即首条消息,支持
 随时插话;Ctrl-C 触发 kill switch,回收全部活动任务与会话)。
 
+## 配置持久化
+
+后端、模型与 base-url 可存为命名 profile,免去每次重给;存于
+`~/.foam/config.json`(写入后权限 0600,与 TUI 呼号同文件、互不影响)。
+`run` / `resume` / `tui` 均支持 `--profile` 与 `--save-profile`:
+
+```bash
+# 本次装配成功后存为 profile,并记为默认(之后不带参数即沿用)
+foam run --scope my.scope --objective "..." --save-profile k3
+
+# 显式选用某个 profile
+foam run --scope my.scope --objective "..." --profile k3
+```
+
+profile 生效时启动行打印 `[config] profile 'k3':backend=… model=…`
+以便核对。解析优先级:CLI 参数 > 环境变量(`FOAM_LLM_MODEL` /
+`FOAM_LLM_BASE_URL`;`--backend` 无环境变量通道)> profile
+(`--profile` 指定,否则默认 profile)> 内置默认。
+
+当前目录的 `.env` 会在启动时注入环境变量(不覆盖已存在的同名变量);
+注入成功时打印 `[config] .env 注入 N 个变量:…`,只列键名、绝不
+打印值。**API key 仍只走环境变量**:foam 读 `.env` 但永不写它;
+profile 白名单只存 backend / model / base_url 三项,任何
+key/token/secret 字样的键一律剔除、不落盘。
+
 ## 命令速览
 
 | 命令 | 作用 |

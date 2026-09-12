@@ -17,6 +17,28 @@
 校验未通过);2 = 参数/配置/前置条件错误(缺文件、TUI 依赖缺失等)。
 密钥只走环境变量(各后端自己的 env key);本文件不接触 key 本体。
 
+配置持久化(P1-1,2026-09-12 冻结契约):入口只读加载 ./.env(注入缺省
+环境变量,绝不写它);run/resume/tui 装配前经 resolve_backend_args 就地回填
+backend/model/base_url,优先级(每键独立):CLI flag > 环境变量
+(FOAM_LLM_MODEL/FOAM_LLM_BASE_URL)> profile(--profile 指定,否则
+active_profile)> 内置默认(k3/claude-sonnet-5);backend 无 env 通道。
+env base_url 对 claude 同样生效(经 resolve_backend_args 回填进
+args.base_url;P1-1 起的行为改进,README 已文档化)。
+--save-profile 在装配成功后落盘(~/.foam/config.json,0600,白名单仅
+backend/model/base_url——密钥永不落盘);坏配置(ConfigError)不落盘。
+2026-09-12 对抗审查修复:profile 名先过 validate_profile_name(非法→
+ConfigError 路径,退出码 2);落盘副本与上屏副本的 base_url 经
+sanitize_url 脱敏(剥 userinfo、敏感 query 打码),运行时传给后端的
+args.base_url 原值不动;tui 在 --save-profile 落盘前先 _build_backend
+预检(与 run/resume 口径拉齐)。
+2026-09-12 第三轮(fail-closed 反转):sanitize_url 改 fail-closed——
+畸形或含凭证却剥不出干净 host 的 base_url 抛 ValueError;--save-profile
+路径捕获后转 ConfigError(stderr 中文「base_url 无法解析,为防凭证泄漏
+已拒绝保存 profile」+ 退出码 2,不回显原 URL,零落盘);[config] 可见性行
+的 base_url 脱敏失败时显示占位符 <无法解析,已脱敏>,profile 名两条回显
+路径(--profile 指定名 / active_profile 名)统一过 _printable 可打印过滤
+(非可打印字符转义,防 ANSI 染色与换行伪造日志行)。
+
 本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)。
 """
 
@@ -42,6 +64,15 @@ from foam.agent.backends.openai_compat import OpenAICompatBackend
 from foam.agent.loop import AgentLoop, LoopObserver, RunResult, ToolRegistry
 from foam.agent.prompts import build_system_prompt
 from foam.agent.toolmap import render_startup_line, render_tool_map, scan_tools
+from foam.config import (
+    active_profile,
+    get_profile,
+    load_config,
+    load_dotenv,
+    put_profile,
+    sanitize_url,
+    validate_profile_name,
+)
 from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog
 from foam.guard.scope import GuardDecision, Scope, load_scope, scope_payload
 from foam.replay import (
@@ -150,20 +181,36 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--backend",
         choices=["openai_compat", "claude"],
-        default="openai_compat",
-        help="LLM 后端(默认 openai_compat)",
+        default=None,
+        help="LLM 后端(不给时按解析链:--profile / 上次保存的 profile > "
+        "内置默认 openai_compat;backend 无环境变量通道,维持现状)",
     )
     parser.add_argument(
         "--model",
         default=None,
-        help=f"模型 id(默认取 env {ENV_MODEL},再退内置默认:openai_compat="
-        f"{DEFAULT_OPENAI_MODEL} / claude={DEFAULT_CLAUDE_MODEL})",
+        help=f"模型 id(解析链:flag > env {ENV_MODEL} > profile > 内置默认:"
+        f"openai_compat={DEFAULT_OPENAI_MODEL} / claude={DEFAULT_CLAUDE_MODEL})",
     )
     parser.add_argument(
         "--base-url",
         default=None,
-        help=f"API base url(openai_compat 必填,可取 env {ENV_BASE_URL};"
-        "claude 默认为官方端点)",
+        help=f"API base url(解析链:flag > env {ENV_BASE_URL} > profile;"
+        "openai_compat 必填,claude 缺省为官方端点)",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        metavar="NAME",
+        help="使用指定 profile(~/.foam/config.json 里保存的 backend/model/"
+        "base-url;不给时用 active_profile,即上次 --save-profile 记住的选择)",
+    )
+    parser.add_argument(
+        "--save-profile",
+        default=None,
+        metavar="NAME",
+        help="本次装配成功后,把解析出的 backend/model/base-url 存为 profile "
+        "并设为 active(下次启动自动生效;密钥永不落盘,仍只走环境变量;"
+        "base-url 落盘副本脱敏——剥 userinfo、敏感 query 打码,运行时原值不动)",
     )
 
 
@@ -269,10 +316,177 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+#: profile 中 backend 的合法值;其余值忽略并警告(配置文件可手编,读侧防线)。
+_VALID_BACKENDS = ("openai_compat", "claude")
+
+#: 启动可见性行的键序(与 config 模块白名单同序,只含非密钥三元组)。
+_PROFILE_DISPLAY_KEYS = ("backend", "model", "base_url")
+
+#: [config] 可见性行上 base_url 脱敏失败时的占位符(fail-closed:绝不原样上屏)。
+_UNPARSEABLE_BASE_URL_PLACEHOLDER = "<无法解析,已脱敏>"
+
+
+def _printable(text: str) -> str:
+    """上屏用可打印过滤:非可打印字符一律转义(\\n、\\x1b 形态,2026-09-12 第三轮)。
+
+    profile 名来自可手编的 config.json 或命令行,原样上屏会被控制字符
+    利用(ANSI 染色、换行伪造 [config] 日志行);两条回显路径(--profile
+    指定名与 active_profile 名)统一先过本函数。
+    """
+    return "".join(
+        ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii")
+        for ch in text
+    )
+
+
+def _select_profile(args: argparse.Namespace) -> tuple[str | None, dict | None]:
+    """取本次生效的 (profile 名, profile):--profile 指定,否则 active_profile。
+
+    配置文件全容错(load_config 口径):任何读取问题按「无 profile」处理,
+    绝不阻断启动;--profile 指名却不存在时警告并按解析链继续。
+    """
+    config = load_config(Path.home())
+    name = getattr(args, "profile", None)
+    if name:
+        profile = get_profile(config, name)
+        if profile is None:
+            print(
+                f"[config] 警告:profile '{_printable(name)}' 不存在或为空"
+                "(已忽略,按优先级链继续解析)",
+                file=sys.stderr,
+            )
+            return None, None
+        return name, profile
+    active_name = config.get("active_profile")
+    if isinstance(active_name, str) and active_name:
+        profile = active_profile(config)
+        if profile is not None:
+            return active_name, profile
+    return None, None
+
+
+def resolve_backend_args(args: argparse.Namespace) -> None:
+    """就地回填 args.backend/args.model/args.base_url(P1-1 冻结契约)。
+
+    优先级(每键独立):CLI flag > 环境变量(FOAM_LLM_MODEL/FOAM_LLM_BASE_URL)
+    > profile(--profile 指定,否则 active_profile)> 内置默认
+    (k3/claude-sonnet-5)。backend 无 env 通道(维持现状);env base_url 对
+    claude 同样生效(经本函数回填,P1-1 起的行为改进)。profile 中 backend
+    非法值忽略并警告,其余键不受影响。profile 生效时打印一行启动可见性
+    (只含非密钥三元组,base_url 过 sanitize_url 上屏副本脱敏,脱敏失败
+    显示占位符;profile 名过 _printable 可打印过滤);无 profile 时零
+    额外输出(回归底线)。
+    """
+    name, profile = _select_profile(args)
+    if profile is not None:
+        raw_backend = profile.get("backend")
+        if raw_backend is not None and raw_backend not in _VALID_BACKENDS:
+            print(
+                f"[config] 警告:profile '{_printable(name)}' 的 backend 值"
+                f"「{_printable(str(raw_backend))}」非法(仅支持 {'/'.join(_VALID_BACKENDS)},"
+                "已忽略该键)",
+                file=sys.stderr,
+            )
+            profile = {k: v for k, v in profile.items() if k != "backend"}
+        if profile:
+            # 上屏副本脱敏(Fix-2,2026-09-12 第三轮起 fail-closed):
+            # config.json 可手编,base_url 即使混入 userinfo/敏感 query
+            # 也不原样上屏;sanitize 解析不出(畸形且可能藏凭证)时显示
+            # 占位符,绝不回原值。下方解析进 args 的仍是 profile 原值
+            # (运行时不动)。profile 名过 _printable(防 ANSI/换行伪造
+            # 日志行)。
+            display = {}
+            for key, value in profile.items():
+                if key == "base_url":
+                    try:
+                        display[key] = sanitize_url(value)
+                    except ValueError:
+                        display[key] = _UNPARSEABLE_BASE_URL_PLACEHOLDER
+                else:
+                    display[key] = value
+            details = " ".join(
+                f"{key}={display[key]}"
+                for key in _PROFILE_DISPLAY_KEYS
+                if key in display
+            )
+            print(f"[config] profile '{_printable(name)}':{details}", flush=True)
+        else:
+            profile = None
+    resolved = profile or {}
+
+    # backend:flag > profile > 内置默认(无 env 通道,维持现状)。
+    if args.backend is None:
+        args.backend = resolved.get("backend") or "openai_compat"
+    # model:flag > env > profile > 内置默认(按已解析的 backend 取)。
+    if args.model is None:
+        args.model = (
+            os.environ.get(ENV_MODEL)
+            or resolved.get("model")
+            or (
+                DEFAULT_CLAUDE_MODEL
+                if args.backend == "claude"
+                else DEFAULT_OPENAI_MODEL
+            )
+        )
+    # base_url:flag > env > profile;无内置默认——openai_compat 缺失报错、
+    # claude 退官方端点,两处兜底仍在 _build_backend。env 通道对 claude
+    # 同样生效(经此处回填进 args.base_url;P1-1 起的行为改进,README
+    # 已文档化)——这是与 P1-1 前「claude 不看 FOAM_LLM_BASE_URL」的行为差。
+    if args.base_url is None:
+        args.base_url = os.environ.get(ENV_BASE_URL) or resolved.get("base_url")
+
+
+def _save_profile_if_requested(args: argparse.Namespace) -> None:
+    """--save-profile:装配成功后落盘解析结果并设为 active(0600)。
+
+    只在后端装配成功之后调用(坏配置不落盘)。profile 名先过
+    validate_profile_name(Fix-1):非法抛 ConfigError——与装配失败同一条
+    报错路径(stderr 中文报错 + 退出码 2);报错文案绝不回现名字本身
+    (名字可能正是 key 值,回显即二次泄漏)。put_profile 白名单是红线
+    防线——base_url 为 None 自动剔除,任何 key/token/secret 字样的键
+    即使混入也绝不落盘;落盘副本的 base_url 过 sanitize_url(Fix-2:
+    剥 userinfo、敏感 query 打码),args.base_url 运行时原值不动。
+    2026-09-12 第三轮 fail-closed:sanitize_url 对畸形/含凭证却剥不出
+    干净 host 的 base_url 抛 ValueError,在此转 ConfigError( stderr
+    中文 + 退出码 2,文案不回显原 URL,且零落盘)。
+    """
+    name = getattr(args, "save_profile", None)
+    if not name:
+        return
+    reason = validate_profile_name(name)
+    if reason is not None:
+        raise ConfigError(f"--save-profile 的 profile 名非法:{reason}")
+    try:
+        # 落盘副本脱敏(fail-closed):畸形/藏凭证的 base_url 抛 ValueError,
+        # 绝不原样落盘(凭证串落盘即红线事故);put_profile 内还有一层。
+        sanitized_base_url = sanitize_url(args.base_url) if args.base_url else None
+        put_profile(
+            Path.home(),
+            name,
+            {
+                "backend": args.backend,
+                "model": args.model,
+                "base_url": sanitized_base_url,
+            },
+        )
+    except ValueError as exc:
+        # exc 为 config 模块的中文原因(不回显 URL);原 URL 绝不进报错文案。
+        raise ConfigError(
+            f"base_url 无法解析,为防凭证泄漏已拒绝保存 profile({exc})"
+        ) from None
+    print(
+        f"[config] profile '{name}' 已保存并设为 active(下次启动自动生效)",
+        flush=True,
+    )
+
+
 def _build_backend(args: argparse.Namespace) -> LLMBackend:
     """按参数构造后端;密钥由后端自己从 env 读取(缺失抛 ConfigError)。"""
     model = args.model or os.environ.get(ENV_MODEL)
     if args.backend == "claude":
+        # args.base_url 已含 env 回填(resolve_backend_args):
+        # FOAM_LLM_BASE_URL 对 claude 同样生效(P1-1 起的行为改进,
+        # README 已文档化);都不给时退官方端点。
         return ClaudeBackend(
             model=model or DEFAULT_CLAUDE_MODEL,
             base_url=args.base_url or DEFAULT_BASE_URL,
@@ -436,6 +650,7 @@ def _create_engagement(args: argparse.Namespace) -> Engagement:
 
 
 async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
+    resolve_backend_args(args)  # P1-1:flag > env > profile > 内置默认,就地回填
     try:
         scope = load_scope(args.scope)
     except (OSError, ValueError) as exc:
@@ -443,6 +658,7 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
         return EXIT_USAGE
     try:
         backend = backend_factory(args)
+        _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
     except ConfigError as exc:
         print(f"[错误] {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -622,12 +838,14 @@ def _resume_preflight(
 
 
 async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
+    resolve_backend_args(args)  # P1-1:与 run 同一条解析链,就地回填
     prepared = _resume_preflight(args)
     if isinstance(prepared, int):
         return prepared
     engagement, scope, scope_source, objective, briefing, record_count = prepared
     try:
         backend = backend_factory(args)
+        _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
     except ConfigError as exc:
         engagement.close()
         print(f"[错误] {exc}", file=sys.stderr)
@@ -724,6 +942,20 @@ def _cmd_tui(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_USAGE
+    # P1-1:同一解析链就地回填(app.py 零改动,经 args 自然生效)。
+    resolve_backend_args(args)
+    # Fix-4(坏配置不落盘):--save-profile 落盘前先 _build_backend 预检——
+    # 构造即读 key env,ConfigError(缺 key/缺 base_url/坏 profile 名)在此
+    # 提前暴露,与 run/resume 口径拉齐;预检成功才保存。该构造无副作用
+    # (不发起网络,httpx 客户端首请求才建连),TUI 内装配会自行再构造;
+    # 预检产物随即关停,不带进 TUI。
+    try:
+        preflight = _build_backend(args)
+        _save_profile_if_requested(args)
+    except ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    asyncio.run(preflight.aclose())
     return int(tui_main(args))
 
 
@@ -737,6 +969,16 @@ def main(
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # P1-1:只读加载 ./.env(永不写它,红线)。只上屏键名,值绝不上屏;
+    # 畸形行中文警告(带行号)走 stderr;文件不存在静默。
+    injected, dotenv_warnings = load_dotenv(Path.cwd() / ".env")
+    for warning in dotenv_warnings:
+        print(f"[config] .env {warning}", file=sys.stderr)
+    if injected:
+        print(
+            f"[config] .env 注入 {len(injected)} 个变量:{', '.join(injected)}",
+            flush=True,
+        )
     factory = backend_factory or _build_backend
     if args.command in ("run", "resume"):
         try:
