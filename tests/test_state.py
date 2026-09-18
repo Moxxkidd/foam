@@ -8,10 +8,17 @@ engagement 目录一律建在 tmp_path,运行时产物不入库。
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
-from foam.state.files import LAYOUT, Engagement
+from foam.agent.prompts import render_engagement_template
+from foam.state.files import (
+    LAYOUT,
+    SCOPE_SECTION_BEGIN,
+    SCOPE_SECTION_END,
+    Engagement,
+)
 from foam.state.index import Index
 from foam.tools.state import TOOL_SCHEMAS, StateTool, mask_secret
 
@@ -386,3 +393,222 @@ def test_update_progress_after_close(engagement):
     engagement.mark_closed()
     text = engagement.update_progress(phase="收尾", current_objective="写报告")
     assert "状态:closed" in text
+
+
+# ================================================================ WP-14a
+# scope 动态段:markers / update_scope_section / update_scope_metadata /
+# update_objective(验收 7/4 助手级 + 元数据)
+
+
+def _scope_block(text: str) -> str:
+    """取「## 授权范围」标题到说明引用块末尾的整段(两处初始形态合一比对用)。"""
+    start = text.index("## 授权范围")
+    tail = "影响执行且会被下次写入覆盖。"
+    return text[start : text.index(tail) + len(tail)]
+
+
+def _section_between_markers(text: str) -> str:
+    begin = text.index(SCOPE_SECTION_BEGIN)
+    start = text.index("\n", begin) + 1
+    end = text.index(SCOPE_SECTION_END, start)
+    return text[start : text.rfind("\n", start, end) + 1]
+
+
+def test_initial_md_has_paired_scope_markers(engagement):
+    """验收 7:create 路径 _render_initial_md 产物开箱即含 markers 成对。"""
+    text = engagement.read_progress()
+    assert text.count(SCOPE_SECTION_BEGIN) == 1
+    assert text.count(SCOPE_SECTION_END) == 1
+    assert text.index(SCOPE_SECTION_BEGIN) < text.index(SCOPE_SECTION_END)
+    # 初始形态:标题 + 占位行 + 「harness 维护,勿手改」说明引用块
+    assert "(scope 尚未冻结——确认后由 harness 写入当前生效的范围规则)" in text
+    assert "> 以上「授权范围」段由 harness 维护,勿手改" in text
+
+
+def test_initial_md_scope_block_matches_prompts_template():
+    """验收 7:初始形态与 14d _ENGAGEMENT_TEMPLATE 动态段逐字合一
+    (14d 一致性请求 2「两处初始形态合一」)。"""
+    from_template = render_engagement_template(
+        objective="合一比对", started_at="2026-09-18T00:00:00+00:00"
+    )
+    meta = {
+        "id": "cmp-eng",
+        "objective": "合一比对",
+        "created_at": "2026-09-18T00:00:00+00:00",
+        "scope": None,
+    }
+    from_files = Engagement._render_initial_md(meta)
+    assert _scope_block(from_files) == _scope_block(from_template)
+
+
+def test_update_scope_metadata_idempotent_and_absolute(tmp_path, scope_file):
+    engagement = Engagement.create(
+        tmp_path / "engagements", "meta 测试", engagement_id="meta-eng"
+    )
+    assert engagement.metadata()["scope"] is None  # create 无 scope 行为不变
+
+    meta = engagement.update_scope_metadata(scope_file)
+    expected = hashlib.sha256(scope_file.read_bytes()).hexdigest()
+    assert meta["scope"] == {"path": str(scope_file.resolve()), "sha256": expected}
+    assert Path(meta["scope"]["path"]).is_absolute()
+    # 幂等:重复调用结果一致
+    assert engagement.update_scope_metadata(scope_file)["scope"] == meta["scope"]
+    assert engagement.metadata()["scope"] == meta["scope"]
+
+    with pytest.raises(FileNotFoundError, match="scope 文件不存在"):
+        engagement.update_scope_metadata(tmp_path / "nope.scope")
+
+
+def test_update_scope_section_rewrite_preserves_outside_bytes(engagement):
+    """验收 4:单形态——markers 间重写,markers 外内容字节不变(含模型手写段)。"""
+    path = engagement.paths.progress_md
+    before = path.read_text(encoding="utf-8") + "\n## 模型手写笔记\n\n这段要保留\n"
+    path.write_text(before, encoding="utf-8")
+
+    section = "- 来源:/x/scope.confirmed\n- 规则(每行一条):\n  192.0.2.0/24"
+    engagement.update_scope_section(section)
+    after = engagement.read_progress()
+
+    prefix = before[: before.index(SCOPE_SECTION_BEGIN)]
+    suffix = before[before.index(SCOPE_SECTION_END) + len(SCOPE_SECTION_END) :]
+    assert after.startswith(prefix)
+    assert after.endswith(suffix)
+    assert _section_between_markers(after) == section + "\n"
+    assert "(scope 尚未冻结" not in after  # 占位行被替换
+    assert "这段要保留" in after  # markers 外模型手写内容原样保留
+
+    # 连续两次写入幂等(同内容再写,文件不变)
+    engagement.update_scope_section(section)
+    assert engagement.read_progress() == after
+
+
+def test_update_scope_section_empty_section_rewrite(engagement):
+    """markers 间为空段(BEGIN 行紧邻 END 行)时重写不复制文件(下标边界)。"""
+    path = engagement.paths.progress_md
+    text = path.read_text(encoding="utf-8")
+    empty_md = (
+        text[: text.index(SCOPE_SECTION_BEGIN) + len(SCOPE_SECTION_BEGIN)]
+        + "\n"
+        + text[text.index(SCOPE_SECTION_END) :]
+    )
+    path.write_text(empty_md, encoding="utf-8")
+    engagement.update_scope_section("- 来源:empty")
+    after = engagement.read_progress()
+    assert _section_between_markers(after) == "- 来源:empty\n"
+    assert after.count("# Engagement") == 1  # 文件未被复制
+    assert after.count(SCOPE_SECTION_BEGIN) == 1
+
+
+def test_update_scope_section_same_line_markers_converge(engagement):
+    """BEGIN/END 同行(模型手改)也属于 markers 间重写:一次写入即规整,
+    幂等收敛,不再每次追加新块导致文件无界增长。"""
+    path = engagement.paths.progress_md
+    text = path.read_text(encoding="utf-8")
+    begin = text.index(SCOPE_SECTION_BEGIN)
+    end = text.index(SCOPE_SECTION_END) + len(SCOPE_SECTION_END)
+    path.write_text(
+        text[:begin] + SCOPE_SECTION_BEGIN + SCOPE_SECTION_END + text[end:],
+        encoding="utf-8",
+    )
+
+    engagement.update_scope_section("- 来源:a")
+    once = engagement.read_progress()
+    assert _section_between_markers(once) == "- 来源:a\n"
+    assert once.count("## 授权范围") == 1  # 未追加新块
+
+    engagement.update_scope_section("- 来源:a")
+    assert engagement.read_progress() == once  # 幂等
+    engagement.update_scope_section("- 来源:b")
+    thrice = engagement.read_progress()
+    assert _section_between_markers(thrice) == "- 来源:b\n"
+    assert len(thrice) == len(once)  # 无界增长修复的直接证据
+    assert thrice.count("## 授权范围") == 1
+
+
+def test_update_scope_section_end_line_prefix_replaced(engagement):
+    """END 所在行有前置文本时,前缀属 markers 间内容,一并替换不留渣。"""
+    path = engagement.paths.progress_md
+    text = path.read_text(encoding="utf-8")
+    old = (
+        SCOPE_SECTION_BEGIN
+        + "\n(scope 尚未冻结——确认后由 harness 写入当前生效的范围规则)\n"
+        + SCOPE_SECTION_END
+    )
+    mangled = SCOPE_SECTION_BEGIN + "\n模型乱写的同行残留 " + SCOPE_SECTION_END
+    assert old in text
+    path.write_text(text.replace(old, mangled), encoding="utf-8")
+
+    engagement.update_scope_section("- 来源:clean")
+    after = engagement.read_progress()
+    assert _section_between_markers(after) == "- 来源:clean\n"
+    assert "模型乱写的同行残留" not in after
+
+
+def test_update_scope_section_unpaired_begin_recovers(engagement):
+    """markers 不成对(只剩 BEGIN,END 被模型删掉)→ 剥离游离 marker 后
+    容错附加恢复完整对,并收敛回单形态。"""
+    path = engagement.paths.progress_md
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text[: text.index(SCOPE_SECTION_END)] + text[text.index("> 以上") :],
+        encoding="utf-8",
+    )
+    assert SCOPE_SECTION_END not in path.read_text(encoding="utf-8")
+
+    engagement.update_scope_section("- 来源:recovered")
+    recovered = engagement.read_progress()
+    assert recovered.count(SCOPE_SECTION_BEGIN) == 1  # 游离 BEGIN 已剥离
+    assert recovered.count(SCOPE_SECTION_END) == 1
+    assert _section_between_markers(recovered) == "- 来源:recovered\n"
+
+    # 恢复后收敛回单形态:再次写入走 markers 间重写
+    engagement.update_scope_section("- 来源:final")
+    final = engagement.read_progress()
+    assert _section_between_markers(final) == "- 来源:final\n"
+    assert final.count(SCOPE_SECTION_BEGIN) == 1
+    assert final.count(SCOPE_SECTION_END) == 1
+
+
+def test_update_scope_section_fault_append_restores_markers(engagement):
+    """验收 4 容错分支:markers 缺失时完整段附加到末尾一次以恢复 markers。"""
+    path = engagement.paths.progress_md
+    text = path.read_text(encoding="utf-8")
+    # 模型误删整段(markers 缺失,信息面容错场景)
+    path.write_text(
+        text[: text.index("## 授权范围")] + text[text.index("## 进展") :],
+        encoding="utf-8",
+    )
+    engagement.update_scope_section("- 来源:y")
+    recovered = engagement.read_progress()
+    assert SCOPE_SECTION_BEGIN in recovered and SCOPE_SECTION_END in recovered
+    assert _section_between_markers(recovered) == "- 来源:y\n"
+
+    # 恢复后收敛回单形态:再次写入走 markers 间重写,markers 仍各一处
+    engagement.update_scope_section("- 来源:z")
+    again = engagement.read_progress()
+    assert again.count(SCOPE_SECTION_BEGIN) == 1
+    assert again.count(SCOPE_SECTION_END) == 1
+    assert _section_between_markers(again) == "- 来源:z\n"
+
+
+def test_update_objective_replaces_md_line(engagement):
+    engagement.update_objective("新目标:复核边界")
+    assert engagement.metadata()["objective"] == "新目标:复核边界"
+    text = engagement.read_progress()
+    assert "- 目标:新目标:复核边界" in text
+    assert "- 目标:测试目标 objective" not in text
+
+
+def test_update_objective_matches_parenthesized_form(engagement):
+    """prompts 模板形态 ``- 目标(objective):`` 同样匹配替换。"""
+    path = engagement.paths.progress_md
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "- 目标:测试目标 objective", "- 目标(objective):测试目标 objective"
+        ),
+        encoding="utf-8",
+    )
+    engagement.update_objective("统一形态")
+    text = engagement.read_progress()
+    assert "- 目标:统一形态" in text
+    assert "目标(objective)" not in text

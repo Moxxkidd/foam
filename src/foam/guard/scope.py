@@ -31,6 +31,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import shlex
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -463,6 +464,19 @@ def check_command(
             },
         )
     return decision
+
+
+def render_canonical_rules(rules: Iterable[str]) -> str:
+    """规则列表 → canonical 文本(WP-14a,Q2/D1 落盘与 round-trip 形态)。
+
+    每行一条、保持顺序、无注释空行、尾部单换行;空列表 → 空串(空规则集
+    合法,语义=拒绝一切网络目标)。纯文本函数,不做语法校验——合法性永远
+    由 ``parse_scope`` 裁决。输入应为已归一化的规则行(去注释/去空白)。
+    """
+    lines = [rule.strip() for rule in rules if rule.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 def scope_payload(scope: Scope, source: str) -> dict:

@@ -8,28 +8,35 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from foam.agent.loop import KIND_RUN_FINISHED, KIND_RUN_STARTED
+from foam.agent.scope_compiler import scope_event_payload
 from foam.cli import main as cli_main
 from foam.guard.audit import (
     KIND_EXEC_REQUEST,
     KIND_EXEC_RESULT_META,
     KIND_LLM_EXCHANGE_META,
     KIND_OPERATOR_INTERJECT,
+    KIND_REFUSAL_DETECTED,
+    KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
+    KIND_SCOPE_UPDATED,
     AuditLog,
     llm_meta,
     verify,
 )
-from foam.guard.scope import parse_scope, scope_payload
+from foam.guard.scope import load_scope, parse_scope, scope_payload
 from foam.replay import (
+    audit_stats,
     build_report,
     build_resume_briefing,
     find_chain_break,
     read_records,
     recover_objective,
     recover_scope_record,
+    summarize_recent_rounds,
 )
 from foam.state.files import Engagement
 from foam.state.index import Index
@@ -294,3 +301,194 @@ def test_resume_helpers(tmp_path):
     briefing_one = build_resume_briefing(records, recent_rounds=1)
     assert "run 结束" in briefing_one
     assert "nmap -Pn" not in briefing_one  # 第一轮的动作在窗口外
+
+
+# ---------------------------------------------------------------------------
+# WP-14a:recover_scope_record 三 kind 归一化(验收 8,T2+)
+# ---------------------------------------------------------------------------
+
+
+def _make_chain(tmp_path: Path, entries: list[tuple[str, dict]]) -> list[dict]:
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    for kind, payload in entries:
+        audit.append(kind, payload)
+    audit.close()
+    return read_records(tmp_path / "audit.jsonl")
+
+
+def _nl_payload(scope_text: str, path: str, sha: str, **extra) -> dict:
+    return scope_event_payload(
+        parse_scope(scope_text),
+        source="nl",
+        path=path,
+        canonical_sha256=sha,
+        nl_text="NL 描述",
+        compile_attempts=1,
+        **extra,
+    )
+
+
+def test_recover_scope_record_normalizes_confirmed_only_chain(tmp_path):
+    """仅含 scope_confirmed(无 scope_loaded)的链 → D13 映射输出。"""
+    payload = _nl_payload(
+        "192.0.2.0/24\nlab.example.com\n", "/eng/demo/scope.confirmed", "ab" * 32
+    )
+    records = _make_chain(tmp_path, [(KIND_SCOPE_CONFIRMED, payload)])
+    record = recover_scope_record(records)
+    assert record["source"] == "/eng/demo/scope.confirmed"  # payload path → source
+    assert record["origin"] == "nl"  # payload source(file|nl)→ origin
+    # 四键摘要逐键相等 + canonical_sha256 透传
+    for key in ("cidrs", "hosts", "wildcards", "url_prefixes"):
+        assert record[key] == payload[key]
+    assert record["canonical_sha256"] == "ab" * 32
+
+
+def test_recover_scope_record_normalizes_updated_only_chain(tmp_path):
+    payload = _nl_payload(
+        "198.51.100.0/24\n",
+        "/eng/demo/scope.confirmed",
+        "cd" * 32,
+        old_sha256="ab" * 32,
+    )
+    records = _make_chain(tmp_path, [(KIND_SCOPE_UPDATED, payload)])
+    record = recover_scope_record(records)
+    assert record["source"] == "/eng/demo/scope.confirmed"
+    assert record["origin"] == "nl"
+    assert record["cidrs"] == ["198.51.100.0/24"]
+    assert record["canonical_sha256"] == "cd" * 32
+
+
+def test_recover_scope_record_mixed_chain_takes_last(tmp_path):
+    """混合三 kind 链取链上最后一条。"""
+    scope = parse_scope("127.0.0.0/8\n")
+    loaded = scope_payload(scope, "scopes/lab.scope")
+    confirmed = _nl_payload("192.0.2.0/24\n", "/eng/x/scope.confirmed", "ab" * 32)
+    updated = _nl_payload(
+        "198.51.100.0/24\n", "/eng/x/scope.confirmed", "cd" * 32, old_sha256="ab" * 32
+    )
+    records = _make_chain(
+        tmp_path,
+        [
+            (KIND_SCOPE_LOADED, loaded),
+            (KIND_SCOPE_CONFIRMED, confirmed),
+            (KIND_SCOPE_UPDATED, updated),
+        ],
+    )
+    record = recover_scope_record(records)
+    assert record["canonical_sha256"] == "cd" * 32  # 最后一条(scope_updated)
+    assert record["origin"] == "nl"
+
+    # 反向:scope_loaded 在最后 → payload 原样(既有行为,无 origin 键)
+    records = _make_chain(
+        tmp_path, [(KIND_SCOPE_CONFIRMED, confirmed), (KIND_SCOPE_LOADED, loaded)]
+    )
+    record = recover_scope_record(records)
+    assert record == loaded
+    assert "origin" not in record
+
+
+def test_recover_scope_record_legacy_loaded_only_unchanged(tmp_path):
+    """纯 scope_loaded 旧链行为不变。"""
+    root = make_engagement(tmp_path)
+    records = read_records(root / "audit.jsonl")
+    record = recover_scope_record(records)
+    assert record["source"] == "scopes/lab.scope"
+    assert record["cidrs"] == ["127.0.0.0/8"]
+    assert "origin" not in record
+
+
+def test_normalized_record_feeds_resolve_scope_logic(tmp_path):
+    """验收 8 消费面:归一化记录键集满足 cli.py:739-748——source 可作文件
+    路径打开、四键可逐键比对(模拟 _resolve_scope 比对逻辑;纯链 e2e 归 14b)。"""
+    eng_dir = tmp_path / "eng"
+    eng_dir.mkdir()
+    canonical = "192.0.2.0/24\nlab.example.com\n"
+    confirmed = eng_dir / "scope.confirmed"
+    confirmed.write_text(canonical, encoding="utf-8")
+    sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    payload = _nl_payload(canonical, str(confirmed.resolve()), sha)
+    records = _make_chain(tmp_path, [(KIND_SCOPE_CONFIRMED, payload)])
+
+    record = recover_scope_record(records)
+    # 以下逐行模拟 cli.py:739-748 的比对逻辑(零适配消费断言)
+    path = Path(str(record.get("source") or ""))
+    assert path.is_file()
+    summary = load_scope(path).summary()
+    mismatched = [
+        key
+        for key in ("cidrs", "hosts", "wildcards", "url_prefixes")
+        if summary[key] != list(record.get(key) or [])
+    ]
+    assert mismatched == []
+
+
+# ---------------------------------------------------------------------------
+# WP-14a:audit_stats refusals 计数与报告展示(验收 5)/ interesting 集(验收 6)
+# ---------------------------------------------------------------------------
+
+
+def test_audit_stats_counts_refusals_and_report_shows(tmp_path):
+    root = make_engagement(tmp_path)
+    audit = AuditLog(root / "audit.jsonl")
+    for round_no in (1, 2):
+        audit.append(
+            KIND_REFUSAL_DETECTED,
+            {"round": round_no, "text_sha256": "ab" * 32, "patterns": ["无法协助"]},
+        )
+    audit.close()
+    assert verify(root / "audit.jsonl")
+
+    records = read_records(root / "audit.jsonl")
+    stats = audit_stats(records)
+    assert stats["refusals"] == 2
+    assert "拒答 2 次" in build_report(root)
+
+
+def test_audit_stats_legacy_chain_refusals_zero(tmp_path):
+    """旧链(无新 kind)stats/replay 行为不变:refusals=0,不炸。"""
+    root = make_engagement(tmp_path)
+    records = read_records(root / "audit.jsonl")
+    assert audit_stats(records)["refusals"] == 0
+    report = build_report(root)
+    assert "拒答 0 次" in report
+    assert "审计链:完整(8 条记录" in report  # 旧断言面不变
+
+
+def test_resume_briefing_shows_scope_updated(tmp_path):
+    """验收 6(总纲 15):interesting 集含 scope_updated,简报出现变更行
+    (format_record 通用兜底格式,不新设专用格式)。"""
+    root = make_engagement(tmp_path)
+    audit = AuditLog(root / "audit.jsonl")
+    audit.append(
+        KIND_LLM_EXCHANGE_META,
+        llm_meta("p3", "r3", prompt_tokens=10, response_tokens=5),
+    )
+    audit.append(
+        KIND_SCOPE_UPDATED,
+        _nl_payload(
+            "198.51.100.0/24\n",
+            "/eng/x/scope.confirmed",
+            "cd" * 32,
+            old_sha256="ab" * 32,
+        ),
+    )
+    audit.close()
+
+    records = read_records(root / "audit.jsonl")
+    lines = summarize_recent_rounds(records, 2)
+    scope_lines = [line for line in lines if "scope_updated" in line]
+    assert len(scope_lines) == 1
+    assert scope_lines[0].startswith("- [seq ")  # 通用兜底:kind + payload 摘要
+    assert "198.51.100.0/24" in scope_lines[0]
+
+    briefing = build_resume_briefing(records, recent_rounds=2)
+    assert "scope_updated" in briefing
+
+
+def test_resume_briefing_without_scope_updated_unchanged(tmp_path):
+    """无 scope_updated 的旧链简报行为不变。"""
+    root = make_engagement(tmp_path)
+    records = read_records(root / "audit.jsonl")
+    briefing = build_resume_briefing(records, recent_rounds=2)
+    assert "scope_updated" not in briefing
+    assert "nmap -Pn --top-ports 100 127.0.0.1" in briefing  # 原有内容照常

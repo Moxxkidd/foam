@@ -15,6 +15,7 @@
 | WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | closed | 2026-08-25 | docs/dev-logs/WP-11.md |
 | WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | closed | 2026-08-26 | docs/dev-logs/WP-12.md |
 | WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | closed | 2026-08-27 | docs/dev-logs/WP-13.md |
+| WP-14a | scope 编译与冻结基座 | `agent/scope_compiler.py`、`guard/scope.py`(canonical 渲染助手)、`guard/audit.py`、`state/files.py`、`replay.py`、`tests/test_scope_compiler.py` | 01-13 全部关闭 + 14d `prompts.render_scope_section` | closed | 2026-09-18 | docs/dev-logs/WP-14a.md |
 | WP-14d | 反拒答授权与拒答观测(纯观测) | `agent/prompts.py`、`agent/refusal.py`、`agent/loop.py`(2 处)、`tests/test_prompts.py`、`tests/test_refusal.py` | 零代码依赖(与 14a 并行) | closed | 2026-09-18 | docs/dev-logs/WP-14d.md |
 
 ## 里程碑门(milestone;挂牌不改 WP 制,见 HANDOVER 同名节)
@@ -216,3 +217,29 @@
   HEAD+本片文件独立复跑同数),ruff 本片文件全绿(cli.py:386 E501
   为 HEAD 既有,归 14b/14c 面,如实记录);prompt 快照逐字更新属
   本片有意行为,声明见 docs/dev-logs/WP-14d.md。
+- 2026-09-18 **WP-14a closed**:scope 编译与冻结基座(总纲 WP-14 切片 A,
+  与 WP-14d 同树并行、文件所有权零重叠)。交付:agent/scope_compiler.py
+  新建——compile_scope(一次性 LLM 调用,独立 system prompt 内嵌四种规则
+  形态精确语义,严格 JSON 无工具无流式;归一化 → render_canonical_rules
+  → parse_scope round-trip 门禁 Q2,产物 100% 落既有护栏语法;audit 形参
+  每次调用含失败路径落 llm_exchange_meta,D7;BackendError/JSON 失败/
+  round-trip 拒绝三类中文可行动报错)、ScopeCompilation/ScopeCompileError、
+  freeze_scope(唯一冻结入口,D13 写序:scope.confirmed tmp+rename →
+  update_scope_metadata → objective 同步 D8 → 动态段重写(消费 14d
+  prompts.render_scope_section,不自建第二份渲染)→ scope_confirmed/
+  scope_updated 审计)、scope_event_payload(D13 payload 契约单源,file
+  流 path=as-given 原串对齐 14b W14b-2)。guard/scope.py 仅 +渲染助手
+  (判定/解析零改);guard/audit.py KNOWN_KINDS +三常量(scope_confirmed/
+  scope_updated/refusal_detected,他片只使用不注册);state/files.py
+  markers 常量(定义权本片,与 14d 模板逐字一致)+ create 初始段(与
+  _ENGAGEMENT_TEMPLATE 逐字合一)+ update_scope_section(markers 间原子
+  重写单形态,容错剥离游离 marker 后附加恢复)+ update_scope_metadata
+  (resolve 绝对路径)+ update_objective + update_progress 互斥声明级;
+  replay.py recover_scope_record 三 kind 归一化(D13 映射,cli.py:739-748
+  零适配消费)+ interesting 集 +scope_updated + audit_stats refusals +
+  报告统计行。T2 评审(四视角 + 逐发现对抗核实,21 agents)确认 7 条
+  (major 2:同行 markers 不收敛/台账登记缺失;minor 4;nit 1)全部修复,
+  驳回 9 条超规格偏好不行动。本片测试 37 例新增全绿(编译器 17 +
+  state 11 + replay 9),全仓 490 passed + 2 skipped 零回归(14d 落地后
+  基线 453+2),ruff 本片文件全绿;验收 1-9 逐条核销见
+  docs/dev-logs/WP-14a.md。

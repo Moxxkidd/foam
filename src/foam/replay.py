@@ -35,7 +35,10 @@ from foam.guard.audit import (
     KIND_KILL_SWITCH,
     KIND_LLM_EXCHANGE_META,
     KIND_OPERATOR_INTERJECT,
+    KIND_REFUSAL_DETECTED,
+    KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
+    KIND_SCOPE_UPDATED,
     ZERO_HASH,
     compute_hash,
     explain,
@@ -240,15 +243,40 @@ def recover_objective(records: list[dict[str, Any]]) -> str | None:
 
 
 def recover_scope_record(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """最后一条 scope_loaded 的 payload(source + 规则摘要),供 resume 对账。"""
+    """链上最后一条 scope 记录的归一化形式(WP-14a,定案 D13),供 resume 对账。
+
+    取链上最后一条 ``scope_loaded``/``scope_confirmed``/``scope_updated``:
+
+    - ``scope_loaded`` → payload 原样(既有行为,``source`` 即路径);
+    - ``scope_confirmed``/``scope_updated`` → D13 映射:输出 ``source`` 键 =
+      payload 的 ``path``、``origin`` 键 = payload 的 ``source``(file|nl)、
+      四键摘要原样透传、``canonical_sha256`` 透传。缺键容忍(``.get`` 兜底)。
+
+    注意两处 source 语义不同:payload 的 source=来源枚举 file|nl,归一化输出
+    的 source=scope 文件路径;本映射是两者唯一转接点,使 cli.py:739-748 的
+    ``_resolve_scope`` 链上回退零适配消费。
+    """
     for record in reversed(records):
-        if record.get("kind") == KIND_SCOPE_LOADED:
+        kind = record.get("kind")
+        if kind == KIND_SCOPE_LOADED:
             return dict(record.get("payload") or {})
+        if kind in (KIND_SCOPE_CONFIRMED, KIND_SCOPE_UPDATED):
+            payload = record.get("payload") or {}
+            return {
+                "source": payload.get("path"),
+                "origin": payload.get("source"),
+                "cidrs": payload.get("cidrs"),
+                "hosts": payload.get("hosts"),
+                "wildcards": payload.get("wildcards"),
+                "url_prefixes": payload.get("url_prefixes"),
+                "canonical_sha256": payload.get("canonical_sha256"),
+            }
     return None
 
 
 def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
-    """run 次数 / LLM 轮数 / 命令数 / 拒绝数 / 插话数 / kill 数(报告与简报共用)。"""
+    """run 次数 / LLM 轮数 / 命令数 / 拒绝数 / 插话数 / kill 数 / 拒答数
+    (报告与简报共用;拒答为 WP-14 纯观测计数,供授权段措辞迭代供数)。"""
     stats = {
         "runs": 0,
         "rounds": 0,
@@ -256,6 +284,7 @@ def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
         "denied": 0,
         "interjects": 0,
         "kills": 0,
+        "refusals": 0,
     }
     for record in records:
         kind = record.get("kind")
@@ -271,6 +300,8 @@ def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
             stats["interjects"] += 1
         elif kind == KIND_KILL_SWITCH:
             stats["kills"] += 1
+        elif kind == KIND_REFUSAL_DETECTED:
+            stats["refusals"] += 1
     return stats
 
 
@@ -290,6 +321,9 @@ def summarize_recent_rounds(records: list[dict[str, Any]], n: int) -> list[str]:
         KIND_LOOP_CORRECTION,
         KIND_KILL_SWITCH,
         KIND_RUN_FINISHED,
+        # WP-14a:resume 简报最近 N 轮可见 scope 变更(行格式走
+        # format_record 通用摘要兜底,不新设专用格式)
+        KIND_SCOPE_UPDATED,
     }
     lines = []
     for record in records:
@@ -498,6 +532,7 @@ def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
         f"- run {stats['runs']} 次 / LLM {stats['rounds']} 轮 / 命令 "
         f"{stats['commands']} 条(拒绝 {stats['denied']})/ 插话 "
         f"{stats['interjects']} 条 / kill {stats['kills']} 次"
+        f" / 拒答 {stats['refusals']} 次"
     )
     if not index_missing:
         counts = {

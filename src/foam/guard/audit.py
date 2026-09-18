@@ -46,6 +46,10 @@ KIND_EXEC_RESULT_META = "exec_result_meta"
 KIND_OPERATOR_INTERJECT = "operator_interject"
 KIND_KILL_SWITCH = "kill_switch"
 KIND_LLM_EXCHANGE_META = "llm_exchange_meta"
+# WP-14a 注册(他片只使用不注册):scope 冻结/更新、拒答观测。
+KIND_SCOPE_CONFIRMED = "scope_confirmed"
+KIND_SCOPE_UPDATED = "scope_updated"
+KIND_REFUSAL_DETECTED = "refusal_detected"
 
 KNOWN_KINDS = frozenset(
     {
@@ -56,6 +60,9 @@ KNOWN_KINDS = frozenset(
         KIND_OPERATOR_INTERJECT,
         KIND_KILL_SWITCH,
         KIND_LLM_EXCHANGE_META,
+        KIND_SCOPE_CONFIRMED,
+        KIND_SCOPE_UPDATED,
+        KIND_REFUSAL_DETECTED,
     }
 )
 

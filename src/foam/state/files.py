@@ -20,6 +20,13 @@ WP-01 的 BashTool(output_dir=...) 由调用方注入输出目录,本 WP 不改 
 与已有 engagement.json 冲突时报 ValueError——防止两个 engagement 误用同一
 目录。audit.jsonl 只 touch 占位,不初始化哈希链(空文件对 WP-02 的
 AuditLog 即「全新链」)。
+
+WP-14a 动态段契约(D12):ENGAGEMENT.md 开箱即含 scope 动态段 markers
+(``SCOPE_SECTION_BEGIN``/``SCOPE_SECTION_END``,定义权在本模块,14d 模板
+逐字一致);``update_scope_section`` 仅「markers 间原子重写」单一形态。
+**``update_progress`` 与动态段互斥**:它整文件重写会抹掉 markers;目前
+运行期无调用方(仅 tests/test_state.py 触达),未来若给 update_progress
+接运行期调用方,必须同步改造为保留动态段。
 """
 
 from __future__ import annotations
@@ -46,9 +53,25 @@ LAYOUT: dict[str, str] = {
 
 DEFAULT_ENGAGEMENTS_DIR = Path("engagements")
 
+#: scope 动态段 markers(WP-14a,边界契约 1:定义权在本模块;14d
+#: ``_ENGAGEMENT_TEMPLATE`` 的动态段占位与写入助手消费同一字面量)。
+SCOPE_SECTION_BEGIN = "<!-- foam:scope:begin -->"
+SCOPE_SECTION_END = "<!-- foam:scope:end -->"
+
+#: ENGAGEMENT.md 目标行(create 模板 ``- 目标:`` 与 prompts 模板
+#: ``- 目标(objective):`` 两种形态都认),update_objective 据此定位。
+_OBJECTIVE_LINE_RE = re.compile(r"^- 目标(\(objective\))?[:：]")
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """tmp+rename 原子写回(同目录临时文件,rename 后无残留)。"""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 def _slugify(text: str, max_len: int = 24) -> str:
@@ -222,6 +245,23 @@ class Engagement:
         self._write_metadata(meta)
         return meta
 
+    def update_scope_metadata(self, scope_path: str | Path) -> dict[str, Any]:
+        """幂等重写 engagement.json 的 ``meta["scope"]``(WP-14a,供冻结助手复用)。
+
+        内部 ``Path.resolve()`` 落绝对路径(定案 D13:cli.py:739 的
+        ``is_file`` 判定不依赖 resume 时的 cwd)+ 文件字节 sha256;文件不存在
+        抛 FileNotFoundError。create 路径的 ``_scope_metadata`` 行为不变
+        (仍记 as-given 原串)。返回更新后的完整元数据。
+        """
+        path = Path(scope_path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"scope 文件不存在:{path}")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        meta = self.metadata()
+        meta["scope"] = {"path": str(path), "sha256": digest}
+        self._write_metadata(meta)
+        return meta
+
     # ---------- ENGAGEMENT.md(loop 每轮调用的读写接口) ----------
 
     @property
@@ -246,6 +286,11 @@ class Engagement:
 
         关键发现计数自动从索引库统计;note 为可选自由段落(一句话级,
         保持文件小而可整载入 context)。返回渲染后的全文。
+
+        WP-14a 声明(定案 D12):本方法整文件重写,会抹掉 scope 动态段
+        markers——**与动态段互斥**。目前运行期无调用方(仅
+        tests/test_state.py 触达),行为保持不变;未来若接运行期调用方,
+        必须同步改造为保留动态段。
         """
         meta = self.metadata()
         counts = self.index.counts()
@@ -298,7 +343,20 @@ class Engagement:
         scope = meta.get("scope")
         if scope:
             lines.append(f"- scope:{scope['path']} (sha256:{scope['sha256']})")
+        # WP-14a(定案 D12):create 路径开箱即含 scope 动态段 markers,与 14d
+        # _ENGAGEMENT_TEMPLATE 的动态段逐字合一(14d 一致性请求 2)——写入助手
+        # 据此只需「markers 间原子重写」单一形态,无插入特例。markers 间占位行
+        # 与 markers 外说明引用块均为模板静态文本,不经写入助手重写。
         lines += [
+            "",
+            "## 授权范围",
+            "",
+            SCOPE_SECTION_BEGIN,
+            "(scope 尚未冻结——确认后由 harness 写入当前生效的范围规则)",
+            SCOPE_SECTION_END,
+            "",
+            "> 以上「授权范围」段由 harness 维护,勿手改——护栏判定以代码为准,手改不",
+            "> 影响执行且会被下次写入覆盖。",
             "",
             "## 进展(loop 每轮更新)",
             "",
@@ -306,6 +364,87 @@ class Engagement:
             "",
         ]
         return "\n".join(lines)
+
+    def update_scope_section(self, section: str) -> None:
+        """动态段写入助手(WP-14a,定案 D12 **单形态**):markers 间内容整段
+        替换,tmp+rename 原子写回,markers 外字节不变。
+
+        - ``section``:markers 之间的新内容(不含 markers 本身)。渲染唯一
+          来源为 14d ``prompts.render_scope_section``,调用方一律消费其输出,
+          本助手不自建渲染。
+        - 「markers 间」以 marker 字面量本身为界:BEGIN 字面量之后、END
+          字面量之前的全部内容(含同行残留文本)都算段内,整段替换——故
+          同行 markers、END 行前缀残留等模型手改形态同样收敛。
+        - 容错分支(D12 单形态的细化,D6 信息面容错):模型可写
+          ENGAGEMENT.md;markers 缺失/不成对(END 在 BEGIN 前、只剩其一)
+          时,先剥离游离 marker 字面量,再将完整段(标题 + markers + 内容)
+          附加到文件末尾一次以恢复 markers——这是容错恢复,不构成第二写入
+          形态;正常路径永远是 markers 间重写。
+        """
+        path = self.paths.progress_md
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        body = section.strip("\n") + "\n"
+
+        begin_idx = text.find(SCOPE_SECTION_BEGIN)
+        end_idx = (
+            text.find(SCOPE_SECTION_END, begin_idx + len(SCOPE_SECTION_BEGIN))
+            if begin_idx != -1
+            else -1
+        )
+        if begin_idx != -1 and end_idx != -1:
+            # 正常路径(唯一形态):marker 字面量间整段重写,markers 外字节不动
+            content_start = begin_idx + len(SCOPE_SECTION_BEGIN)
+            new_text = text[:content_start] + "\n" + body + text[end_idx:]
+        else:
+            # 容错恢复:剥离游离 marker 字面量,完整段附加到文件末尾一次
+            cleaned = text.replace(SCOPE_SECTION_BEGIN, "").replace(
+                SCOPE_SECTION_END, ""
+            )
+            block = (
+                "## 授权范围\n\n"
+                + SCOPE_SECTION_BEGIN
+                + "\n"
+                + body
+                + SCOPE_SECTION_END
+                + "\n"
+            )
+            if not cleaned.strip():
+                new_text = block
+            else:
+                sep = "" if cleaned.endswith("\n") else "\n"
+                new_text = cleaned + sep + "\n" + block
+        _atomic_write_text(path, new_text)
+
+    def update_objective(self, objective: str) -> None:
+        """冻结时以最新文本覆盖 objective(WP-14a,定案 D8 落点)。
+
+        engagement.json objective 覆盖 + ENGAGEMENT.md 首个匹配
+        ``^- 目标(\\(objective\\))?[:：]`` 的行替换为 ``- 目标:{objective}``
+        (无匹配行则在首个 ``# `` 标题行后插入),tmp+rename。
+        """
+        meta = self.metadata()
+        meta["objective"] = objective
+        self._write_metadata(meta)
+
+        path = self.paths.progress_md
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        lines = text.splitlines()
+        new_line = f"- 目标:{objective}"
+        for i, line in enumerate(lines):
+            if _OBJECTIVE_LINE_RE.match(line):
+                lines[i] = new_line
+                break
+        else:
+            for i, line in enumerate(lines):
+                if line.startswith("# "):
+                    lines.insert(i + 1, new_line)
+                    break
+            else:
+                lines.insert(0, new_line)
+        new_text = "\n".join(lines)
+        if text.endswith("\n") or not text:
+            new_text += "\n"
+        _atomic_write_text(path, new_text)
 
     # ---------- 校验 ----------
 
