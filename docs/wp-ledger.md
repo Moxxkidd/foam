@@ -17,6 +17,7 @@
 | WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | closed | 2026-08-27 | docs/dev-logs/WP-13.md |
 | WP-14a | scope 编译与冻结基座 | `agent/scope_compiler.py`、`guard/scope.py`(canonical 渲染助手)、`guard/audit.py`、`state/files.py`、`replay.py`、`tests/test_scope_compiler.py` | 01-13 全部关闭 + 14d `prompts.render_scope_section` | closed | 2026-09-18 | docs/dev-logs/WP-14a.md |
 | WP-14d | 反拒答授权与拒答观测(纯观测) | `agent/prompts.py`、`agent/refusal.py`、`agent/loop.py`(2 处)、`tests/test_prompts.py`、`tests/test_refusal.py` | 零代码依赖(与 14a 并行) | closed | 2026-09-18 | docs/dev-logs/WP-14d.md |
+| WP-14b | headless 双通道与 resume 对账 | `cli.py`、`tests/test_cli.py` | WP-14a 关闭(编译器四件/payload 单源/replay 归一化)+ 14d `prompts.render_scope_section` | closed | 2026-09-18 | docs/dev-logs/WP-14b.md |
 
 ## 里程碑门(milestone;挂牌不改 WP 制,见 HANDOVER 同名节)
 
@@ -243,3 +244,27 @@
   state 11 + replay 9),全仓 490 passed + 2 skipped 零回归(14d 落地后
   基线 453+2),ruff 本片文件全绿;验收 1-9 逐条核销见
   docs/dev-logs/WP-14a.md。
+- 2026-09-18 **WP-14b closed**:headless 双通道与 resume 对账(WP-14 四片
+  拆分第二片,前置 WP-14a 已关闭,规格承诺以 14a 实物签名接线)。cli.py:
+  run `--scope`/`--scope-text` 互斥组必给其一(两给/两缺均 argparse rc 2);
+  --scope-text 走 14a 编译器一次性编译+自动冻结(Q6 非交互:成功
+  canonical 全文上屏+审计,失败中文报错+rc 2 无进程内重试),链序
+  llm_exchange_meta→scope_confirmed→scope_loaded(D9 同构);W14b-1
+  同目录已冻结拒绝(fail-closed,先于任何 LLM 调用);file 流装配后补
+  scope_confirmed(source="file",Q8:零仪式≠无审计,W14b-2 payload:
+  path=as-given 原串、canonical_sha256=文件字节 sha256;W14b-3 仅显式
+  --scope 时补写,plain resume 不补);tui --scope 改可选(None 下行归
+  14c,本片只放行);resume 经 14a replay 归一化零适配消费三 kind
+  (_resolve_scope/_resume_preflight 零新分支,D13);cli.py 两写入点
+  (file 流装配时、resume 对账完成时)各一行 render_scope_section +
+  update_scope_section 落动态段(D6,协调层裁定归本片)。退出码:
+  编译失败归 2、freeze 落盘 OSError 归 1(W14b-4)。测试:既有 13 例
+  语义保持+Q8 例外条款更新 3 处+新增 12 例全绿(目标两文件 44 绿);
+  全仓零回归(干净基线 490+2 → 本片 502+2;收尾实测 515+2 含 14c
+  同树在飞 13 例,commit 只含本片两文件);ruff 本片文件全绿(顺手
+  修复 HEAD 既有 E501 一处,仅折行,日志已声明)。T2 评审(四视角+
+  逐发现对抗核实;首轮因后端配额中断,resume 续跑完成)确认 1 条
+  minor(验收 10 file 流 markers 外断言升级为 prefix/suffix 全字节
+  比对)已修复,驳回 5 条超规格/假设性回归偏好,1 条孤儿 nit 顺手
+  加固(互斥组断言改 argparse 专属报错形态);验收 1-11 逐条核销、
+  W14b-1..4 逐条声明见 docs/dev-logs/WP-14b.md。

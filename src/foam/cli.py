@@ -15,6 +15,8 @@
 
 退出码:0 = finished/成功;130 = killed(含 Ctrl-C);1 = error(含审计链
 校验未通过);2 = 参数/配置/前置条件错误(缺文件、TUI 依赖缺失等)。
+编译失败(--scope-text,含后端错误包装)归 2——scope 输入前置条件,
+operator 修正声明后重跑(W14b-4);freeze 落盘 OSError 归 1(写盘故障)。
 密钥只走环境变量(各后端自己的 env key);本文件不接触 key 本体。
 
 配置持久化(P1-1,2026-09-12 冻结契约):入口只读加载 ./.env(注入缺省
@@ -39,7 +41,21 @@ args.base_url 原值不动;tui 在 --save-profile 落盘前先 _build_backend
 路径(--profile 指定名 / active_profile 名)统一过 _printable 可打印过滤
 (非可打印字符转义,防 ANSI 染色与换行伪造日志行)。
 
-本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)。
+WP-14b(2026-09-18,headless 双通道与 resume 对账):run 的 --scope 与
+--scope-text 互斥组必给其一;--scope-text 走 WP-14a 编译器一次性编译 +
+自动冻结(成功:canonical 全文上屏 + scope_confirmed(source="nl") 审计;
+失败:中文报错 + 退出码 2,无进程内重试,Q6);file 流装配后补写
+scope_confirmed(source="file")(Q8:零仪式 ≠ 无审计,与 scope_loaded
+相邻、run_started 之前);同目录已有冻结 scope 时 NL 流拒绝(W14b-1,
+fail-closed);tui --scope 改可选(缺席的 NL 确认仪式归 WP-14c,本片
+只放行,None 下行不处理);resume 经 WP-14a replay 归一化零适配消费
+scope_loaded/scope_confirmed/scope_updated 三 kind(D13,不新增分支),
+--scope 显式覆盖时同样补确认记录(W14b-3);ENGAGEMENT.md 动态段两写入点
+(file 流装配时、resume 对账完成时)各经 render_scope_section +
+update_scope_section 落盘(D6,裁定归本片)。
+
+本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)→
+WP-14b(headless 双通道与 resume 对账)。
 """
 
 from __future__ import annotations
@@ -62,7 +78,13 @@ from foam.agent.backends.base import ConfigError, LLMBackend, ToolCall
 from foam.agent.backends.claude import DEFAULT_BASE_URL, ClaudeBackend
 from foam.agent.backends.openai_compat import OpenAICompatBackend
 from foam.agent.loop import AgentLoop, LoopObserver, RunResult, ToolRegistry
-from foam.agent.prompts import build_system_prompt
+from foam.agent.prompts import build_system_prompt, render_scope_section
+from foam.agent.scope_compiler import (
+    ScopeCompileError,
+    compile_scope,
+    freeze_scope,
+    scope_event_payload,
+)
 from foam.agent.toolmap import render_startup_line, render_tool_map, scan_tools
 from foam.config import (
     active_profile,
@@ -73,7 +95,7 @@ from foam.config import (
     sanitize_url,
     validate_profile_name,
 )
-from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog
+from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_LOADED, AuditLog
 from foam.guard.scope import GuardDecision, Scope, load_scope, scope_payload
 from foam.replay import (
     build_report,
@@ -251,7 +273,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Ctrl-C 一次触发 kill switch(杀活动 job 与会话、写审计、退出码 "
         "130);再按一次立即强制退出。",
     )
-    run.add_argument("--scope", required=True, help="scope 授权范围文件路径")
+    scope_group = run.add_mutually_exclusive_group(required=True)
+    scope_group.add_argument("--scope", help="scope 授权范围文件路径")
+    scope_group.add_argument(
+        "--scope-text",
+        metavar="NL",
+        help="自然语言授权声明(headless 非交互自动确认,Q6):经 WP-14a 编译器"
+        "一次性编译 → canonical 全文上屏 + 自动冻结;编译失败中文报错 + "
+        "退出码 2,无进程内重试,修正声明后重跑",
+    )
     run.add_argument("--objective", required=True, help="本次 engagement 的目标描述")
     run.add_argument(
         "--workdir",
@@ -304,7 +334,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="TUI 入口(WP-09 定案):scope/backend 走本命令参数,"
         "objective 由主界面输入框首条消息提供。",
     )
-    tui.add_argument("--scope", required=True, help="scope 授权范围文件路径")
+    tui.add_argument(
+        "--scope",
+        default=None,
+        help="scope 授权范围文件路径;缺席进入 NL 确认仪式(WP-14c,本片只放行)",
+    )
     tui.add_argument("--workdir", default=None, help="engagement 目录(同 run)")
     _add_backend_args(tui)
     _add_loop_args(tui)
@@ -383,8 +417,8 @@ def resolve_backend_args(args: argparse.Namespace) -> None:
         if raw_backend is not None and raw_backend not in _VALID_BACKENDS:
             print(
                 f"[config] 警告:profile '{_printable(name)}' 的 backend 值"
-                f"「{_printable(str(raw_backend))}」非法(仅支持 {'/'.join(_VALID_BACKENDS)},"
-                "已忽略该键)",
+                f"「{_printable(str(raw_backend))}」非法"
+                f"(仅支持 {'/'.join(_VALID_BACKENDS)},已忽略该键)",
                 file=sys.stderr,
             )
             profile = {k: v for k, v in profile.items() if k != "backend"}
@@ -649,8 +683,50 @@ def _create_engagement(args: argparse.Namespace) -> Engagement:
     return Engagement.create(objective=args.objective, scope_path=args.scope)
 
 
+def _append_file_scope_confirm(
+    audit: AuditLog, scope: Scope, scope_source: str
+) -> None:
+    """file 流补写 scope_confirmed(source="file")(Q8:零仪式 ≠ 无审计)。
+
+    payload 语义(W14b-2,经 WP-14a scope_event_payload 单源构造):
+    path=as-given 原串(与 scope_loaded.source、engagement.json meta 同串)、
+    canonical_sha256=scope 文件字节 sha256(=meta sha256,冻结物=文件本体)、
+    四键=scope.summary()。时机(W14b-3):仅命令行显式传 --scope 时补写,
+    与 scope_loaded 相邻、run_started 之前。
+    """
+    digest = hashlib.sha256(Path(scope_source).read_bytes()).hexdigest()
+    audit.append(
+        KIND_SCOPE_CONFIRMED,
+        scope_event_payload(
+            scope, source="file", path=scope_source, canonical_sha256=digest
+        ),
+    )
+
+
+def _write_scope_section(
+    engagement: Engagement, scope: Scope, scope_source: str
+) -> None:
+    """ENGAGEMENT.md 动态段写入(D6,cli.py 两写入点共用)。
+
+    渲染唯一来源 WP-14d prompts.render_scope_section(经 14a 交付);
+    写入经 WP-14a Engagement.update_scope_section(markers 间原子重写,
+    容错附加恢复)。sha256=scope 文件字节 sha256(与 file 流 meta 同口径);
+    frozen_at=写入时刻(resume 对账完成时为幂等重写,仅信息面)。
+    """
+    digest = hashlib.sha256(Path(scope_source).read_bytes()).hexdigest()
+    section = render_scope_section(
+        scope.rules,
+        source=scope_source,
+        sha256=digest,
+        frozen_at=datetime.now(UTC).isoformat(timespec="seconds"),
+    )
+    engagement.update_scope_section(section)
+
+
 async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
     resolve_backend_args(args)  # P1-1:flag > env > profile > 内置默认,就地回填
+    if args.scope_text is not None:
+        return await _cmd_run_nl(args, backend_factory)
     try:
         scope = load_scope(args.scope)
     except (OSError, ValueError) as exc:
@@ -682,6 +758,92 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
         engagement=engagement,
         scope=scope,
         scope_source=str(args.scope),
+        backend=backend,
+        observer=_CliObserver(),
+    )
+    # Q8:file 流装配后补确认记录(与 scope_loaded 相邻、run_started 之前)
+    _append_file_scope_confirm(runtime.audit, scope, str(args.scope))
+    # D6 写入点①:file 流装配时落动态段
+    _write_scope_section(engagement, scope, str(args.scope))
+    return await _drive(runtime, objective=args.objective, backend=backend)
+
+
+async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
+    """run --scope-text:NL 一次性编译 → 自动冻结 → 装配(headless 非交互,Q6)。
+
+    顺序(规格钉死):后端装配(ConfigError → 2 照旧)→ 建/开 engagement
+    (args.scope=None → meta["scope"]=None)→ W14b-1 已冻结拒绝 → 自建
+    AuditLog → compile_scope(D7 llm_exchange_meta 由编译器现场落,含失败
+    路径,本侧不重复)→ ScopeCompileError → rc 2 无重试(W14b-4)→
+    freeze_scope(D13 写序在 14a 内部,OSError → rc 1)→ 关自建 audit →
+    canonical 全文上屏 → _assemble_runtime(scope_loaded 落链)→ _drive。
+    链上顺序:llm_exchange_meta → scope_confirmed → scope_loaded(D9 同构)。
+    """
+    try:
+        backend = backend_factory(args)
+        _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
+    except ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        engagement = _create_engagement(args)
+    except (OSError, ValueError) as exc:
+        print(f"[错误] engagement 目录创建失败: {exc}", file=sys.stderr)
+        await backend.aclose()
+        return EXIT_USAGE
+    # W14b-1:同目录已有冻结 scope → 拒绝(headless 无换 scope 通道,fail-closed)
+    if engagement.metadata().get("scope") is not None:
+        print(
+            "[错误] 该 engagement 目录已有冻结 scope;headless 无换 scope 通道,"
+            "请换 --workdir 或另建 engagement",
+            file=sys.stderr,
+        )
+        engagement.close()
+        await backend.aclose()
+        return EXIT_USAGE
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    try:
+        compilation = await compile_scope(args.scope_text, backend, audit=audit)
+    except ScopeCompileError as exc:
+        print(f"[错误] scope 编译失败: {exc}", file=sys.stderr)
+        audit.close()
+        engagement.close()
+        await backend.aclose()
+        return EXIT_USAGE  # W14b-4:编译失败归 2,无进程内重试(Q6)
+    try:
+        freeze_scope(
+            engagement, audit, compilation, source="nl", nl_text=args.scope_text
+        )
+    except OSError as exc:
+        print(f"[错误] scope 冻结落盘失败: {exc}", file=sys.stderr)
+        audit.close()
+        engagement.close()
+        await backend.aclose()
+        return EXIT_ERROR  # 写盘故障归 1(W14b-4)
+    audit.close()
+
+    # scope.confirmed 文件名按 D1 硬编码(14a 未导出常量,一致性请求 3 声明);
+    # resolve 口径与 freeze_scope 落 meta/payload 的 path 同串(一致性请求 4)。
+    confirmed_path = (engagement.paths.root / "scope.confirmed").resolve()
+    print(
+        f"[run] engagement={engagement.paths.root} backend={args.backend}",
+        flush=True,
+    )
+    # Q6 非交互自动确认的上屏面:canonical 全文([scope] 行 + 规则逐行)。
+    print(
+        f"[scope] 编译完成:{len(compilation.rules)} 条规则已冻结"
+        f"({confirmed_path});越界命令将被护栏拒绝并记审计",
+        flush=True,
+    )
+    for rule in compilation.rules:
+        print(f"  {rule}", flush=True)
+    if not compilation.rules:
+        print("  (空——任何网络目标都会被拒)", flush=True)  # Q9 醒目行
+    runtime = _assemble_runtime(
+        args,
+        engagement=engagement,
+        scope=compilation.scope,
+        scope_source=str(confirmed_path),
         backend=backend,
         observer=_CliObserver(),
     )
@@ -843,6 +1005,8 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
     if isinstance(prepared, int):
         return prepared
     engagement, scope, scope_source, objective, briefing, record_count = prepared
+    # D6 写入点②:resume 对账完成,动态段幂等重写为恢复后 scope 的渲染。
+    _write_scope_section(engagement, scope, scope_source)
     try:
         backend = backend_factory(args)
         _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
@@ -865,6 +1029,10 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
         backend=backend,
         observer=_CliObserver(),
     )
+    if args.scope:
+        # W14b-3:--scope 显式覆盖 = 命令行重新授权,与 run file 流同义补写
+        # (Q8;plain resume 不补,确认计数不变)。
+        _append_file_scope_confirm(runtime.audit, scope, str(args.scope))
     return await _drive(
         runtime, objective=objective, backend=backend, interject=briefing
     )
