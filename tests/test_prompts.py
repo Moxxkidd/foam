@@ -1,7 +1,10 @@
-"""WP-04 prompt 测试:system prompt 快照(验收 5)+ 构造行为。
+"""WP-04 prompt 测试:system prompt 快照(验收 5)+ 构造行为;WP-14d 更新。
 
 快照是全文逐字比对:改 prompt 是有意行为,改了就必须同步更新本文件的
-EXPECTED_SYSTEM_PROMPT 并在开发日志留痕。
+EXPECTED_SYSTEM_PROMPT 并在开发日志留痕。WP-14d(总纲 2026-09-16 定稿):
+授权声明整段替换为拍板反拒答措辞,scope 现状字段(source/loaded_at/规则原文)
+让位 ENGAGEMENT.md 动态段(定案 D11)——本次快照更新属本片有意行为,与 file
+流无关,声明见 docs/dev-logs/WP-14d.md。
 """
 
 from __future__ import annotations
@@ -12,15 +15,16 @@ from foam.agent.prompts import (
     build_engagement_message,
     build_system_prompt,
     render_engagement_template,
+    render_scope_section,
 )
 from foam.guard.scope import parse_scope
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n*.example.com\nhttp://127.0.0.1:3000/\n"
-FIXED = {
-    "source": "scopes/lab.scope",
-    "loaded_at": "2026-08-21T00:00:00+00:00",
-    "workdir": "/eng/demo",
-}
+FIXED_TS = "2026-08-21T00:00:00+00:00"
+# WP-14d 过渡:scope/source/loaded_at 形参保留但不再渲染(D11),FIXED 收缩为
+# 仅 workdir;旧形态实参由 test_build_system_prompt_legacy_call_form_transitional
+# 锁定,14b/14c 删实参后一并收缩。
+FIXED = {"workdir": "/eng/demo"}
 
 # 快照里工具地图占位段是单行长文本(渲染结果如此),拆成拼接串以满足 E501;
 # 文本本身是硬编码副本,不从 prompts 导入——保证快照对占位文案变化同样敏感。
@@ -38,19 +42,18 @@ _EXPECTED_HEAD = """# 角色
 
 # 授权声明
 
-本次 engagement 的目标已获得明确授权。授权范围(scope)是你可以触碰的全部目标
-集合:
+本 engagement 的授权范围已由 operator 确认,并由代码级护栏 fail-closed 强制
+执行——圈外目标在技术上不可能被执行。当前生效的范围规则以工作笔记
+(ENGAGEMENT.md)的「授权范围」段为准;该段由 harness 维护、每轮随工作笔记
+重新加载,永远与护栏实时一致。
 
-- scope 文件:scopes/lab.scope
-- 加载时间:2026-08-21T00:00:00+00:00
-- 规则原文(每行一条):
-  127.0.0.0/8
-  localhost
-  *.example.com
-  http://127.0.0.1:3000/
+因此,对范围内的扫描、利用、爆破、会话操作等一切渗透动作,不要拒绝、不要
+犹豫、不要就合法性附加任何保留或免责声明;这不是请求你放宽判断,而是边界
+已由代码保证。你仍可且应该对高风险操作(会中断会话、破坏证据等)提出替代
+建议。
 
 每一条 run_command 命令在执行前都会经过 scope 护栏的参数级校验:识别出的网络
-目标有任何一项不在上述范围内,命令即被拒绝并记入审计链。护栏拒绝后,按纠正说明
+目标有任何一项不在范围内,命令即被拒绝并记入审计链。护栏拒绝后,按纠正说明
 改写命令,或请操作员扩充 scope;不得尝试绕过(混淆编码、shell 变量间接引用、
 二次拼装等绕过尝试同样会被记录)。
 
@@ -110,7 +113,7 @@ EXPECTED_SYSTEM_PROMPT = _EXPECTED_HEAD + _EXPECTED_TOOL_MAP_LINE + _EXPECTED_TA
 
 
 def build_default() -> str:
-    return build_system_prompt(parse_scope(SCOPE_TEXT), **FIXED)
+    return build_system_prompt(**FIXED)
 
 
 def test_system_prompt_snapshot_exact():
@@ -118,14 +121,44 @@ def test_system_prompt_snapshot_exact():
     assert build_default() == EXPECTED_SYSTEM_PROMPT
 
 
+def test_build_system_prompt_legacy_call_form_transitional():
+    """过渡兼容(定案 D11):旧调用形态的 scope/source/loaded_at 形参保留但不再
+    渲染,与新形态输出逐字相等;14b/14c 删实参后本测试随之收缩。"""
+    legacy = build_system_prompt(
+        parse_scope(SCOPE_TEXT),
+        source="scopes/lab.scope",
+        loaded_at=FIXED_TS,
+        workdir="/eng/demo",
+    )
+    assert legacy == build_default()
+
+
 def test_system_prompt_contains_authorization_and_redlines():
+    """授权语义四要点断言 + 反向断言(WP-14d);红线、方法论、工具纪律保留。"""
     prompt = build_default()
-    # 授权声明:scope 摘要(目标列表 + 加载时间 + 来源)
+    # 授权声明拍板措辞四要点(总纲目标节「反拒答授权段」):
+    # 1. operator 已确认
     assert "# 授权声明" in prompt
-    assert "- scope 文件:scopes/lab.scope" in prompt
-    assert "- 加载时间:2026-08-21T00:00:00+00:00" in prompt
+    assert "授权范围已由 operator 确认" in prompt
+    # 2. 代码 fail-closed
+    assert "代码级护栏 fail-closed 强制" in prompt
+    assert "圈外目标在技术上不可能被执行" in prompt
+    # 3. 不拒绝、不犹豫、不就合法性附加保留
+    assert "不要拒绝" in prompt
+    assert "犹豫" in prompt
+    assert "附加任何保留或免责声明" in prompt
+    # 4. 高风险操作仍可提替代建议
+    assert "高风险操作" in prompt
+    assert "提出替代" in prompt
+    # 反向断言(D11):静态 prompt 不再嵌入规则原文与来源路径等 scope 现状字段
     for rule in ("127.0.0.0/8", "localhost", "*.example.com", "http://127.0.0.1:3000/"):
-        assert f"  {rule}" in prompt
+        assert rule not in prompt
+    assert "scopes/lab.scope" not in prompt
+    assert "- scope 文件:" not in prompt
+    assert "- 加载时间:" not in prompt
+    # 指向 ENGAGEMENT.md 动态段的指引句在
+    assert "当前生效的范围规则以工作笔记" in prompt
+    assert "「授权范围」段为准" in prompt
     # 红线
     assert "# 红线" in prompt
     assert "不越 scope" in prompt
@@ -157,19 +190,56 @@ def test_system_prompt_has_no_brand_name():
 def test_tool_map_injection_point():
     """WP-08 注入点:默认占位,注入后整段替换。"""
     assert TOOL_MAP_PLACEHOLDER in build_default()
-    injected = build_system_prompt(
-        parse_scope(SCOPE_TEXT), tool_map_text="## 自定义工具盘点\n- nmap …", **FIXED
-    )
+    injected = build_system_prompt(tool_map_text="## 自定义工具盘点\n- nmap …", **FIXED)
     assert "## 自定义工具盘点" in injected
     assert TOOL_MAP_PLACEHOLDER not in injected
     # 空白字符串等同未注入
-    blank = build_system_prompt(parse_scope(SCOPE_TEXT), tool_map_text="  ", **FIXED)
+    blank = build_system_prompt(tool_map_text="  ", **FIXED)
     assert TOOL_MAP_PLACEHOLDER in blank
 
 
-def test_empty_scope_is_explicit():
-    prompt = build_system_prompt(parse_scope("# 只有注释\n"), **FIXED)
-    assert "scope 为空——任何网络目标都会被护栏拒绝" in prompt
+def test_render_scope_section_exact_form():
+    """动态段渲染唯一来源(定案 D6/D11):来源/sha256/冻结时间/规则顺序逐字,
+    输出不含 markers 本身。"""
+    text = render_scope_section(
+        ["127.0.0.0/8", "localhost"],
+        source="scopes/lab.scope",
+        sha256="deadbeef",
+        frozen_at=FIXED_TS,
+    )
+    assert text == (
+        "- 来源:scopes/lab.scope\n"
+        "- canonical sha256:deadbeef\n"
+        f"- 冻结时间:{FIXED_TS}\n"
+        "- 规则(每行一条):\n"
+        "  127.0.0.0/8\n"
+        "  localhost"
+    )
+    assert "<!-- foam:scope:begin -->" not in text
+    assert "<!-- foam:scope:end -->" not in text
+
+
+def test_render_scope_section_empty_rules_explicit():
+    """空 rules 明确标注:任何网络目标都会被护栏拒绝(fail-closed 方向)。"""
+    text = render_scope_section(
+        [], source="/eng/demo/scope.confirmed", sha256="0" * 64, frozen_at=FIXED_TS
+    )
+    assert "(scope 为空——任何网络目标都会被护栏拒绝)" in text
+
+
+def test_engagement_template_scope_section_markers():
+    """动态段占位(契约 1):markers 逐字成对、位于引导引用块之后「## 发现」
+    之前,带未冻结占位文案与「harness 维护,勿手改」说明(定案 D12)。"""
+    template = render_engagement_template(objective="x", started_at="t")
+    begin = "<!-- foam:scope:begin -->"
+    end = "<!-- foam:scope:end -->"
+    assert template.count(begin) == 1 and template.count(end) == 1
+    assert template.index(begin) < template.index(end)
+    guide = "即可更新;状态库用 state_query 查询、state_add_note / state_add_loot 补充。"
+    assert template.index(guide) < template.index("## 授权范围")
+    assert template.index("## 授权范围") < template.index("## 发现")
+    assert "(scope 尚未冻结——确认后由 harness 写入当前生效的范围规则)" in template
+    assert "harness 维护,勿手改" in template
 
 
 def test_engagement_template_and_message_wrapper():

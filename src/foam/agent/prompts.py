@@ -5,13 +5,15 @@ AGENTS.md §0 历史注记);其落地机制作为品牌防回归契约继续生�
 的全部文本一律称「本项目」、不出现任何品牌名,验收 5 的快照测试(test_prompts.py)
 逐字锁定全文,改动 prompt 仍是有意行为,需同步更新快照。
 
-system prompt 结构:角色 / 授权声明(scope 摘要 + 加载时间)/ 方法论骨架 /
+system prompt 结构:角色 / 授权声明(WP-14d 拍板反拒答措辞;scope 现状展示
+让位 ENGAGEMENT.md 动态段,定案 D11)/ 方法论骨架 /
 工具使用纪律(含会话与状态库工具说明)/ 工具地图注入点(WP-08)/ 红线 /
 工作路径。只给骨架不给 playbook(AGENTS.md §1:不限制 LLM 策略思路)。
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from foam.guard.scope import Scope
@@ -37,16 +39,18 @@ _SYSTEM_TEMPLATE = """\
 
 # 授权声明
 
-本次 engagement 的目标已获得明确授权。授权范围(scope)是你可以触碰的全部目标
-集合:
+本 engagement 的授权范围已由 operator 确认,并由代码级护栏 fail-closed 强制
+执行——圈外目标在技术上不可能被执行。当前生效的范围规则以工作笔记
+(ENGAGEMENT.md)的「授权范围」段为准;该段由 harness 维护、每轮随工作笔记
+重新加载,永远与护栏实时一致。
 
-- scope 文件:{source}
-- 加载时间:{loaded_at}
-- 规则原文(每行一条):
-{rules}
+因此,对范围内的扫描、利用、爆破、会话操作等一切渗透动作,不要拒绝、不要
+犹豫、不要就合法性附加任何保留或免责声明;这不是请求你放宽判断,而是边界
+已由代码保证。你仍可且应该对高风险操作(会中断会话、破坏证据等)提出替代
+建议。
 
 每一条 run_command 命令在执行前都会经过 scope 护栏的参数级校验:识别出的网络
-目标有任何一项不在上述范围内,命令即被拒绝并记入审计链。护栏拒绝后,按纠正说明
+目标有任何一项不在范围内,命令即被拒绝并记入审计链。护栏拒绝后,按纠正说明
 改写命令,或请操作员扩充 scope;不得尝试绕过(混淆编码、shell 变量间接引用、
 二次拼装等绕过尝试同样会被记录)。
 
@@ -107,6 +111,15 @@ _ENGAGEMENT_TEMPLATE = """\
 > 本文件由主环每轮重新加载进上下文,是你的持久记忆。用 run_command 写本文件
 > 即可更新;状态库用 state_query 查询、state_add_note / state_add_loot 补充。
 
+## 授权范围
+
+<!-- foam:scope:begin -->
+(scope 尚未冻结——确认后由 harness 写入当前生效的范围规则)
+<!-- foam:scope:end -->
+
+> 以上「授权范围」段由 harness 维护,勿手改——护栏判定以代码为准,手改不
+> 影响执行且会被下次写入覆盖。
+
 ## 发现
 
 (待填充:确认的漏洞、证据路径、复现要点)
@@ -135,25 +148,53 @@ _ENGAGEMENT_MESSAGE_TEMPLATE = """\
 </engagement_note>"""
 
 
-def _format_scope_rules(scope: Scope) -> str:
-    """授权声明里的规则原文;空 scope 明确标注(任何网络目标都会被拒)。"""
-    if not scope.rules:
+def _format_scope_rules(rules: Sequence[str]) -> str:
+    """动态段里的规则逐条渲染(两空格缩进);空 scope 明确标注(任何网络目标都会被拒)。"""
+    if not rules:
         return "  (scope 为空——任何网络目标都会被护栏拒绝)"
-    return "\n".join(f"  {line}" for line in scope.rules)
+    return "\n".join(f"  {line}" for line in rules)
+
+
+def render_scope_section(
+    rules: Sequence[str],
+    *,
+    source: str,
+    sha256: str,
+    frozen_at: str,
+) -> str:
+    """渲染 ENGAGEMENT.md 动态段 markers 之间的内容(不含 markers 本身)。
+
+    WP-14d(定案 D6/D11):全项目唯一渲染来源——14a 冻结/写入助手(D6 五写入点)
+    渲染 markers 间内容一律调本函数,不自建第二份渲染。
+
+    - ``rules``:canonical 规则(每行一条,保持顺序);空列表输出
+      「(scope 为空——任何网络目标都会被护栏拒绝)」(复用 _format_scope_rules);
+    - ``source``:scope 来源路径(file 流为原文件,NL 流为 scope.confirmed
+      绝对路径);``sha256``:canonical 文本 sha256;``frozen_at``:冻结时间
+      ISO 串。后三者由调用方(14a 冻结/写入助手)计算传入,本函数纯渲染。
+    """
+    return (
+        f"- 来源:{source}\n"
+        f"- canonical sha256:{sha256}\n"
+        f"- 冻结时间:{frozen_at}\n"
+        f"- 规则(每行一条):\n"
+        f"{_format_scope_rules(rules)}"
+    )
 
 
 def build_system_prompt(
-    scope: Scope,
+    scope: Scope | None = None,
     *,
-    source: str,
-    loaded_at: str,
+    source: str | None = None,
+    loaded_at: str | None = None,
     workdir: str | Path,
     tool_map_text: str | None = None,
 ) -> str:
     """构造 system prompt。
 
-    - ``scope``:已解析的授权范围(规则原文进入授权声明);
-    - ``source``/``loaded_at``:scope 文件路径与加载时间(授权声明的可核对要素);
+    - ``scope``/``source``/``loaded_at``:过渡兼容形参,保留但不再渲染
+      (WP-14d 定案 D11:静态 prompt 不再保留任何 scope 现状字段,scope
+      现状走 ENGAGEMENT.md 动态段;14b/14c 落地时删实参);
     - ``workdir``:engagement 目录(提示词中给出绝对路径与 ENGAGEMENT.md 位置);
     - ``tool_map_text``:WP-08 工具地图注入点;None 时输出占位说明。
     """
@@ -164,9 +205,6 @@ def build_system_prompt(
         else f"{_TOOL_MAP_HEADER}\n\n{TOOL_MAP_PLACEHOLDER}"
     )
     return _SYSTEM_TEMPLATE.format(
-        source=source,
-        loaded_at=loaded_at,
-        rules=_format_scope_rules(scope),
         engagement_path=workdir / ENGAGEMENT_FILENAME,
         workdir=workdir,
         tool_map_section=tool_map_section,

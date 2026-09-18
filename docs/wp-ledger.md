@@ -15,6 +15,7 @@
 | WP-11 | e2e 场景一:容器靶场 Web 全链 | `tests/e2e/`、`docs/e2e/` | 04-08 | closed | 2026-08-25 | docs/dev-logs/WP-11.md |
 | WP-12 | e2e 场景二:Metasploitable2 + msf shell | `tests/e2e/`、`docs/e2e/` | 05 | closed | 2026-08-26 | docs/dev-logs/WP-12.md |
 | WP-13 | 总体整合 + 发布准备 | 全仓只读 + 文档 | 全部 | closed | 2026-08-27 | docs/dev-logs/WP-13.md |
+| WP-14d | 反拒答授权与拒答观测(纯观测) | `agent/prompts.py`、`agent/refusal.py`、`agent/loop.py`(2 处)、`tests/test_prompts.py`、`tests/test_refusal.py` | 零代码依赖(与 14a 并行) | closed | 2026-09-18 | docs/dev-logs/WP-14d.md |
 
 ## 里程碑门(milestone;挂牌不改 WP 制,见 HANDOVER 同名节)
 
@@ -196,3 +197,22 @@
   ⑤本日志 + 台账。全仓 383 passed + 2 skipped(40.82s,exit 0),
   ruff 全过;代码零改动(关闭 commit 仅文档面)。**M4 门随之触发,
   门口动作待总指挥执行。**
+- 2026-09-18 **WP-14d closed**:反拒答授权与拒答观测(WP-14 四片拆分
+  最先交付片,2026-09-16 定稿;纯观测,T3 精简)。prompts.py:授权
+  声明整段替换为拍板反拒答措辞(四要点:operator 已确认/代码
+  fail-closed/不拒绝不犹豫不附加保留/高风险操作提替代建议),scope
+  现状字段(source/loaded_at/规则原文)让位 ENGAGEMENT.md 动态段
+  (定案 D11),模板加 markers 逐字占位 + 「harness 维护,勿手改」
+  说明(D12),新增 `render_scope_section` 为动态段渲染唯一来源
+  (供 14a 五写入点复用);`build_system_prompt` 三形参过渡保留不
+  渲染,旧调用方零适配。refusal.py 新建:中英 18 条拒答意图短语
+  词表 + `detect`(小写化 + U+2019 归一,纯子串;零误报样例五条
+  锁定)。loop.py 仅两处:import + `_collect_round` 尾部挂载——
+  只测正文不测 reasoning,命中落 `refusal_detected`(payload 仅
+  round/text_sha256/patterns 不记全文),零控制流改动(Q7);该 kind
+  注册归 14a(契约 2),本片链上未注册零风险(append/verify 不校验
+  kind,干净 HEAD 独立验证实证)。本片测试 45 项全绿(prompts 9 +
+  refusal 12 + loop 24),全仓 453 项全绿 + 2 环境门控 skip(干净
+  HEAD+本片文件独立复跑同数),ruff 本片文件全绿(cli.py:386 E501
+  为 HEAD 既有,归 14b/14c 面,如实记录);prompt 快照逐字更新属
+  本片有意行为,声明见 docs/dev-logs/WP-14d.md。

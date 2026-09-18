@@ -60,6 +60,8 @@ from foam.agent.prompts import (
     build_engagement_message,
     render_engagement_template,
 )
+from foam.agent.refusal import KIND_REFUSAL_DETECTED
+from foam.agent.refusal import detect as refusal_detect
 from foam.guard.audit import (
     KIND_EXEC_RESULT_META,
     KIND_KILL_SWITCH,
@@ -744,6 +746,18 @@ class AgentLoop:
             ).hexdigest()
             payload["reasoning_chars"] = len(reasoning)
         self._audit.append(KIND_LLM_EXCHANGE_META, payload)
+        refusal_patterns = refusal_detect(text)
+        if refusal_patterns:
+            # WP-14d(Q7):拒答纯观测——只记哈希与命中模式,不记全文,不改
+            # 任何控制流;只测正文 text,reasoning 通道(ReasoningDelta)不测。
+            self._audit.append(
+                KIND_REFUSAL_DETECTED,
+                {
+                    "round": self._rounds,
+                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "patterns": refusal_patterns,
+                },
+            )
         return _RoundOutcome(
             text=text, tool_calls=tool_calls, usage=usage, malformed=malformed
         )
