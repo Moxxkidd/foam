@@ -53,23 +53,34 @@ httpx / rich / textual(均在 Kali 官方源)。LLM 密钥只走环境变量。
 git clone https://github.com/Moxxkidd/foam && cd foam
 pipx install .          # 也可 python3 -m venv 安装
 
-# 1. 定义授权范围(每行一个:CIDR / 主机名 / 通配域 / URL 前缀)
-printf '192.168.56.0/24\n' > my.scope
-
-# 2. 配置后端(openai_compat 万能适配;实弹使用 Kimi K3 系)
+# 1. 配置后端(openai_compat 万能适配;实弹使用 Kimi K3 系)
 export FOAM_LLM_API_KEY=... FOAM_LLM_BASE_URL=... FOAM_LLM_MODEL=...
 
-# 3. 运行
-foam run --scope my.scope \
-  --objective "对 scope 内主机做侦察,汇总存活主机与开放服务"
+# 2. 启动 TUI,首条消息用自然语言声明目标与授权范围
+foam tui
+#    → 确认卡展示编译出的 scope 规则(canonical 形态 + sha256 短哈希):
+#      确认冻结 / 用自然语言修正重编译 / 取消;确认后冻结进审计链
+#    → 运行中随时 /scope 查看当前规则,/scope <描述> 经同一仪式修改
 
-# 4. 回放与报告
+# 3. 回放与报告
 foam replay engagements/<id>
 foam report engagements/<id> --out report.md
 ```
 
-全屏 TUI:`foam tui --scope my.scope`(objective 即首条消息,支持
-随时插话;Ctrl-C 触发 kill switch,回收全部活动任务与会话)。
+headless/CI 场景可用 scope 文件(零确认仪式,行为照旧;每行一条:
+CIDR / 主机名 / 通配域 / URL 前缀):
+
+```bash
+printf '192.168.56.0/24\n' > my.scope
+foam run --scope my.scope \
+  --objective "对 scope 内主机做侦察,汇总存活主机与开放服务"
+# 或一句话声明(headless 非交互自动确认,编译结果上屏+落审计):
+foam run --scope-text "仅限 192.168.56.0/24 网段" --objective "..."
+```
+
+全屏 TUI 也接受 `foam tui --scope my.scope`(文件流零仪式照旧);
+TUI 内 objective 即首条消息,支持随时插话;Ctrl-C 触发 kill switch,
+回收全部活动任务与会话。
 
 ## 配置持久化
 
@@ -101,7 +112,7 @@ key/token/secret 字样的键一律剔除、不落盘。
 | 命令 | 作用 |
 |---|---|
 | `foam run` | headless 执行一个 objective(`--max-rounds` 等兜底阀可调) |
-| `foam tui` | 全屏 TUI(连续对话、插话、斜杠命令、侧栏状态) |
+| `foam tui` | 全屏 TUI(NL scope 确认仪式 + `/scope` 热换;连续对话、插话、斜杠命令、侧栏状态) |
 | `foam resume <dir>` | 审计链校验 + objective/scope 对账后从现场继续 |
 | `foam replay <dir>` | 哈希链校验 + 只读重放审计时间线 |
 | `foam report <dir>` | 生成中文 markdown 报告(凭证节为全值,注意去向) |

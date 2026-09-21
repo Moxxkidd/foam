@@ -209,6 +209,11 @@
 
 ## 下一 WP
 
+**(2026-09-20 注记:WP-14「NL scope 声明」四片已全部关闭,见文末
+「当前状态(2026-09-20)」;在飞 WP 归零,下一动作回到 v0.1.x 维护批
+与 v0.2 波次清单,由总指挥拍板。WP-14c 日志「已知边界」节留有一个
+统一 TUI file 流动态段写段的后续小片候选。)**
+
 **WP-13 已关闭(2026-08-27);M4 门同日通过(见「里程碑门」)——
 13/13 WP 全部收口,M1–M4 全放行,项目发布就绪。**v1 立项清单 14 项
 P0–P3 在下方待命,开闸与否总指挥随时可裁;M3 挂账 9 条原始候选表述
@@ -497,3 +502,33 @@ WP-13(整合)依赖全部
   值后,落盘 JSON 全文 grep 不含该值)。**红线不变**:API key 只走
   环境变量,foam 读 `.env` 但永不写它;无 profile、无 `.env`、无
   flag 时行为与此前逐字节一致。
+
+## 当前状态(2026-09-20)
+
+- **WP-14「NL scope 声明」四片全部落地**(规格 `docs/work-packages/WP-14.md`
+  设计定案 D1-D14;铁律不变:确认权在 operator,执行权在代码——LLM
+  可解析可起草,永远不能在运行中自己重新定义自己的笼子):
+  - **WP-14d**(2026-09-16 先行):反拒答授权与拒答观测(纯观测)——
+    授权段拍板措辞、scope 现状让位 ENGAGEMENT.md 动态段、拒答落审计。
+  - **WP-14a**(2026-09-18):scope 编译与冻结基座——`compile_scope`/
+    `freeze_scope`/`scope_event_payload`(D7/D13 契约单源)、动态段
+    单形态(markers 原子重写)、replay 三 kind 归一化。
+  - **WP-14b**(2026-09-18):headless 双通道与 resume 对账——
+    `run --scope/--scope-text` 互斥组必给其一;Q8 file 流装配后补
+    `scope_confirmed(source="file")`;resume 零适配消费归一化记录;
+    cli.py 两写入点落动态段。
+  - **WP-14c**(2026-09-20 关闭,WP-14 随之全收):TUI 确认仪式与
+    scope 热换——`foam tui` 不带 `--scope` 进入 NL 仪式流(首条消息
+    承载 objective+授权范围 → 确认卡编译/确认/修正/取消 → 冻结后才
+    启动 loop);`/scope` 裸=只读展示(TUIConfig.scope 权威),带参=
+    同一仪式热换(`replace_scope` 原子换,下一条命令生效;system
+    prompt 不重建、会话不动);file 流零仪式照旧(Q8 补写同 14b)。
+    T1 面(护栏热换)满配对抗审查两轮:确认/裁定修复 19 条、驳回 1
+    条,逐条记录与回归测试映射见 `docs/dev-logs/WP-14c.md`。
+- **已知边界**(如实记录,详见 WP-14c 日志「已知边界」节):TUI file
+  流 ENGAGEMENT.md 动态段保持「尚未冻结」占位(护栏执行面不受影响,
+  headless file 流 14b 已写段;统一候选留后续小片);生产 eager 调度
+  (textual 对 Python≥3.12 设 eager_task_factory)相关时序差异与
+  update 仪式编译在途遇 run 终态化的 D7 单点缺口,均已记录并有防护。
+- **测试基线**:全仓 526 passed + 2 skipped(WP-14c 落地前 515+2;
+  本片 +24 例),ruff 全绿。

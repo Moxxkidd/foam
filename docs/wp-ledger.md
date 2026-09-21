@@ -18,6 +18,7 @@
 | WP-14a | scope 编译与冻结基座 | `agent/scope_compiler.py`、`guard/scope.py`(canonical 渲染助手)、`guard/audit.py`、`state/files.py`、`replay.py`、`tests/test_scope_compiler.py` | 01-13 全部关闭 + 14d `prompts.render_scope_section` | closed | 2026-09-18 | docs/dev-logs/WP-14a.md |
 | WP-14d | 反拒答授权与拒答观测(纯观测) | `agent/prompts.py`、`agent/refusal.py`、`agent/loop.py`(2 处)、`tests/test_prompts.py`、`tests/test_refusal.py` | 零代码依赖(与 14a 并行) | closed | 2026-09-18 | docs/dev-logs/WP-14d.md |
 | WP-14b | headless 双通道与 resume 对账 | `cli.py`、`tests/test_cli.py` | WP-14a 关闭(编译器四件/payload 单源/replay 归一化)+ 14d `prompts.render_scope_section` | closed | 2026-09-18 | docs/dev-logs/WP-14b.md |
+| WP-14c | TUI 确认仪式与 scope 热换 | `tui/app.py`、`tui/widgets.py`、`tui/styles.tcss`、`agent/loop.py`(单点)、`tests/test_tui.py`、README/AGENTS/docs 四件 | WP-14a 关闭(编译器/冻结助手/payload 单源)+ 14b 关闭(tui --scope 可选、Q8 语义对齐)+ 14d `prompts.render_scope_section` | closed | 2026-09-20 | docs/dev-logs/WP-14c.md |
 
 ## 里程碑门(milestone;挂牌不改 WP 制,见 HANDOVER 同名节)
 
@@ -268,3 +269,30 @@
   比对)已修复,驳回 5 条超规格/假设性回归偏好,1 条孤儿 nit 顺手
   加固(互斥组断言改 argparse 专属报错形态);验收 1-11 逐条核销、
   W14b-1..4 逐条声明见 docs/dev-logs/WP-14b.md。
+- 2026-09-20 **WP-14c closed**:TUI 确认仪式与 scope 热换(WP-14 四片
+  拆分第三片,最后落地;WP-14 四片随之全收)。前置 14a/14b 均已关闭,
+  规格承诺以 14a 实物签名接线,cli.py 归 14b 全程未碰。交付:
+  tui/app.py(TUIConfig.scope 改 Scope|None;NL 仪式 worker 两段结构
+  ——编译 → 确认卡 → freeze_scope → 才调既有 start_run,其同步方法体
+  一字不动 D9;engagement 首条消息即建 scope_path=None D8;/scope
+  裸=只读展示 TUIConfig.scope 权威 D10、带参=同一仪式热换;
+  _prepare_nl_run_engagement 预声明变体两段结构;_append_file_scope_
+  confirm Q8 补写 W14b-2 语义)+ tui/widgets.py(ScopeConfirmCard 三
+  状态+Q9 空规则双通道+ScopeCardAction)+ tui/styles.tcss +
+  agent/loop.py 单点 replace_scope(D2 原子换,终态拒绝,D10 无公开
+  读取面)。Q8 例外条款声明 2 条(popup 7→8;file 流链上 scope_loaded
+  之后有 scope_confirmed(source="file"),生产 eager 位次差异裁定
+  注记)。片内定案 W14c-1..4(scope_source 单源取 meta/重新声明旗标/
+  run 目录 meta 对账留痕/eager 处置口径)评审即终。测试:test_tui.py
+  既有语义保持 + 新增 24 例(50 绿);全仓零回归 526 passed + 2
+  skipped(落地前 515+2);ruff 全绿。T1 面(护栏热换:replace_scope、
+  /scope 状态机、冻结写序消费)满配对抗审查两轮(workflow 编排,
+  逐发现对抗核实,T1 面 3 票;两轮均遭 kimi 配额中断,journal 恢复
+  +实施侧同标准裁定兜底):第一轮 17 条发现确认 6 修 1 驳(半冻结态/
+  来源错标/纯中文预声明卡死/哈希谱系/文档缺口/eager 守卫锁死),
+  第二轮 14 条发现投票确认 7(6 修 1 文档)、票缺裁定修复 6、清理 1
+  (eager 首轮占位/跨 session 重声明卡死/编译在途终态化/Q8 eager
+  位次与已关句柄/展示口径与覆盖缺口);回归测试逐条映射,记录见
+  docs/dev-logs/WP-14c.md。**WP-14(总纲)四片(14a/14b/14c/14d)
+  全部 closed:NL scope 声明双通道(TUI 仪式/headless 非交互)与
+  热换落地,确认权在 operator、执行权在代码全链可审。**

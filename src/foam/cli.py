@@ -565,14 +565,10 @@ def _assemble_runtime(
     registry.register_module(BASH_TOOL_SCHEMAS, bash.dispatch)
     registry.register_module(SESSION_TOOL_SCHEMAS, session.dispatch)
     registry.register_module(STATE_TOOL_SCHEMAS, state.dispatch)
-    loaded_at = datetime.now(UTC).isoformat(timespec="seconds")
     # WP-08 接线:启动盘点一次(~137 次 which,毫秒级),地图注入 prompt;
     # 阶段跟踪主环尚无,current_phase 一律 None(见 WP-08 日志接线节)。
     scan = scan_tools()
     system_prompt = build_system_prompt(
-        scope,
-        source=scope_source,
-        loaded_at=loaded_at,
         workdir=engagement.paths.root,
         tool_map_text=render_tool_map(scan),
     )
@@ -895,7 +891,8 @@ def _resolve_scope(
     record = recover_scope_record(records)
     if record is None:
         raise ValueError(
-            "无法确定 scope:无 engagement.json 记录且审计链无 scope_loaded;"
+            "无法确定 scope:无 engagement.json 记录且审计链无 scope 记录"
+            "(链上回退兼容 scope_loaded/scope_confirmed/scope_updated);"
             "请用 --scope 显式指定"
         )
     path = Path(str(record.get("source") or ""))

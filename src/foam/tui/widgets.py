@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import Any
@@ -26,8 +27,9 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Click
 from textual.message import Message
 from textual.widget import Widget
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
+from foam.agent.scope_compiler import ScopeCompilation
 from foam.tui.bridge import tool_call_display
 
 # ---------------------------------------------------------------------------
@@ -466,6 +468,12 @@ class NarrativeView(VerticalScroll):
         self._mount_block(block)
         return block
 
+    def mount_scope_card(self, card: ScopeConfirmCard) -> None:
+        """挂载 scope 确认卡(WP-14c:仪式 worker 唯一挂载点;与正文/思考块互斥)。"""
+        self.stream = None
+        self._close_thinking()
+        self._mount_block(card)
+
 
 # ---------------------------------------------------------------------------
 # 侧栏(D3):阶段 → 索引计数 → token 预算 → jobs → sessions
@@ -625,10 +633,175 @@ class StatusBar(Horizontal):
 
 
 # ---------------------------------------------------------------------------
+# scope 确认卡(WP-14c:启动与 /scope 共用同一仪式实现,定案 Q5)
+# ---------------------------------------------------------------------------
+
+
+class ScopeCardAction(Message):
+    """operator 在 scope 确认卡上的动作:confirm / correct(带修正文本)/ cancel。
+
+    修正文本只进编译上下文(corrections 重编译),**不经过主输入坞、不进主环
+    模型上下文**(定案 D4 隔离:主环模型只能经 ENGAGEMENT.md 动态段看到确认后
+    的规则)。
+    """
+
+    def __init__(self, action: str, correction: str = "") -> None:
+        super().__init__()
+        self.action = action
+        self.correction = correction
+
+
+class ScopeConfirmCard(Vertical):
+    """scope 确认卡:canonical 规则逐行 + 计数 + sha256 短哈希 + 来源 +
+    三操作(确认冻结 / NL 修正重编译 / 取消)。
+
+    - 状态先进内存、``_ready`` 后才落 DOM(与工具卡同一挂载时序约定:worker
+      mount 后立刻 set_compiling/update_compilation 也安全);
+    - 编译中按钮与修正框禁用并示「编译中…」;
+    - 空 rules 醒目文案「(空——任何网络目标都会被拒)」(定案 Q9,文字 + CSS
+      类双通道);
+    - 编译失败进错误态:确认禁用(无合法产物可确认),修正/取消可用,
+      中文可行动报错原文上卡;
+    - 关闭后由主界面留通知块摘要(仪式 worker 负责)。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(id="scopecard")
+        self._ready = False
+        self._compiling = True
+        self._attempts = 0
+        self._compilation: ScopeCompilation | None = None
+        self._error = ""
+        self._hint = ""
+
+    def compose(self):
+        yield Static("", id="scope-card-title", markup=False)
+        yield Static("", id="scope-card-body", markup=False)
+        yield Static("", id="scope-card-status", markup=False)
+        with Horizontal(id="scope-card-buttons"):
+            yield Button("确认冻结", id="scope-confirm", variant="success")
+            yield Button("按修正重编译", id="scope-correct", variant="primary")
+            yield Button("取消", id="scope-cancel")
+        yield Input(
+            placeholder="修正意见(自然语言;只进编译上下文,不进主对话)",
+            id="scope-correction",
+        )
+
+    def on_mount(self) -> None:
+        self._ready = True
+        self._redraw()
+
+    # ---------- 仪式 worker 驱动的三态 ----------
+
+    def set_compiling(self) -> None:
+        """进入编译中状态(初次与每次重编译前):按钮/修正框禁用。"""
+        self._compiling = True
+        self._hint = ""
+        self._redraw()
+
+    def update_compilation(
+        self, compilation: ScopeCompilation, attempts: int
+    ) -> None:
+        """编译成功:重渲染规则/计数/短哈希并清空修正框。"""
+        self._compilation = compilation
+        self._attempts = attempts
+        self._error = ""
+        self._compiling = False
+        self._hint = ""
+        if self._ready:
+            self.query_one("#scope-correction", Input).value = ""
+        self._redraw()
+
+    def update_error(self, message: str, attempts: int) -> None:
+        """编译失败:错误态上卡(确认禁用),引导修正或取消。"""
+        self._error = message
+        self._attempts = attempts
+        self._compiling = False
+        self._hint = ""
+        self._redraw()
+
+    # ---------- 内部 ----------
+
+    @staticmethod
+    def _sha12(compilation: ScopeCompilation) -> str:
+        data = compilation.canonical_text.encode("utf-8")
+        return hashlib.sha256(data).hexdigest()[:12]
+
+    def _redraw(self) -> None:
+        if not self._ready:
+            return
+        title = self.query_one("#scope-card-title", Static)
+        body = self.query_one("#scope-card-body", Static)
+        status = self.query_one("#scope-card-status", Static)
+        body.set_class(False, "scope-empty", "scope-error")
+        if self._compiling:
+            title.update("scope 确认仪式——编译中…")
+            if self._compilation is None and not self._error:
+                body.update("(等待编译结果…)")
+            status.update(f"编译中…(第 {self._attempts + 1} 次编译)")
+        elif self._error:
+            title.update("scope 编译失败——请填修正意见重编译,或取消")
+            body.set_class(True, "scope-error")
+            body.update(self._error)
+            status.update(f"第 {self._attempts} 次编译失败;修正意见只进编译上下文")
+        else:
+            compilation = self._compilation
+            if compilation is None:
+                return  # 三态之一必有产物;防御兜底(初始必为编译中态)
+            title.update(f"确认授权 scope(第 {self._attempts} 次编译结果)")
+            if compilation.rules:
+                body.update("\n".join(compilation.rules))
+            else:
+                # 定案 Q9:空规则集合法(fail-closed),醒目双通道
+                body.set_class(True, "scope-empty")
+                body.update("(空——任何网络目标都会被拒)")
+            status.update(
+                f"来源:自然语言声明(NL 编译)· 共 {len(compilation.rules)} 条"
+                f" · canonical sha256:{self._sha12(compilation)}"
+                + (f"\n⚠ {self._hint}" if self._hint else "")
+            )
+        confirm = self.query_one("#scope-confirm", Button)
+        confirm.disabled = (
+            self._compiling or self._compilation is None or bool(self._error)
+        )
+        self.query_one("#scope-correct", Button).disabled = self._compiling
+        self.query_one("#scope-cancel", Button).disabled = self._compiling
+        self.query_one("#scope-correction", Input).disabled = self._compiling
+
+    def _post_action(self, action: str, correction: str = "") -> None:
+        if self._compiling:
+            return  # 编译中按钮虽禁用,快捷键/消息路径同样拦一道
+        if action == "confirm" and (self._compilation is None or self._error):
+            return  # 无合法产物可确认
+        if action == "correct" and not correction.strip():
+            self._hint = "先填修正意见再点「按修正重编译」"
+            self._redraw()
+            return
+        self.post_message(ScopeCardAction(action, correction.strip()))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button_id = event.button.id
+        if button_id == "scope-confirm":
+            self._post_action("confirm")
+        elif button_id == "scope-correct":
+            correction = self.query_one("#scope-correction", Input).value
+            self._post_action("correct", correction)
+        elif button_id == "scope-cancel":
+            self._post_action("cancel")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # 修正框内回车 = 按修正重编译(D4:不经过主输入坞)
+        event.stop()
+        if event.input.id == "scope-correction":
+            self._post_action("correct", event.value)
+
+
+# ---------------------------------------------------------------------------
 # 输入坞:斜杠命令补全 + 输入框(Q4 双通道)
 # ---------------------------------------------------------------------------
 
-#: v0 斜杠命令表(定案 Q4);描述进补全候选与 /help。
+#: v0 斜杠命令表(定案 Q4);描述进补全候选与 /help。WP-14c 增 /scope。
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/help", "命令与快捷键帮助"),
     ("/pause", "暂停 agent(turn 边界生效)"),
@@ -637,6 +810,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/jobs", "列出后台 job"),
     ("/sessions", "列出 PTY 会话"),
     ("/status", "run 状态与索引摘要"),
+    ("/scope", "查看/修改授权 scope(确认仪式)"),
 ]
 
 

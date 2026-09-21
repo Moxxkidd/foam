@@ -16,8 +16,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from foam.guard.scope import Scope
-
 #: 工作笔记文件名(engagement 目录根下);WP-06 接管状态层后仍以此文件为入口。
 ENGAGEMENT_FILENAME = "ENGAGEMENT.md"
 
@@ -183,18 +181,15 @@ def render_scope_section(
 
 
 def build_system_prompt(
-    scope: Scope | None = None,
     *,
-    source: str | None = None,
-    loaded_at: str | None = None,
     workdir: str | Path,
     tool_map_text: str | None = None,
 ) -> str:
     """构造 system prompt。
 
-    - ``scope``/``source``/``loaded_at``:过渡兼容形参,保留但不再渲染
-      (WP-14d 定案 D11:静态 prompt 不再保留任何 scope 现状字段,scope
-      现状走 ENGAGEMENT.md 动态段;14b/14c 落地时删实参);
+    静态 prompt 不含任何 scope 现状字段(定案 D11 终态:scope 现状走
+    ENGAGEMENT.md 动态段;WP-14d 过渡形参 scope/source/loaded_at 已删)。
+
     - ``workdir``:engagement 目录(提示词中给出绝对路径与 ENGAGEMENT.md 位置);
     - ``tool_map_text``:WP-08 工具地图注入点;None 时输出占位说明。
     """

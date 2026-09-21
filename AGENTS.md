@@ -25,7 +25,8 @@
 - 不限制 LLM 的策略思路:system prompt 只给方法论骨架与工具地图,不内置
   playbook。
 - 差异化锚点:持久 PTY 交互会话、智能输出层、engagement 状态索引、
-  scope 硬护栏、全程哈希链审计可回放。
+  scope 硬护栏、全程哈希链审计可回放。NL scope 编译:自然语言声明 →
+  编译为护栏规则 → operator 确认冻结(确认权在 operator,执行权在代码)。
 
 ## 2. WP 制开发
 

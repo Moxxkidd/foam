@@ -38,7 +38,6 @@ from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
 from foam.guard.scope import parse_scope, scope_payload
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 
-FIXED_TS = "2026-08-21T00:00:00+00:00"
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
 
 
@@ -81,9 +80,7 @@ def make_loop(tmp_path, script, *, loop_kw=None, register=None) -> SimpleNamespa
     audit = AuditLog(tmp_path / "audit.jsonl")
     audit.append(KIND_SCOPE_LOADED, scope_payload(scope, "test.scope"))
     bash = BashTool(tmp_path / "outputs")
-    prompt = build_system_prompt(
-        scope, source="test.scope", loaded_at=FIXED_TS, workdir=tmp_path
-    )
+    prompt = build_system_prompt(workdir=tmp_path)
     backend = FakeBackend(script)
     registry = None
     if register is not None:

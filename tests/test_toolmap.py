@@ -24,7 +24,6 @@ from foam.agent.toolmap import (
     render_tool_map,
     scan_tools,
 )
-from foam.guard.scope import parse_scope
 
 # ---------- 目录完整性(验收 1) ----------
 
@@ -309,14 +308,7 @@ def test_no_brand_in_catalog_and_render():
 def test_injection_through_build_system_prompt(tmp_path):
     scan = _fake_scan({"nmap", "gobuster"})
     text = render_tool_map(scan)
-    scope = parse_scope("10.0.0.0/24\n")
-    prompt = build_system_prompt(
-        scope,
-        source="scopes/test.txt",
-        loaded_at="2026-08-22T00:00:00+00:00",
-        workdir=tmp_path,
-        tool_map_text=text,
-    )
+    prompt = build_system_prompt(workdir=tmp_path, tool_map_text=text)
     assert "# 工具地图" in prompt  # 标题由 prompts 层加,正文来自本模块
     assert "nmap" in prompt  # 已安装工具进入 system prompt
     assert TOOL_MAP_PLACEHOLDER not in prompt  # 占位文本已被整段替换

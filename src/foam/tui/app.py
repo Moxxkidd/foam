@@ -17,6 +17,14 @@
   输入框普通文本经 ``loop.interject`` 唤醒续段;顶栏显「待命」,
   placeholder 随之切换。真终态(killed/error)的「run 已结束」提示
   只发一次,placeholder 更新在一处。
+- WP-14c scope 确认仪式(定案 Q5/D8/D9):``config.scope is None`` 时首条
+  消息承载 objective+NL scope → 仪式 worker 两段结构(编译 → 确认卡 →
+  冻结,完成后才调既有 ``start_run``,其同步方法体一字不动);engagement
+  在首条消息到达即建(``scope_path=None``)。``/scope`` 裸命令只读展示
+  (数据源为 TUI 侧权威引用 ``TUIConfig.scope``,D10),带参经同一仪式
+  热换(确认后 ``loop.replace_scope`` 原子换,D2)。file 流零仪式照旧,
+  唯一有意变更:链上 ``scope_loaded`` 之后补一条
+  ``scope_confirmed(source="file")``(Q8,payload 语义对齐 14b W14b-2)。
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Input, Static
+from textual.worker import Worker
 
 from foam import __app_name__, __version__
 from foam.agent.backends.base import ConfigError, LLMBackend
@@ -51,11 +60,27 @@ from foam.agent.loop import (
     ToolRegistry,
     estimate_tokens,
 )
-from foam.agent.prompts import build_system_prompt
+from foam.agent.prompts import build_system_prompt, render_scope_section
+from foam.agent.scope_compiler import (
+    ScopeCompilation,
+    ScopeCompileError,
+    compile_scope,
+    freeze_scope,
+    scope_event_payload,
+)
 from foam.agent.toolmap import render_tool_map, scan_tools
-from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog
-from foam.guard.scope import Scope, scope_payload
-from foam.state.files import DEFAULT_ENGAGEMENTS_DIR, Engagement
+from foam.guard.audit import (
+    KIND_SCOPE_CONFIRMED,
+    KIND_SCOPE_LOADED,
+    KIND_SCOPE_UPDATED,
+    AuditLog,
+)
+from foam.guard.scope import Scope, render_canonical_rules, scope_payload
+from foam.state.files import (
+    DEFAULT_ENGAGEMENTS_DIR,
+    Engagement,
+    _default_engagement_id,
+)
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
 from foam.tools.session import SessionTool
@@ -79,6 +104,8 @@ from foam.tui.widgets import (
     InputDock,
     KillConfirmBar,
     NarrativeView,
+    ScopeCardAction,
+    ScopeConfirmCard,
     SidebarPane,
     StatusBar,
 )
@@ -114,6 +141,7 @@ _HELP_TEXT = """斜杠命令(输入 / 有补全):
   /jobs     列出后台 job
   /sessions 列出 PTY 会话(只读;干预请插话,由 agent 经 session_send 操作)
   /status   run 状态与索引摘要
+  /scope    裸命令=查看当前授权 scope;/scope <描述> 经确认仪式修改
 快捷键:
   Ctrl-X / Ctrl-C  kill(二次确认,Esc 取消)
   Ctrl-P           暂停/继续切换
@@ -131,8 +159,11 @@ _HELP_TEXT = """斜杠命令(输入 / 有补全):
 class TUIConfig:
     """TUI 启动配置:全部由调用方(CLI 子命令)显式装配。
 
-    - ``scope``/``scope_source``:授权范围与来源路径(迎宾屏展示 + 审计 +
-      system prompt 授权声明);加载失败应在 CLI 层直接报掉。
+    - ``scope``/``scope_source``:授权范围与来源路径(迎宾屏展示 + 审计)。
+      WP-14c 起 ``scope`` 可为 None(定案 D9/D10):None = NL 确认仪式流,
+      冻结后赋值、``scope_source`` 置 scope.confirmed 绝对路径;``/scope``
+      确认后同步更新(TUI 侧权威引用,AgentLoop 无公开读取面)。file 流照旧
+      非 None 零仪式;加载失败应在 CLI 层直接报掉。
     - ``backend``:已构造的后端实例(API key 只走环境变量,本层不接触)。
     - ``model_label``:展示用模型名(迎宾屏/顶栏);空串显示 provider 默认。
     - ``config_home``:本地配置目录(呼号预填),默认 ``~/.foam/``。
@@ -144,7 +175,7 @@ class TUIConfig:
       False 不受影响。
     """
 
-    scope: Scope
+    scope: Scope | None
     scope_source: str
     backend: LLMBackend
     model_label: str = ""
@@ -202,9 +233,6 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
     registry.register_module(SESSION_TOOL_SCHEMAS, session.dispatch)
     registry.register_module(STATE_TOOL_SCHEMAS, state.dispatch)
     prompt = build_system_prompt(
-        config.scope,
-        source=config.scope_source,
-        loaded_at=datetime.now(UTC).isoformat(timespec="seconds"),
         workdir=engagement.paths.root,
         tool_map_text=render_tool_map(scan_tools()),
     )
@@ -312,7 +340,12 @@ def _gradient_wordmark(lines: list[str], start: str, end: str) -> Text:
 
 @dataclass
 class WelcomeInfo:
-    """迎宾屏展示数据(品牌名只经 __app_name__ 进来,验收 5)。"""
+    """迎宾屏展示数据(品牌名只经 __app_name__ 进来,验收 5)。
+
+    ``scope_declared=False``(WP-14c NL 仪式流)时 compose 渲染单行
+    「scope 待声明(主界面确认)」,规则计数与 sha 给占位「—」;
+    file 流(True)渲染逐字节不变。
+    """
 
     wordmark: Text
     version: str
@@ -321,6 +354,7 @@ class WelcomeInfo:
     scope_rules: int
     scope_sha: str
     prefill: str
+    scope_declared: bool = True
 
 
 class WelcomeScreen(Screen):
@@ -334,13 +368,19 @@ class WelcomeScreen(Screen):
         with Vertical(id="gate"):
             yield Static(self.info.wordmark, id="wm-logo")
             yield Static(f"v{self.info.version}", id="wm-version")
-            yield Static(
-                f"后端  {self.info.backend_label}\n"
-                f"scope {self.info.scope_path} · {self.info.scope_rules} 条规则"
-                f" · sha256:{self.info.scope_sha}",
-                id="wm-meta",
-                markup=False,
-            )
+            if self.info.scope_declared:
+                meta_text = (
+                    f"后端  {self.info.backend_label}\n"
+                    f"scope {self.info.scope_path} · {self.info.scope_rules} 条规则"
+                    f" · sha256:{self.info.scope_sha}"
+                )
+            else:
+                # WP-14c NL 仪式流(D9):scope 待声明,计数与 sha 占位「—」
+                meta_text = (
+                    f"后端  {self.info.backend_label}\n"
+                    "scope 待声明(主界面确认) · 规则 — · sha256:—"
+                )
+            yield Static(meta_text, id="wm-meta", markup=False)
             yield Static(
                 "仅服务明确授权目标 · 每条命令过 scope 护栏\n全程哈希链审计",
                 id="wm-redline",
@@ -519,7 +559,7 @@ class MainScreen(Screen):
         self.tui.submit_text(msg.text)
 
     def execute_command(self, raw: str) -> None:
-        """斜杠命令分派(v0 七条;未知命令如实报错,不静默)。"""
+        """斜杠命令分派(v0 八条;未知命令如实报错,不静默)。"""
         command = raw.split(maxsplit=1)[0].lower()
         loop = self.tui.active_loop
         if command == "/help":
@@ -544,10 +584,80 @@ class MainScreen(Screen):
             self.run_worker(self._show_sessions())
         elif command == "/status":
             self._show_status()
+        elif command == "/scope":
+            parts = raw.split(maxsplit=1)
+            argument = parts[1].strip() if len(parts) > 1 else ""
+            if argument:
+                self._request_scope_change(argument)
+            else:
+                self._show_scope()
         else:
             self.narrative.add_notice(
                 "error", f"未知命令 {command};/help 查看可用命令"
             )
+
+    # ---------- /scope(WP-14c:裸=只读展示 D3/D10;带参=同一仪式热换 Q5) ----------
+
+    def _show_scope(self) -> None:
+        """裸 /scope:canonical 逐行 + 计数 + 来源 + canonical sha256 短哈希
+        12 位(只读;数据源为 TUI 侧权威引用 ``TUIConfig.scope``,不回读 loop)。"""
+        app = self.tui
+        scope = app.config.scope
+        if scope is None:
+            self.narrative.add_notice(
+                "info",
+                "尚未声明授权 scope——发送首条消息(自然语言描述目标与范围),"
+                "或 /scope <描述> 启动确认仪式",
+            )
+            return
+        canonical = render_canonical_rules(scope.rules)
+        # 哈希口径与链上记录/迎宾屏/engagement meta 对齐(第二轮对抗审查
+        # 修复):NL 冻结物即 canonical 字节(两口径恒等);file 流取文件字节
+        # sha256(W14b-2 同口径),免同一「canonical sha256」标签两个值。
+        try:
+            digest = hashlib.sha256(
+                Path(app.config.scope_source).read_bytes()
+            ).hexdigest()
+        except OSError:
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        sha = digest[:12]
+        lines = [
+            f"当前授权 scope · 来源:{app.config.scope_source} · "
+            f"canonical sha256:{sha}"
+        ]
+        if scope.rules:
+            lines.extend(f"  {rule}" for rule in scope.rules)
+        else:
+            lines.append("  (空——任何网络目标都会被拒)")
+        lines.append(f"共 {len(scope.rules)} 条;修改经 /scope <描述> 确认仪式")
+        self.narrative.add_notice("info", "\n".join(lines))
+
+    def _request_scope_change(self, argument: str) -> None:
+        """带参 /scope 状态机(Q5 三路共用同一仪式实现;D2 终态拒绝)。"""
+        app = self.tui
+        if app.ceremony_running:
+            self.narrative.add_notice(
+                "info", "scope 确认仪式进行中,请先完成确认卡"
+            )
+            return
+        if app.run_handle is not None and app.active_loop is None:
+            self.narrative.add_notice("info", "run 已结束,scope 不可更改(D2)")
+            return
+        if app.active_loop is not None:
+            app.start_scope_ceremony(argument, mode="update")
+            return
+        if app.config.scope is None or app.scope_frozen_via_nl:
+            # 未启动 + 未声明 → 预声明;未启动 + 已 NL 冻结 → 同一仪式重新声明
+            app.start_scope_ceremony(argument, mode="predeclare")
+            return
+        self.narrative.add_notice(
+            "info",
+            "scope 已由 --scope 指定;改用 NL 声明请不带 --scope 重启",
+        )
+
+    def on_scope_card_action(self, msg: ScopeCardAction) -> None:
+        """确认卡动作 → 回填仪式 worker 的 future(编译循环继续)。"""
+        self.tui.resolve_scope_card_action(msg)
 
     async def _show_jobs(self) -> None:
         bash = self.tui.run_handle.bash if self.tui.run_handle else None
@@ -755,6 +865,13 @@ class TuiApp(App[None]):
         self._final_result: RunResult | None = None
         self._fatal: str | None = None
         self._main: MainScreen | None = None
+        # WP-14c scope 仪式单例守卫(D9,与 start_run 单 run 守卫同构):
+        # worker 引用 + 卡动作回填 future(None = 当前无仪式/无待答卡)。
+        self._ceremony: Worker[None] | None = None
+        self._ceremony_action: asyncio.Future[ScopeCardAction] | None = None
+        # scope 来源谱系(D10 配套):NL 仪式冻结过 → 未启动时可再 /scope 重声明
+        # (file 流未启动带参 /scope 一律拒并指引,见 _request_scope_change)。
+        self._scope_frozen_via_nl = False
 
     # ---------- 展示数据 ----------
 
@@ -781,24 +898,38 @@ class TuiApp(App[None]):
             return None
         return handle.loop
 
+    @property
+    def ceremony_running(self) -> bool:
+        """scope 确认仪式是否在进行中(D9 单例守卫的读取面)。"""
+        return self._ceremony is not None
+
+    @property
+    def scope_frozen_via_nl(self) -> bool:
+        """本会话的 scope 是否经 NL 仪式冻结(/scope 状态机分支依据)。"""
+        return self._scope_frozen_via_nl
+
     # ---------- 屏幕流 ----------
 
     async def on_mount(self) -> None:
-        scope_sha = self._scope_sha()
+        declared = self.config.scope is not None
         info = WelcomeInfo(
             wordmark=_gradient_wordmark(
                 render_wordmark(__app_name__), "#56d4dd", "#58a6ff"
             ),
             version=__version__,
             backend_label=self.backend_label,
-            scope_path=self.config.scope_source,
-            scope_rules=len(self.config.scope.rules),
-            scope_sha=scope_sha,
+            # NL 仪式流(D9):scope 待声明,占位值不进 compose(渲染分支钉死)
+            scope_path=self.config.scope_source if declared else "",
+            scope_rules=len(self.config.scope.rules) if declared else 0,
+            scope_sha=self._scope_sha(),
             prefill=load_operator(self.config.home_path),
+            scope_declared=declared,
         )
         await self.push_screen(WelcomeScreen(info))
 
     def _scope_sha(self) -> str:
+        if self.config.scope is None:
+            return "—"  # NL 仪式流(D9):冻结前无文件可哈希
         try:
             data = Path(self.config.scope_source).read_bytes()
         except OSError:
@@ -834,11 +965,31 @@ class TuiApp(App[None]):
         if text.startswith("/"):
             main.execute_command(text)
             return
+        if self.ceremony_running:
+            # D9 worker 单例守卫(与 start_run 单 run 守卫同构):仪式中再发
+            # 普通文本提示并忽略,不重复启动 worker。
+            main.narrative.add_notice(
+                "info", "scope 确认仪式进行中,请先完成确认卡"
+            )
+            return
         if self.run_handle is None:
             main.narrative.add_notice(
                 "objective", f"目标(呼号 {self.operator}):{text}"
             )
+            if self.config.scope is None:
+                # NL 仪式流(Q5):首条消息承载 objective+NL scope,冻结完成前
+                # loop 不启动(「scope 冻结前 loop 不启动」)。
+                self.start_scope_ceremony(text, mode="startup")
+                return
+            if self._scope_frozen_via_nl:
+                # NL 冻结后首条消息:先把 run engagement 预备齐(meta 对账+
+                # 动态段),再 start_run 幂等复开——生产 eager_task_factory
+                # 下 create_task 同步开跑,开跑后再写段首轮上下文只剩占位
+                # (第二轮对抗审查修复)。
+                self._prepare_nl_run_engagement(text)
             self.start_run(text)
+            if not self._scope_frozen_via_nl:
+                self._append_file_scope_confirm()
             return
         loop = self.active_loop
         if loop is None:
@@ -852,6 +1003,365 @@ class TuiApp(App[None]):
         main.narrative.add_notice(
             "interject", f"插话(呼号 {self.operator}):{text}"
         )
+
+    def _append_file_scope_confirm(self) -> None:
+        """Q8:file 流补写 ``scope_confirmed(source="file")``(``start_run``
+        返回后、``scope_loaded`` 相邻之后;start_run 失败则 ``_audit`` 未就绪,
+        不补)。payload 经 14a ``scope_event_payload`` 单源构造,语义对齐 14b
+        W14b-2:``path`` = as-given 原串、``canonical_sha256`` = scope 文件字节
+        sha256(取刚写入的 engagement.json meta,免二次读盘的 TOCTOU)。
+
+        scope 由 NL 仪式冻结(``_scope_frozen_via_nl``)时不补:确认事实已在
+        仪式 engagement 链上以 ``source="nl"`` 落账,此处补 ``source="file"``
+        会错标来源(第一轮对抗审查修复)。
+        """
+        if self._scope_frozen_via_nl:
+            return
+        if self._audit is None or self.engagement is None:
+            return
+        scope = self.config.scope
+        if scope is None:
+            return  # 防御:file 流恒非 None
+        file_sha256 = self.engagement.metadata()["scope"]["sha256"]
+        payload = scope_event_payload(
+            scope,
+            source="file",
+            path=self.config.scope_source,
+            canonical_sha256=file_sha256,
+        )
+        try:
+            self._audit.append(KIND_SCOPE_CONFIRMED, payload)
+        except ValueError:
+            # 第二轮对抗审查修复:生产 eager_task_factory 下,同步完结的 run
+            # 可能在 start_run 返回前已收尾并关闭共享句柄;链已封口即无
+            # 竞态写者,重开补写(AuditLog 重开恢复尾序 seq/prev_hash)。
+            audit = AuditLog(self.engagement.paths.audit_jsonl)
+            try:
+                audit.append(KIND_SCOPE_CONFIRMED, payload)
+            finally:
+                audit.close()
+
+    def _prepare_nl_run_engagement(self, text: str) -> None:
+        """NL 冻结(predeclare/重新声明)后首条消息开跑前的 run engagement
+        预备(第二轮对抗审查修复;两段结构 D9 的预声明变体,start_run 本体
+        一字不动,其后的幂等复开因本预备而同参通过):
+
+        - 目录不存在:按当前冻结 scope 创建(meta.scope 随 create 一步写齐)
+          + 动态段写入——loop 首轮读到的即是已确认规则(生产 eager 调度下
+          create_task 同步开跑,事后再写段只剩「尚未冻结」占位);
+        - 目录已存在(同 objective 此前跑过旧 scope):meta.scope 对账为当前
+          冻结 scope——否则 start_run 的 create 幂等复开撞 scope 一致性
+          检查,该 objective 当天永久无法启动(冲突物是内部路径,NL 用户
+          无可行动指引);漂移在 run 链上留痕:旧值有 sha256 →
+          ``scope_updated``(old/new 键,D13),旧值为空(曾取消的仪式目录)
+          → ``scope_confirmed(source="nl")`` 指针记录;动态段同步重写。
+          对账 = startup 仪式 freeze_scope ② 写 meta 的同义动作,确认事实
+          与 NL 出处键在仪式 engagement 链上,本片不重复。
+
+        create/open/对账失败时不重复报错:start_run 将以同参重试 create
+        并给出自己的「engagement 创建失败」指引。
+        """
+        scope = self.config.scope
+        main = self._main
+        if scope is None or main is None:
+            return
+        root = Path(self.config.engagements_dir) / _default_engagement_id(text)
+        engagement: Engagement
+        sha256 = ""
+        try:
+            if (root / "engagement.json").exists():
+                engagement = Engagement.open(root)
+                old_scope_meta = engagement.metadata().get("scope") or {}
+                new_scope_meta = engagement.update_scope_metadata(
+                    self.config.scope_source
+                )["scope"]
+                sha256 = new_scope_meta["sha256"]
+                if old_scope_meta != new_scope_meta:
+                    audit = AuditLog(engagement.paths.audit_jsonl)
+                    try:
+                        audit.append(
+                            KIND_SCOPE_UPDATED
+                            if old_scope_meta.get("sha256")
+                            else KIND_SCOPE_CONFIRMED,
+                            scope_event_payload(
+                                scope,
+                                source="nl",
+                                path=self.config.scope_source,
+                                canonical_sha256=sha256,
+                                old_sha256=old_scope_meta.get("sha256"),
+                            ),
+                        )
+                    finally:
+                        audit.close()
+            else:
+                engagement = Engagement.create(
+                    self.config.engagements_dir,
+                    text,
+                    scope_path=self.config.scope_source,
+                )
+                sha256 = (engagement.metadata().get("scope") or {}).get(
+                    "sha256", ""
+                )
+        except (OSError, ValueError):
+            return  # start_run 同参重试 create 时给出自己的报错指引
+        try:
+            engagement.update_scope_section(
+                render_scope_section(
+                    scope.rules,
+                    source=self.config.scope_source,
+                    sha256=sha256,
+                    frozen_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                )
+            )
+        except OSError as exc:
+            main.narrative.add_notice("error", f"scope 动态段写入失败:{exc}")
+
+    # ---------- scope 确认仪式(WP-14c:Q5 三路共用同一实现) ----------
+
+    def start_scope_ceremony(self, text: str, *, mode: str) -> None:
+        """启动 scope 仪式 worker(单例守卫,D9)。
+
+        ``mode``:``startup``=首条消息承载 objective+NL scope(冻结后才调
+        ``start_run``);``predeclare``=run 前 /scope 先声明(不启动 loop);
+        ``update``=运行中 /scope 热换(确认后 ``loop.replace_scope``,D2)。
+        """
+        if self._ceremony is not None or self._main is None:
+            return  # 仪式单例:调用方负责提示,这里直接忽略
+        worker = self.run_worker(self._scope_ceremony(text, mode=mode))
+        if worker.is_finished:
+            # textual 在 Python≥3.12 下设 eager_task_factory:协程可能在
+            # run_worker 内同步跑完(如同步失败早退),其 finally 已清守卫
+            # 字段;此时把已完成 worker 赋回 _ceremony 会让单例守卫永久
+            # 锁死(第一轮对抗审查修复,勿回归)。
+            self._ceremony = None
+        else:
+            self._ceremony = worker
+
+    def _ceremony_engagement(
+        self, text: str, *, predeclare: bool = False
+    ) -> Engagement | None:
+        """D8 engagement 获取:以当前文本 derive id——``engagement.json`` 存在
+        走 ``Engagement.open``(绕过 create 的 objective 冲突检查:取消后重发
+        可换文本),不存在才 ``Engagement.create(objective=text, scope_path=None)``
+        (meta["scope"] 记 None,使仪式期编译调用有审计链可落)。
+
+        ``predeclare=True`` 时 derive id 加 ``scope-predeclare-`` 前缀(第一
+        轮对抗审查修复):预声明 engagement 的 objective 是 scope 文本,若与
+        首条消息派生同目录(纯中文输入 slug 恒为 "engagement",必然相碰),
+        ``start_run`` 的 create 幂等复开会因 objective 冲突永远拒绝启动;
+        前缀把预声明目录与 objective 派生目录隔开命名空间,而同文本→同
+        目录的复用语义(D8 初衷)不变。
+        """
+        engagement_id = (
+            _default_engagement_id(f"scope-predeclare-{text}")
+            if predeclare
+            else None
+        )
+        root = Path(self.config.engagements_dir) / (
+            engagement_id or _default_engagement_id(text)
+        )
+        try:
+            if (root / "engagement.json").exists():
+                return Engagement.open(root)
+            return Engagement.create(
+                self.config.engagements_dir,
+                text,
+                scope_path=None,
+                engagement_id=engagement_id,
+            )
+        except (OSError, ValueError) as exc:
+            if self._main is not None:
+                self._main.narrative.add_notice(
+                    "error", f"engagement 创建失败:{exc}"
+                )
+            return None
+
+    async def _scope_ceremony(self, text: str, *, mode: str) -> None:
+        """仪式本体:engagement 获取(D8)→ 编译循环(确认卡)→ 冻结 → 两段
+        结构(D9)。worker 自开 AuditLog 续链(update 除外:直接用运行中句柄);
+        任何异常如实上屏收口,不炸 app(run_worker 默认 exit_on_error)。
+        """
+        main = self._main
+        if main is None:  # start_scope_ceremony 已守卫;防御兜底
+            self._ceremony = None
+            return
+        audit: AuditLog | None = None
+        own_audit = False
+        card = ScopeConfirmCard()
+        card_mounted = False
+        try:
+            if mode == "update":
+                engagement = self.engagement
+                audit = self._audit
+                if engagement is None or audit is None:
+                    main.narrative.add_notice(
+                        "error", "运行中 engagement/审计句柄缺失,无法热换 scope"
+                    )
+                    return
+            else:
+                engagement = self._ceremony_engagement(
+                    text, predeclare=mode == "predeclare"
+                )
+                if engagement is None:
+                    return  # 报错已上屏
+                engagement.set_operator(self.operator)
+                audit = AuditLog(engagement.paths.audit_jsonl)
+                own_audit = True
+
+            main.narrative.mount_scope_card(card)
+            card_mounted = True
+
+            # 编译循环:每次调用(含修正、失败路径)由 14a 编译器经 audit 形参
+            # 现场落 llm_exchange_meta(D7),本片不重复 append。
+            corrections: list[str] = []
+            attempts = 0
+            compilation: ScopeCompilation | None = None
+            while True:
+                card.set_compiling()
+                try:
+                    compilation = await compile_scope(
+                        text,
+                        self.config.backend,  # D5:复用同一后端实例
+                        corrections=corrections,
+                        current=(
+                            list(self.config.scope.rules)
+                            if mode == "update" and self.config.scope is not None
+                            else None
+                        ),
+                        audit=audit,
+                    )
+                    attempts += 1
+                    card.update_compilation(compilation, attempts)
+                except ScopeCompileError as exc:
+                    attempts += 1
+                    card.update_error(str(exc), attempts)
+                except ValueError:
+                    # 第二轮对抗审查修复:update 仪式编译在途(含修正重编译)
+                    # 期间 run 终态化——_run_to_end 已关闭共享审计句柄,
+                    # compile_scope 的落账 finally 在已关句柄上炸 ValueError
+                    # (该次 D7 记录随句柄关闭而缺,链本身完整可验);按 D2
+                    # 收口而非裸抛内部异常。
+                    if mode == "update" and self.active_loop is None:
+                        main.narrative.add_notice(
+                            "info",
+                            "run 已结束,scope 不可更改(D2);仪式终止",
+                        )
+                        return
+                    raise
+                action = await self._await_card_action()
+                if action.action == "cancel":
+                    main.narrative.add_notice(
+                        "info",
+                        "已取消 scope 修改,现状不变"
+                        if mode == "update"
+                        else "已取消;重发首条消息可重新声明",
+                    )
+                    return
+                if action.action == "correct":
+                    corrections.append(action.correction)
+                    continue
+                break  # confirm:卡在无合法产物时不发 confirm,此处必有 compilation
+
+            if compilation is None:
+                # 卡侧已保证 confirm 只在有合法产物时发出;防御兜底不收冻结
+                main.narrative.add_notice(
+                    "error", "scope 仪式内部状态异常:无编译产物,未冻结"
+                )
+                return
+
+            # 冻结(14a freeze_scope 唯一入口,D13 写序)→ 两段结构(D9)
+            if mode == "update" and self.active_loop is None:
+                # 第一轮对抗审查修复:仪式挂起等卡期间 run 可能已终态
+                # (_run_to_end 收尾并关闭共享审计句柄)——此时 freeze_scope
+                # 尾步 audit.append 会在已关句柄上炸 ValueError,落出半冻结
+                # 态(链上无 scope_updated);D2 终态拒绝,不冻结。本检查与
+                # freeze_scope 同步体之间无 await,单线程原子。
+                main.narrative.add_notice(
+                    "info", "run 已结束,scope 不可更改(D2);未冻结"
+                )
+                return
+            old_sha256 = None
+            if mode == "update" and self.config.scope is not None:
+                # 谱系口径(第一轮对抗审查修复):与链上最近一条 scope 记录的
+                # canonical_sha256 对齐——取 engagement.json meta 的 sha256
+                # (NL 冻结物即 canonical 渲染字节,二者恒等;file 流则为
+                # 文件字节哈希,与链上 source="file" 记录同口径),免注释与
+                # 换行的渲染差异断谱系。
+                old_sha256 = (engagement.metadata().get("scope") or {}).get(
+                    "sha256"
+                )
+                if old_sha256 is None:  # 防御:meta 缺 scope 段退回渲染口径
+                    old_sha256 = hashlib.sha256(
+                        render_canonical_rules(
+                            self.config.scope.rules
+                        ).encode("utf-8")
+                    ).hexdigest()
+            frozen_sha = freeze_scope(
+                engagement,
+                audit,
+                compilation,
+                source="nl",
+                nl_text=text,
+                old_sha256=old_sha256,
+                objective=text if mode != "update" else None,  # D8 最新文本
+                compile_attempts=attempts,
+            )
+            if own_audit:
+                # 先关 worker 自有链句柄,start_run 重开续链(seq 不断)
+                audit.close()
+                own_audit = False
+                audit = None
+            # D10:TUI 侧权威引用同步更新(path 取冻结刚落盘的 meta,单源)
+            meta_scope = engagement.metadata()["scope"]
+            self.config.scope = compilation.scope
+            self.config.scope_source = meta_scope["path"]
+            self._scope_frozen_via_nl = True
+            summary = (
+                f"scope 已确认冻结:{len(compilation.rules)} 条规则 · "
+                f"canonical sha256:{frozen_sha[:12]}"
+            )
+            if mode == "startup":
+                main.narrative.add_notice("success", summary)
+                # D9 两段结构:冻结完成后才调既有 start_run(其方法体不动;
+                # 幂等复开同参目录——objective/scope meta 已由冻结写齐)。
+                self.start_run(text)
+            elif mode == "update":
+                loop = self.active_loop
+                if loop is not None:
+                    loop.replace_scope(compilation.scope)  # D2 原子换
+                main.narrative.add_notice(
+                    "success", summary + "(下一条命令即生效)"
+                )
+            else:  # predeclare:不启动 loop
+                main.narrative.add_notice(
+                    "success", summary + ";发送首条消息启动 run"
+                )
+        except Exception as exc:  # 仪式异常:如实上屏收口,不炸 app
+            main.narrative.add_notice("error", f"scope 仪式异常:{exc!r}")
+        finally:
+            if own_audit and audit is not None:
+                audit.close()
+            if card_mounted:
+                await card.remove()
+            self._ceremony_action = None
+            self._ceremony = None
+
+    async def _await_card_action(self) -> ScopeCardAction:
+        """挂起仪式 worker,等 operator 的确认卡动作(MainScreen 回填)。"""
+        future: asyncio.Future[ScopeCardAction] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._ceremony_action = future
+        try:
+            return await future
+        finally:
+            self._ceremony_action = None
+
+    def resolve_scope_card_action(self, action: ScopeCardAction) -> None:
+        """卡动作回填仪式 future(MainScreen.on_scope_card_action 转发至此)。"""
+        future = self._ceremony_action
+        if future is not None and not future.done():
+            future.set_result(action)
 
     # ---------- run 生命周期(Q1:首条消息才启动) ----------
 
@@ -972,15 +1482,23 @@ def main(args) -> int:
     objective 由主界面输入框首条消息提供(定案 Q1)。scope/后端装配复用
     cli 的公开构件与其 ``_build_backend``(cli 注释明示「tui 就绪后也可
     复用」);密钥只由后端从环境变量读取,本层不接触。
+
+    WP-14c:``--scope`` 由 CLI 侧改可选(cli.py 归属 14b);``args.scope``
+    为 None 时跳过 ``load_scope``,以 ``scope=None, scope_source=""`` 进 NL
+    确认仪式流;给定时逐字节照旧。
     """
     from foam.cli import ENV_MODEL, EXIT_USAGE, _build_backend
     from foam.guard.scope import load_scope
 
-    try:
-        scope = load_scope(args.scope)
-    except (OSError, ValueError) as exc:
-        print(f"[错误] scope 加载失败: {exc}", file=sys.stderr)
-        return EXIT_USAGE
+    scope: Scope | None = None
+    scope_source = ""
+    if args.scope is not None:
+        try:
+            scope = load_scope(args.scope)
+        except (OSError, ValueError) as exc:
+            print(f"[错误] scope 加载失败: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        scope_source = str(args.scope)
     try:
         backend = _build_backend(args)
     except ConfigError as exc:
@@ -993,7 +1511,7 @@ def main(args) -> int:
         kwargs["first_event_timeout"] = args.first_event_timeout
     config = TUIConfig(
         scope=scope,
-        scope_source=str(args.scope),
+        scope_source=scope_source,
         backend=backend,
         model_label=args.model or os.environ.get(ENV_MODEL) or "",
         engagements_dir=args.workdir or DEFAULT_ENGAGEMENTS_DIR,

@@ -484,6 +484,18 @@ class AgentLoop:
         if task is not None and not task.done():
             task.cancel()
 
+    def replace_scope(self, scope: Scope) -> None:
+        """原子换护栏 scope(WP-14c,定案 D2):frozen dataclass 一次引用赋值,
+        asyncio 单线程无撕裂,下一条命令即生效;不重建 system prompt(Q3),
+        不动会话/jobs/索引。终态拒绝:run 已收尾不可再授权。
+
+        注意(定案 D10):AgentLoop 不加公开 scope 读取面——无 property、无
+        getter;loop 内的 Scope 是执行面私有状态,只能经本方法原子换。
+        """
+        if self._status in ("finished", "killed", "error"):
+            raise RuntimeError("run 已终态,不可更换 scope(D2)")
+        self._scope = scope
+
     # ---------- 主入口 ----------
 
     async def run(self, objective: str) -> RunResult:

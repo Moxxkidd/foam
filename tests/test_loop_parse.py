@@ -24,7 +24,6 @@ from foam.tools.bash import TOOL_SCHEMAS, BashTool
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SCOPE_TEXT = "192.0.2.0/24\n"
-FIXED_TS = "2026-08-25T00:00:00+00:00"
 NMAP_CMD = "nmap -sV 192.0.2.10 192.0.2.11"
 CURL_CMD = "curl -s 192.0.2.10"
 GENERIC_VIEW = "GENERIC_VIEW_MARKER:head+tail 通用截断视图原文"
@@ -90,9 +89,7 @@ def make_env(
     audit = AuditLog(tmp_path / "audit.jsonl")
     audit.append(KIND_SCOPE_LOADED, scope_payload(scope, "test.scope"))
     bash = BashTool(tmp_path / "outputs")  # 仅 kill 清理面用;dispatch 不进它
-    prompt = build_system_prompt(
-        scope, source="test.scope", loaded_at=FIXED_TS, workdir=tmp_path
-    )
+    prompt = build_system_prompt(workdir=tmp_path)
     backend = FakeBackend(toolcall_script(command))
     registry = ToolRegistry()
 

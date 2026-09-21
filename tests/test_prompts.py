@@ -17,13 +17,9 @@ from foam.agent.prompts import (
     render_engagement_template,
     render_scope_section,
 )
-from foam.guard.scope import parse_scope
 
-SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n*.example.com\nhttp://127.0.0.1:3000/\n"
 FIXED_TS = "2026-08-21T00:00:00+00:00"
-# WP-14d 过渡:scope/source/loaded_at 形参保留但不再渲染(D11),FIXED 收缩为
-# 仅 workdir;旧形态实参由 test_build_system_prompt_legacy_call_form_transitional
-# 锁定,14b/14c 删实参后一并收缩。
+# scope/source/loaded_at 过渡形参已删(D11 终态),FIXED 仅 workdir。
 FIXED = {"workdir": "/eng/demo"}
 
 # 快照里工具地图占位段是单行长文本(渲染结果如此),拆成拼接串以满足 E501;
@@ -119,18 +115,6 @@ def build_default() -> str:
 def test_system_prompt_snapshot_exact():
     """验收 5:全文快照(授权声明与红线含于其中,逐字锁定)。"""
     assert build_default() == EXPECTED_SYSTEM_PROMPT
-
-
-def test_build_system_prompt_legacy_call_form_transitional():
-    """过渡兼容(定案 D11):旧调用形态的 scope/source/loaded_at 形参保留但不再
-    渲染,与新形态输出逐字相等;14b/14c 删实参后本测试随之收缩。"""
-    legacy = build_system_prompt(
-        parse_scope(SCOPE_TEXT),
-        source="scopes/lab.scope",
-        loaded_at=FIXED_TS,
-        workdir="/eng/demo",
-    )
-    assert legacy == build_default()
 
 
 def test_system_prompt_contains_authorization_and_redlines():

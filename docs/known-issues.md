@@ -1,7 +1,8 @@
 # 已知问题总表(WP-13 收口,2026-08-27)
 
 > 汇总口径:M3 门口挂账 9 条(①–⑨)+ 各 WP 日志遗留在册项(⑩–⑫)+
-> WP-13 整合期新发现(⑬–⑭)。全部如实收录,逐条给 v1 去向;v1 立项清单
+> WP-13 整合期新发现(⑬–⑭)+ WP-14 评估期新发现(⑮,2026-09-21 登记)。
+> 全部如实收录,逐条给 v1 去向;v1 立项清单
 > 本体(含优先级排序)在 `docs/HANDOVER.md`「v1 立项清单」节。
 > 本表不替代各 WP 开发日志的原始记录,证据以原始记录为准。
 
@@ -33,6 +34,25 @@
 |---|---|---|---|
 | ⑬ | HANDOVER 陷阱 15 路径表述过时:仓库现位于 `~/Desktop/foam`,条目仍记 `~/Documents/foam`(该目录已不存在) | WP-13 开工勘察实录;git 仓有效、HEAD 与台账一致 | append-only 纪律不动原条目;在 HANDOVER「当前状态」WP-13 条目内补记新路径 |
 | ⑭ | 现 README 标题/类比行含显示名品牌串 2 处,与「显示名仅 pyproject + `__app_name__`」纪律冲突 | WP-13 品牌扫描 `git grep "Foam"` 实录 | **本 WP 内解决**:README 终版重写收口(零品牌串 + 命名纪律等价声明)。(2026-08-27 命名纪律退役:「违规」前提不再存在,README 同日已改为直书 Foam;本条仅作历史记录) |
+
+## D. WP-14 评估期新发现(2026-09-21 登记;既有洞,非 WP-14 引入)
+
+| # | 问题 | 现象与证据 | 影响 | 处置/去向 |
+|---|---|---|---|---|
+| ⑮ | PTY 会话命令无护栏检查点 | WP-14 评估 T1 实锤:`agent/loop.py:781` 的 scope 判定仅包裹 `run_command`,`session_open`/`session_send` 经 `tools/session.py:362-375` dispatch 直抵工具实现(`tools/session.py:453`),PTY 会话内任意进程/文本不经任何 scope 判定 | 会话通道整体绕过护栏:run_command 的命令行目标提取对交互式会话原理性不可达;`replace_scope` 热换语义对该通道为空(在途会话进程不受新 scope 约束) | 根治归 v0.2 第 9 项 nftables 网络级出口护栏(参数级静态分析对交互式会话原理性无解,须网络层一刀切);与已知问题④(会话期审计断档)互为姊妹项——④是审计面断档,本条是护栏面缺失 |
+
+低严重度附记(同批评估翻出,一并如实登记,均不挡当前使用):
+
+- **engagement.json 写入非原子**:`state/files.py:223` `_write_metadata`
+  裸 `write_text`,崩溃窗口内 engagement.json 可截断/半写;兜底为
+  fail-closed——下次打开时 JSON 解析/scope drift 报错拒绝继续,不会
+  静默采纳坏态。
+- **TUI file 流 scope 加载→哈希绑定 TOCTOU 分钟级窗口**:scope 文件
+  在 TUI 启动时加载(`tui/app.py:1500`),sha256 绑定迟至首条消息落
+  engagement meta(`tui/app.py:1028-1034`),窗口内改文件则内存 Scope
+  与绑定哈希各取一时刻;可检出——重解析文件比对四键
+  (cidrs/hosts/wildcards/url_prefixes,`Scope.summary()` 口径)即现
+  矛盾,不构成静默越权。
 
 ## 附:扫描期确认为「非问题」的项(防止重复立项)
 

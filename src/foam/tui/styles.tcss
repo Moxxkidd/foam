@@ -183,6 +183,59 @@ WelcomeScreen {
     padding: 0 1;
 }
 
+/* ---------- scope 确认卡(WP-14c) ---------- */
+
+#scopecard {
+    border: solid #56d4dd;
+    padding: 0 1;
+    margin: 1 0;
+    height: auto;
+}
+
+#scope-card-title {
+    text-style: bold;
+    color: #56d4dd;
+}
+
+#scope-card-body {
+    color: #e6edf3;
+    background: #161b22;
+    padding: 0 1;
+    margin: 1 0;
+}
+
+/* Q9 空规则集 / 编译失败:颜色 + 粗体第二通道(不只靠颜色) */
+#scope-card-body.scope-empty {
+    color: #d29922;
+    text-style: bold;
+}
+
+#scope-card-body.scope-error {
+    color: #f85149;
+}
+
+#scope-card-status {
+    color: #8b949e;
+}
+
+#scope-card-buttons {
+    height: auto;
+    margin-top: 1;
+}
+
+#scope-card-buttons Button {
+    margin-right: 2;
+}
+
+#scope-correction {
+    border: solid #30363d;
+    background: #161b22;
+}
+
+#scope-correction:focus {
+    border: solid #56d4dd;
+}
+
 /* ---------- kill 确认条 ---------- */
 
 #killbar {
