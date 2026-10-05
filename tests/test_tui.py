@@ -2416,3 +2416,91 @@ async def test_file_scope_modified_after_start_run_unaffected_and_resume_refuses
     )
     assert rc == 2
     assert "sha256 不符" in capsys.readouterr().err
+
+
+def _make_relative_file_config(tmp_path: Path, script) -> TUIConfig:
+    """模拟 main() 以相对 --scope 的装配:scope_source as-given 相对串,
+    scope_bytes 绑定加载期字节(单次读盘)。"""
+    config = make_config(tmp_path, script)
+    config.scope = parse_scope(SCOPE_TEXT)
+    config.scope_source = "rel.scope"
+    config.scope_bytes = (tmp_path / "rel.scope").read_bytes()
+    return config
+
+
+async def test_file_flow_relative_scope_records_absolute_meta(tmp_path, monkeypatch):
+    """R02 收口(对抗评审 Gap B):TUI file 流相对 --scope ——
+    engagement.json meta 落 resolve 后绝对路径(CLI resume 不依赖 cwd);
+    审计 payload path、scope_loaded.source、动态段来源与
+    config.scope_source 全部保持 as-given 原串(W14b-2 口径不变,
+    meta/audit 双渠道分离,config.scope_source 不被回写)。"""
+    monkeypatch.chdir(tmp_path)
+    Path("rel.scope").write_text(SCOPE_TEXT, encoding="utf-8")
+    app = TuiApp(
+        _make_relative_file_config(tmp_path, [[TextDelta("跑完。"), Usage(1, 1)]])
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        assert app._final_result.status == "finished"
+        root = app.engagement.paths.root
+
+        meta = json.loads((root / "engagement.json").read_text(encoding="utf-8"))
+        assert meta["scope"]["path"] == str((tmp_path / "rel.scope").resolve())
+        assert Path(meta["scope"]["path"]).is_absolute()
+        assert meta["scope"]["sha256"] == hashlib.sha256(
+            SCOPE_TEXT.encode()
+        ).hexdigest()
+        # 审计与展示渠道保持 as-given
+        assert app.config.scope_source == "rel.scope"
+        records = audit_records(app)
+        confirmed = [r for r in records if r["kind"] == KIND_SCOPE_CONFIRMED]
+        assert confirmed[0]["payload"]["path"] == "rel.scope"
+        loaded = [r for r in records if r["kind"] == KIND_SCOPE_LOADED]
+        assert loaded[0]["payload"]["source"] == "rel.scope"
+        assert "- 来源:rel.scope" in scope_section_text(root)
+        assert verify(root / "audit.jsonl")
+
+
+def test_tui_created_engagement_resumes_from_different_cwd(
+    tmp_path, monkeypatch, capsys
+):
+    """R02-AC03 补强:TUI 以相对 --scope 创建的 engagement,CLI 从其他
+    cwd resume → rc 0(meta 绝对路径;修复前 meta 相对串,换 cwd 报
+    「scope 文件不存在」rc 2)。
+
+    同步外壳:CLI `_drive` 的 SIGINT handler 只能在主线程装配,故 TUI
+    部分收进 asyncio.run,resume 直接在主线程同步驱动。
+    """
+    monkeypatch.chdir(tmp_path)
+    Path("rel.scope").write_text(SCOPE_TEXT, encoding="utf-8")
+
+    async def _tui_run() -> Path:
+        app = TuiApp(
+            _make_relative_file_config(
+                tmp_path, [[TextDelta("跑完。"), Usage(1, 1)]]
+            )
+        )
+        async with app.run_test(headless=True, size=(140, 40)) as pilot:
+            await pilot.pause(0.2)
+            await enter_main(app, pilot)
+            await start_run_and_wait(app, pilot)
+            assert app._final_result.status == "finished"
+            return app.engagement.paths.root
+
+    root = asyncio.run(_tui_run())
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    rc = cli_main(
+        ["resume", str(root)],
+        backend_factory=lambda _a: ScriptedBackend([[TextDelta("x"), Usage(1, 1)]]),
+    )
+    assert rc == 0, capsys.readouterr().err
+    loaded = read_records(root / "audit.jsonl")
+    scope_loaded = [r for r in loaded if r["kind"] == KIND_SCOPE_LOADED]
+    assert scope_loaded[-1]["payload"]["source"] == str(
+        (tmp_path / "rel.scope").resolve()
+    )
+    assert verify(root / "audit.jsonl")

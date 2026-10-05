@@ -1146,10 +1146,17 @@ class TuiApp(App[None]):
         - meta 与动态段的 sha256 绑定 ``config.scope_bytes``(main() 加载期
           读出的同一份字节,单次读盘);无 scope_bytes 的旧式配置退回读
           文件一次(行为与既往一致);
+        - meta 落盘口径(Gap B 收口):``meta_path`` = ``config.scope_source``
+          的 resolve 后绝对路径(CLI resume 不依赖 cwd,AC03);审计
+          payload、动态段来源与迎宾展示仍用 ``config.scope_source``
+          as-given 原串(W14b-2)——两渠道在此分离,
+          ``config.scope_source`` 不被回写(NL 仪式 :1417 的回写只在 NL
+          流,file 流不到达);
         - 目录已存在(同 objective 此前跑过旧 scope):meta.scope 对账为当前
-          加载 scope——否则 start_run 的幂等复开撞 scope 一致性检查;漂移
-          在 run 链上留痕(``scope_updated``/``scope_confirmed``,
-          source="file",path=as-given 原串,Q8/W14b-2 口径);并
+          加载 scope——否则 start_run 的幂等复开撞 scope 一致性检查;内容
+          漂移(sha256 变化)在 run 链上留痕(``scope_updated``/
+          ``scope_confirmed``,source="file",path=as-given 原串,
+          Q8/W14b-2 口径;仅路径形态规范化的不记记录);并
           ``mark_active``(R02 状态迁移,start 置 active);
         - start_run 随后的幂等复开按 ``_scope_metadata`` 重读文件对账:
           迎宾等待期文件被改 → 对账不符、拒绝启动(fail-closed,operator
@@ -1169,16 +1176,20 @@ class TuiApp(App[None]):
             except OSError:
                 return  # start_run 同参重试 create 时给出自己的报错指引
         sha256 = hashlib.sha256(data).hexdigest()
+        # meta 落盘口径(Gap B 收口):resolve 后绝对路径;审计/展示渠道仍用
+        # config.scope_source as-given——meta_path 只是局部变量,不回写 config
+        meta_path = str(Path(self.config.scope_source).resolve())
         root = Path(self.config.engagements_dir) / _default_engagement_id(text)
         try:
             if (root / "engagement.json").exists():
                 engagement = Engagement.open(root)
                 old_scope_meta = engagement.metadata().get("scope") or {}
                 new_scope_meta = engagement.update_scope_metadata_bytes(
-                    self.config.scope_source, data
+                    meta_path, data
                 )["scope"]
                 engagement.mark_active()
-                if old_scope_meta != new_scope_meta:
+                if old_scope_meta.get("sha256") != new_scope_meta["sha256"]:
+                    # 内容漂移才留痕(路径形态规范化不记 scope_updated)
                     audit = AuditLog(engagement.paths.audit_jsonl)
                     try:
                         audit.append(
@@ -1199,7 +1210,7 @@ class TuiApp(App[None]):
                 engagement = Engagement.create(
                     self.config.engagements_dir,
                     text,
-                    scope_path=self.config.scope_source,
+                    scope_path=meta_path,
                     scope_bytes=data,
                 )
         except (OSError, ValueError):

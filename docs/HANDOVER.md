@@ -605,7 +605,11 @@ WP-13(整合)依赖全部
   legacy 目录走既有路径不重建，首次 R02 写前自动备份
   engagement.json.pre-r02.bak（只供检查，不自动恢复授权）。
 - 状态迁移：start/resume 置 active；finished 置 closed（re-finish 刷新
-  closed_at）。测试基线：全仓 **606 passed + 2 skipped**（基线 585+2，
-  本条目净增 21 例），ruff check 全绿。
+  closed_at）。测试基线：全仓 **609 passed + 2 skipped**（基线 585+2，
+  本条目净增 24 例），ruff check 全绿。
+- 2026-10-06 对抗评审收口（跟进提交）：TUI file 流 meta 改落绝对路径
+  （审计/展示保持 as-given，AC03 覆盖 TUI 创建的 engagement）；create
+  scope 冲突判定规范化——pre-R02 相对路径目录同 cwd 幂等复开恢复，
+  sha256 不符仍冲突。决策与红绿实录见 R02.md §7 决策 8/9、§6 追加。
 - 下一步：按 [R 索引](items/README.md) 评审 [R03](items/R03.md)（各退出
   路径资源清理，E04；依赖 R02 已满足）。

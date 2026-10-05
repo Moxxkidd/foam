@@ -183,6 +183,31 @@ def _default_engagement_id(objective: str) -> str:
     return f"{date}-{_slugify(objective)}"
 
 
+def _scope_meta_conflict(
+    stored: dict[str, Any] | None, given: dict[str, Any]
+) -> bool:
+    """create 幂等复开的 scope 冲突判定(R02 对抗评审收口,规范化比较)。
+
+    - ``stored`` 为 None(目录未记 scope)→ 冲突(既有行为,防 scope 与
+      无 scope engagement 混用同目录);
+    - sha256 不一致 → 冲突(既有 drift 语义:内容不同即不同授权物);
+    - sha256 一致时,路径 exact-equal 或 ``resolve()``-equal 视为同一授权
+      物——legacy 相对路径目录的同 cwd 幂等复开(pre-R02 可用流程)不再
+      误报;不同 cwd 复开 legacy 相对路径目录 pre-R02 已在文件缺失处
+      失败,语义不变(不新增义务)。resolve() 相对串按当前 cwd 归一,
+      与 pre-R02 as-given 记录的读取口径一致。
+    """
+    if stored is None:
+        return True
+    if stored.get("sha256") != given.get("sha256"):
+        return True
+    stored_path = str(stored.get("path") or "")
+    given_path = str(given.get("path") or "")
+    if stored_path == given_path:
+        return False
+    return Path(stored_path).resolve() != Path(given_path).resolve()
+
+
 class EngagementPaths:
     """布局各路径的集中访问点(WP-04 接线、WP-07/WP-10 消费都用它)。"""
 
@@ -241,7 +266,9 @@ class Engagement:
         """创建(或幂等复开)一个 engagement 目录。
 
         - 目录/id 不存在:按布局全新创建;
-        - 已存在且 objective/scope 参数一致:幂等复开,不动任何已有内容;
+        - 已存在且 objective/scope 参数一致:幂等复开,不动任何已有内容
+          (scope 冲突判定经 ``_scope_meta_conflict`` 规范化:sha256 一致
+          且路径 exact/resolve 等价即同一授权物);
         - 已存在但参数冲突:ValueError(防两个 engagement 混用同一目录)。
 
         ``scope_bytes``(R02,单次读盘绑定):与 ``scope_path`` 同给时,
@@ -267,7 +294,9 @@ class Engagement:
                     f"objective 不一致:已有 {meta.get('objective')!r} "
                     f"vs 传入 {objective!r}"
                 )
-            if scope_meta is not None and meta.get("scope") != scope_meta:
+            if scope_meta is not None and _scope_meta_conflict(
+                meta.get("scope"), scope_meta
+            ):
                 conflicts.append("scope 与已有记录不一致(路径或哈希不同)")
             if conflicts:
                 raise ValueError(

@@ -989,3 +989,38 @@ def test_resume_missing_scope_file_requires_reconfirm(tmp_path, capsys):
     assert "请用 --scope 显式指定" in err
     assert not (workdir / "engagement.json.pre-r02.bak").exists()
     assert (workdir / "engagement.json").read_bytes() == meta_before
+
+
+def test_run_reopens_legacy_dir_with_relative_scope_path(tmp_path, monkeypatch, capsys):
+    """R02 收口(对抗评审 Gap A):pre-R02 engagement(meta 记相对 scope
+    路径)以同 workdir/objective/scope/cwd 复跑 run —— 规范化对账后幂等
+    复开,不再误报「参数冲突」(该流程 pre-R02 本可用);sha256 不符仍
+    冲突(既有 drift 语义不变)。"""
+    monkeypatch.chdir(tmp_path)
+    Path("lab.scope").write_text(SCOPE_TEXT, encoding="utf-8")
+    workdir = tmp_path / "eng"
+    # 手工布置 pre-R02 形态:meta["scope"]["path"] 为 as-given 相对串
+    Engagement.create(
+        tmp_path, "侦察本机", scope_path="lab.scope", engagement_id="eng"
+    ).close()
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["scope"]["path"] == "lab.scope"  # pre-R02 as-given 相对形态
+
+    argv = [
+        "run",
+        "--scope",
+        "lab.scope",
+        "--objective",
+        "侦察本机",
+        "--workdir",
+        str(workdir),
+    ]
+    rc = cli_main(argv, backend_factory=lambda _a: FakeBackend([FINISH]))
+    assert rc == 0, capsys.readouterr().err  # 修复前:「参数冲突」rc 2
+    assert verify(workdir / "audit.jsonl")
+
+    # sha256 不符仍冲突(drift 语义不变:内容不同即不同授权物)
+    Path("lab.scope").write_text(SCOPE_TEXT + "10.0.0.0/8\n", encoding="utf-8")
+    rc = cli_main(argv, backend_factory=lambda _a: FakeBackend([FINISH]))
+    assert rc == 2
+    assert "参数冲突" in capsys.readouterr().err
