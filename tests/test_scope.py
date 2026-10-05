@@ -1,4 +1,7 @@
-"""scope 护栏表驱动单测(WP-02 验收 1/2/3)。"""
+"""scope 护栏表驱动单测(WP-02 验收 1/2/3;R01 回归见末节)。"""
+
+import ipaddress
+import itertools
 
 import pytest
 
@@ -284,3 +287,253 @@ def test_denial_audit_contains_violations(tmp_path):
     content = log_path.read_text(encoding="utf-8")
     assert "evil.example.com" in content
     assert "exec_denied" in content
+
+
+# ============================================================ R01 回归
+# R01-A · URL origin 判定(E01);R01-B · nmap 地址集合覆盖(E02);
+# R01-C · 混合/畸形/命令级回归。fixture 全部合成(TEST-NET-1 /
+# example.com / *.testonly.invalid),不发网络请求。
+
+URL_ORIGIN_CASES = [
+    # (目标, 是否在界内)——scope 仅一条 https://example.com
+    ("https://example.com", True),  # 规则无路径:授权整个 origin
+    ("https://example.com/", True),
+    ("https://example.com/admin/login?x=1", True),
+    ("HTTPS://EXAMPLE.COM/admin", True),  # scheme/host 大小写不敏感
+    ("https://example.com./x", True),  # 尾点归一=同一 DNS 名
+    ("https://example.com:443/x", True),  # 显式缺省端口=同一 origin
+    ("https://example.com.testonly.invalid", False),  # E01:相邻域名
+    ("https://example.com@other.testonly.invalid/", False),  # E01:userinfo
+    ("https://example.com:444/", False),  # 非缺省端口=不同 origin
+    ("http://example.com/", False),  # 不同 scheme=不同 origin
+    ("https://example.com:99999/", False),  # 端口越界:拒绝而非抛异常
+    ("https://example.com:abc/", False),  # 非数字端口:拒绝而非抛异常
+    ("https://example.com:443evil/", False),  # 端口带垃圾字符
+    ("https://", False),  # 空 host
+    ("http://[::1", False),  # authority 无法解析(旧实现对调用方抛 ValueError)
+]
+
+
+@pytest.mark.parametrize(("target", "expected"), URL_ORIGIN_CASES)
+def test_url_origin_boundary(target, expected):
+    """R01-A:仅授权 https://example.com 时的 origin 边界。"""
+    scope = parse_scope("https://example.com")
+    assert target_in_scope(target, scope) is expected
+
+
+def test_url_origin_default_port_normalization():
+    """缺省端口按 scheme 归一化(双向):规则写 :443 与目标省略 :443 同 origin。"""
+    scope = parse_scope("https://example.com:443/app")
+    assert target_in_scope("https://example.com/app", scope)
+    assert target_in_scope("https://example.com:443/app/x", scope)
+    assert not target_in_scope("https://example.com:444/app", scope)
+    # 非缺省端口不被归一化放宽
+    scope = parse_scope("http://192.0.2.1:8080")
+    assert target_in_scope("http://192.0.2.1:8080/x", scope)
+    assert not target_in_scope("http://192.0.2.1/x", scope)
+    assert not target_in_scope("http://192.0.2.2:8080/x", scope)
+
+
+def test_url_path_prefix_semantics():
+    """origin 相同后按路径前缀判定;前缀语义照旧(不改成目录边界匹配)。"""
+    scope = parse_scope("https://example.com/app")
+    assert target_in_scope("https://example.com/app", scope)
+    assert target_in_scope("https://example.com/app/x?y=1", scope)
+    assert target_in_scope("https://example.com/app2", scope)  # 前缀非目录边界
+    assert not target_in_scope("https://example.com/other", scope)
+    assert not target_in_scope("https://other.testonly.invalid/app", scope)
+
+
+def test_url_origin_ipv6_normalization():
+    """IPv6 字面量经 ipaddress 归一:::1 与 0:0:0:0:0:0:0:1 同 origin。"""
+    scope = parse_scope("http://[2001:db8::1]:8080/")
+    assert target_in_scope("http://[2001:db8:0:0:0:0:0:1]:8080/x", scope)
+    assert not target_in_scope("http://[2001:db8::2]:8080/", scope)
+    assert not target_in_scope("http://[2001:db8::1]:8081/", scope)
+    assert not target_in_scope("http://[2001:db8::1]/", scope)  # 缺省 80 ≠ 8080
+
+
+def test_url_falls_back_to_host_rules():
+    """URL 规则不匹配时回退 host/IP/通配域判定(「或」语义保留)。"""
+    scope = parse_scope("https://example.com\n192.0.2.0/24\n*.testonly.invalid")
+    assert target_in_scope("http://192.0.2.9:8080/x", scope)  # host 落 CIDR
+    assert target_in_scope("http://a.testonly.invalid/", scope)  # host 落通配域
+    assert not target_in_scope("http://192.0.3.9/", scope)
+    assert not target_in_scope("http://other.invalid/", scope)
+    # 主机名规则覆盖任意端口/scheme;细粒度授权须用 URL 规则表达
+    scope = parse_scope("https://example.com\nexample.com")
+    assert target_in_scope("http://example.com:9000/x", scope)
+
+
+BAD_URL_RULES = [
+    "https://",  # 空 host(旧实现逐字收下,会字符串匹配所有 https URL)
+    "http://:8080/",  # 空 host 带端口
+    "https://example.com:99999/",  # 端口越界
+    "https://example.com:abc/",  # 非数字端口
+]
+
+
+@pytest.mark.parametrize("line", BAD_URL_RULES)
+def test_parse_scope_rejects_bad_url_rule(line):
+    """R01-A:畸形 URL 规则在加载期拒绝(fail closed),不逐字收下。"""
+    with pytest.raises(ValueError, match="非法 URL"):
+        parse_scope(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["https://example.com", "http://127.0.0.1:3000/", "https://example.com/api/v1"],
+)
+def test_parse_scope_accepts_legal_url_rule(line):
+    assert parse_scope(line).url_prefixes == (line,)
+
+
+# ---------------------------------------------------------------- R01-B
+
+def test_nmap_range_union_hole():
+    """R01-B/E02:离散 /32 端点都在界内 ≠ 整段被授权覆盖。"""
+    scope = parse_scope("192.0.2.1/32\n192.0.2.254/32")
+    assert target_in_scope("192.0.2.1", scope)
+    assert target_in_scope("192.0.2.254", scope)
+    assert not target_in_scope("192.0.2.2", scope)
+    assert not target_in_scope("192.0.2.1-254", scope)  # 旧端点法误放行
+    assert not target_in_scope("192.0.2.1-253", scope)  # 空洞同样拒绝
+    # 相邻 CIDR 并集完整覆盖 → 允许
+    scope = parse_scope("192.0.2.0/25\n192.0.2.128/25")
+    assert target_in_scope("192.0.2.0-255", scope)
+    # 并集带空洞(.128–.191 未授权)→ 拒绝
+    scope = parse_scope("192.0.2.0/25\n192.0.2.192/26")
+    assert not target_in_scope("192.0.2.0-255", scope)
+    assert target_in_scope("192.0.2.0-127", scope)  # 被完整覆盖的子段仍允许
+    assert target_in_scope("192.0.2.192-255", scope)
+
+
+def test_nmap_range_multi_octet():
+    """多八位组范围按笛卡尔积判定,可由不同 CIDR 分别覆盖。"""
+    scope = parse_scope("192.0.2.0/24")
+    assert target_in_scope("192.0.2.10-20", scope)  # 全集在 /24 内
+    assert not target_in_scope("192.0.2-3.10", scope)  # 192.0.3.10 越界
+    # 两个八位组同时取区间:笛卡尔积全集在 /16 内
+    scope = parse_scope("192.0.0.0/16")
+    assert target_in_scope("192.0.2-3.10-20", scope)
+    assert not target_in_scope("192.0-1.2.10", scope)  # 192.1.2.10 越界
+    scope = parse_scope("192.0.2.0/24\n192.0.3.0/25")
+    assert target_in_scope("192.0.2-3.0-2", scope)  # 两个分量各有 CIDR 覆盖
+    scope = parse_scope("192.0.2.0/24\n192.0.3.128/25")
+    assert not target_in_scope("192.0.2-3.0-2", scope)  # 192.0.3.0-2 无覆盖
+    # 笛卡尔积中间分量落在并集空洞(192.0.3.0):旧端点法误放行
+    scope = parse_scope("192.0.2.0/24\n192.0.4.0/24")
+    assert not target_in_scope("192.0.2-4.0", scope)
+    scope = parse_scope("192.0.2.0/24\n192.0.3.0/24\n192.0.4.0/24")
+    assert target_in_scope("192.0.2-4.0-1", scope)  # 无空洞时全集允许
+
+
+def test_nmap_range_mixed_ip_versions():
+    """v6 CIDR 不能覆盖 v4 范围;IPv4/IPv6 混合 scope 不得崩溃。"""
+    scope = parse_scope("2001:db8::/32")
+    assert not target_in_scope("192.0.2.1-50", scope)
+    scope = parse_scope("2001:db8::/32\n192.0.2.0/24")
+    assert target_in_scope("192.0.2.1-50", scope)
+
+
+def test_nmap_range_inverted_octet_invalid():
+    """倒置八位组区间(50-1)不是合法范围;按主机名处理 → 不在界内。"""
+    scope = parse_scope("192.0.2.0/24")
+    assert not target_in_scope("192.0.2.50-1", scope)
+
+
+def test_nmap_range_leading_zero_octet_rejected():
+    """前导零八位组(056)有 inet_aton 八进制歧义:不当范围解析,拒绝。"""
+    scope = parse_scope("192.0.0.0/16")
+    assert not target_in_scope("192.0.056.1-50", scope)
+
+
+def test_nmap_range_huge_bounded_computation():
+    """R01-B:大范围不得逐 IP 枚举——全网笛卡尔积上的空洞须立即判定。"""
+    # 并集在 64/8–127/8 有空洞;hull 两端(0.0.0.0 与 255.255.255.255)都被覆盖
+    scope = parse_scope("0.0.0.0/2\n128.0.0.0/1")
+    assert not target_in_scope("0-255.0-255.0-255.0-255", scope)
+    # 无空洞时同一全网集合允许
+    scope = parse_scope("0.0.0.0/0")
+    assert target_in_scope("0-255.0-255.0-255.0-255", scope)
+    # 小 scope + 全网请求:立即拒绝
+    scope = parse_scope("10.0.0.0/8")
+    assert not target_in_scope("0-255.0-255.0-255.0-255", scope)
+
+
+def _brute_force_range_covered(octets, scope) -> bool:
+    """oracle:逐地址枚举笛卡尔积,每个地址都必须落在 scope 的 CIDR 内。"""
+    for combo in itertools.product(*(range(lo, hi + 1) for lo, hi in octets)):
+        addr = ipaddress.IPv4Address(bytes(combo))
+        if not any(addr in net for net in scope.cidrs):
+            return False
+    return True
+
+
+NMAP_ORACLE_CASES = [
+    # (scope 文本, 四个八位组的 (lo, hi) 区间)——地址域刻意保持小,便于枚举
+    ("192.0.2.0/24", ((192, 192), (0, 0), (2, 2), (0, 3))),
+    ("192.0.2.0/25", ((192, 192), (0, 0), (2, 2), (0, 3))),
+    ("192.0.2.0/25", ((192, 192), (0, 0), (2, 2), (124, 131))),  # 跨界溢出
+    ("192.0.2.0/25\n192.0.2.128/25", ((192, 192), (0, 0), (2, 2), (0, 7))),
+    ("192.0.2.0/25\n192.0.2.192/26", ((192, 192), (0, 0), (2, 2), (0, 3))),
+    # hull 端点在界内、中间有空洞(旧端点法误放行,oracle 必须一致拒绝)
+    ("192.0.2.0/25\n192.0.2.192/26", ((192, 192), (0, 0), (2, 2), (126, 193))),
+    ("192.0.2.0/24\n192.0.3.0/25", ((192, 192), (0, 0), (2, 3), (0, 2))),
+    ("192.0.2.0/24\n192.0.3.128/25", ((192, 192), (0, 0), (2, 3), (0, 2))),
+    ("2001:db8::/32\n192.0.2.0/29", ((192, 192), (0, 0), (2, 2), (0, 3))),
+    ("2001:db8::/32", ((192, 192), (0, 0), (2, 2), (0, 3))),  # 纯 v6 不覆盖 v4
+    ("192.0.2.1/32\n192.0.2.2/32", ((192, 192), (0, 0), (2, 2), (1, 2))),  # 相邻
+    ("192.0.2.1/32\n192.0.2.3/32", ((192, 192), (0, 0), (2, 2), (1, 2))),  # 空洞
+    # 多八位组笛卡尔积中间分量落在并集空洞
+    ("192.0.2.0/24\n192.0.4.0/24", ((192, 192), (0, 0), (2, 4), (0, 0))),
+]
+
+
+@pytest.mark.parametrize(("scope_text", "octets"), NMAP_ORACLE_CASES)
+def test_nmap_range_matches_brute_force_oracle(scope_text, octets):
+    """R01-B:小地址域枚举 oracle 与区间算法逐案一致。"""
+    scope = parse_scope(scope_text)
+    range_str = ".".join(
+        str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in octets
+    )
+    expected = _brute_force_range_covered(octets, scope)
+    assert target_in_scope(range_str, scope) is expected
+
+
+# ---------------------------------------------------------------- R01-C
+
+def test_check_command_denies_url_userinfo_bypass(tmp_path):
+    """E01 命令级:curl https://example.com@other.testonly.invalid/ 拒绝并留痕。"""
+    log_path = tmp_path / "audit.jsonl"
+    scope = parse_scope("https://example.com")
+    with audit.AuditLog(log_path) as log:
+        decision = check_command(
+            "curl https://example.com@other.testonly.invalid/", scope, audit=log
+        )
+    assert not decision.allowed
+    assert decision.violations == ("https://example.com@other.testonly.invalid/",)
+    assert '"kind": "exec_denied"' in log_path.read_text(encoding="utf-8")
+
+
+def test_check_command_allows_same_origin_url():
+    scope = parse_scope("https://example.com")
+    decision = check_command("curl https://example.com/admin/login", scope)
+    assert decision.allowed
+
+
+def test_check_command_denies_nmap_range_with_hole():
+    """E02 命令级:nmap 192.0.2.1-254 在离散 /32 scope 下拒绝。"""
+    scope = parse_scope("192.0.2.1/32\n192.0.2.254/32")
+    decision = check_command("nmap 192.0.2.1-254", scope)
+    assert not decision.allowed
+    assert decision.violations == ("192.0.2.1-254",)
+
+
+def test_check_command_denies_malformed_url_not_raise():
+    """畸形 URL 目标:拒绝(fail closed),不向调用方抛解析异常。"""
+    scope = parse_scope("https://example.com")
+    decision = check_command("curl http://[::1", scope)
+    assert not decision.allowed
+    decision = check_command("curl https://example.com:99999/", scope)
+    assert not decision.allowed

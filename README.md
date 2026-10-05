@@ -68,7 +68,8 @@ foam report engagements/<id> --out report.md
 ```
 
 headless/CI 场景可用 scope 文件(零确认仪式,行为照旧;每行一条:
-CIDR / 主机名 / 通配域 / URL 前缀):
+CIDR / 主机名 / 通配域 / URL——URL 规则按规范化 origin(scheme/host/
+有效端口)匹配,再按路径前缀收窄;畸形 URL 目标与畸形 URL 规则一律拒绝):
 
 ```bash
 printf '192.168.56.0/24\n' > my.scope

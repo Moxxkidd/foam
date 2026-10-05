@@ -5,11 +5,18 @@
 - CIDR:``192.168.56.0/24``(单个 IP 视作 /32、/128)
 - 主机名:``localhost`` / ``metasploitable.testlab.local``;``*.`` 前缀为通配域
   (``*.example.com`` 匹配任意深度子域,不匹配裸域 ``example.com``)
-- URL 前缀:``http://127.0.0.1:3000/``(字符串前缀语义)
+- URL 前缀:``http://127.0.0.1:3000/``(规范化 origin + 路径前缀语义)
 
-判定顺序:URL 目标先匹配 URL 前缀,再取其 host 按 IP/主机名规则匹配;
+判定顺序:URL 目标先按规范化 origin(scheme 小写 / host 小写去尾点、IP 字面量
+经 ipaddress 归一 / 有效端口=显式端口或 scheme 缺省)匹配 URL 规则,origin
+相同再比 path+query+fragment 前缀(规则无路径即授权整个 origin);URL 规则
+不匹配再取其 host 按 IP/主机名规则匹配(「或」语义)。畸形 URL(空 host、
+非法/越界端口、无法解析的 authority)一律拒绝,不抛异常、不回退 host 检查;
+畸形 URL 规则在 ``parse_scope`` 加载期拒绝。
 CIDR 目标要求整条网段是 scope 内某条 CIDR 的子网(防止用 /16 超网绕过);
-nmap 八位组范围(``192.168.56.1-50``)按端点凸集法判定整段是否在界内。
+nmap 八位组范围(``192.168.56.1-50``)的请求集合是四个八位组区间的笛卡尔积,
+必须被 scope 的 IPv4 CIDR 并集**完整覆盖**(离散并集中的空洞也算越界;逐空隙
+精确判定,O(#CIDR) 有界,不逐 IP 枚举)。
 
 明示限制(必须同步进开发日志的绕过面清单):
 - **参数级启发式**,不是网络层强制。shell 变量(``$T``)、命令替换
@@ -34,7 +41,7 @@ import shlex
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urlsplit
 
 from foam.guard import audit as _audit_mod
@@ -111,7 +118,12 @@ class Scope:
 
 
 def parse_scope(text: str) -> Scope:
-    """解析 scope 文本(``#`` 注释、空行忽略;行内 ``#`` 起也算注释)。"""
+    """解析 scope 文本(``#`` 注释、空行忽略;行内 ``#`` 起也算注释)。
+
+    URL 规则在加载期校验:空 host、非法/越界端口、无法解析的 authority
+    一律 ``ValueError``(fail closed)——逐字收下 ``https://`` 这类规则会
+    在旧字符串前缀语义下匹配所有 https URL。
+    """
     cidrs: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     hosts: set[str] = set()
     wildcards: list[str] = []
@@ -123,6 +135,8 @@ def parse_scope(text: str) -> Scope:
             continue
         rules.append(line)
         if _URL_SCHEME_RE.match(line):
+            if _parse_url_parts(line) is None:
+                raise ValueError(f"scope 第 {lineno} 行:非法 URL 规则 {line!r}")
             url_prefixes.append(line)
             continue
         if line.startswith("*."):
@@ -172,26 +186,181 @@ def is_hostname(token: str) -> bool:
     return True
 
 
-def _parse_nmap_range(
-    value: str,
-) -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address] | None:
-    """解析 nmap 八位组范围,返回 (下界, 上界);不是范围语法则返回 None。"""
+#: 常见 scheme 的缺省端口(URL origin 归一化用;未知 scheme 无缺省,记 None)。
+_SCHEME_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+class _UrlParts(NamedTuple):
+    """规范化后的 URL 部件(origin 比较 + 路径前缀比较的依据)。
+
+    - ``scheme`` 小写;
+    - ``host`` 小写、去尾点;IP 字面量(v4/v6)经 ``ipaddress`` 归一化
+      (``::1`` 与 ``0:0:0:0:0:0:0:1`` 视为同一 host);
+    - ``port`` 为有效端口:显式端口,否则 ``_SCHEME_DEFAULT_PORTS`` 里的
+      scheme 缺省,否则 None;
+    - ``suffix`` 为 path+query+fragment,即 origin 之后的字符串——路径前缀
+      语义维持旧字符串前缀在同一 origin 内的行为(规则 suffix 为空串时
+      授权整个 origin)。
+    """
+
+    scheme: str
+    host: str
+    port: int | None
+    suffix: str
+
+
+def _parse_url_parts(url: str) -> _UrlParts | None:
+    """解析并规范化 URL;畸形返回 None(调用方按 fail closed 处理)。
+
+    畸形 = scheme 缺失、host 为空、端口非数字或越界、authority 无法解析。
+    注意 ``SplitResult.port`` 是惰性校验:非法端口在**访问**时才抛
+    ``ValueError``;``urlsplit`` 自身也可能因不配对 IPv6 括号等抛出——
+    全部归为畸形,绝不上抛。
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port  # 访问即校验:非法端口在此抛 ValueError
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if not scheme or not host:
+        return None
+    host = host.lower().rstrip(".")
+    if not host:
+        return None
+    try:  # IP 字面量归一化;非 IP(主机名)保持字符串形态
+        host = str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    if port is None:
+        port = _SCHEME_DEFAULT_PORTS.get(scheme)
+    suffix = parts.path
+    if parts.query:
+        suffix += "?" + parts.query
+    if parts.fragment:
+        suffix += "#" + parts.fragment
+    return _UrlParts(scheme=scheme, host=host, port=port, suffix=suffix)
+
+
+def _url_rules_match(target: _UrlParts, scope: Scope) -> bool:
+    """URL 目标是否命中某条 URL 规则:规范化 origin 相同,且目标 suffix
+    以规则 suffix 为前缀。"""
+    for rule in scope.url_prefixes:
+        rule_parts = _parse_url_parts(rule)
+        if rule_parts is None:
+            continue  # 畸形规则已在 parse_scope 拒绝;此处防御性跳过
+        if (
+            (rule_parts.scheme, rule_parts.host, rule_parts.port)
+            == (target.scheme, target.host, target.port)
+            and target.suffix.startswith(rule_parts.suffix)
+        ):
+            return True
+    return False
+
+
+def _parse_nmap_range(value: str) -> tuple[tuple[int, int], ...] | None:
+    """解析 nmap 八位组范围(``192.168.56.1-50``),返回四个八位组的
+    ``(下界, 上界)`` 区间;不是范围语法或区间非法(越出 0-255、下界 >
+    上界)返回 None。
+
+    请求地址集合是四个区间的**笛卡尔积**(nmap 实际会触碰的地址),不是
+    一条连续数值区间——``192.0.2-3.1`` = {192.0.2.1, 192.0.3.1}。
+    """
     if "-" not in value or not _NMAP_RANGE_RE.match(value):
         return None
-    lo_parts: list[str] = []
-    hi_parts: list[str] = []
+    octets: list[tuple[int, int]] = []
     for segment in value.split("."):
-        lo, _, hi = segment.partition("-")
-        lo_parts.append(lo)
-        hi_parts.append(hi or lo)
-    try:
-        low = ipaddress.IPv4Address(".".join(lo_parts))
-        high = ipaddress.IPv4Address(".".join(hi_parts))
-    except ipaddress.AddressValueError:
-        return None
-    if high < low:
-        return None
-    return low, high
+        lo_s, _, hi_s = segment.partition("-")
+        if (len(lo_s) > 1 and lo_s.startswith("0")) or (
+            len(hi_s) > 1 and hi_s.startswith("0")
+        ):
+            return None  # 前导零(056):inet_aton 八进制歧义,拒绝而非猜测
+        lo = int(lo_s)
+        hi = int(hi_s) if hi_s else lo
+        if lo > 255 or hi > 255 or lo > hi:
+            return None
+        octets.append((lo, hi))
+    return tuple(octets)
+
+
+def _v4_scope_intervals(scope: Scope) -> list[tuple[int, int]]:
+    """scope 的 IPv4 CIDR 合并为排序、不相交的整数区间。
+
+    v6 CIDR 不可能覆盖 v4 地址,直接排除(混合 v4/v6 scope 照常工作)。
+    """
+    ivs = sorted(
+        (int(net.network_address), int(net.broadcast_address))
+        for net in scope.cidrs
+        if isinstance(net, ipaddress.IPv4Network)
+    )
+    merged: list[list[int]] = []
+    for lo, hi in ivs:
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
+
+
+def _octets_to_int(digits: Iterable[int]) -> int:
+    value = 0
+    for digit in digits:
+        value = (value << 8) | digit
+    return value
+
+
+def _product_min_at_least(
+    octets: tuple[tuple[int, int], ...], floor: int
+) -> int | None:
+    """笛卡尔积 S 中 ≥ ``floor`` 的最小元素;没有则 None。
+
+    32 位数值序 = 八位组字典序。不枚举元素:``floor`` 自身在 S 内即答案;
+    否则从右往左找第一个能在保持前缀等于 ``floor`` 的前提下提升的八位组,
+    提升位取区间内最小合法值、后缀取各区间下界,O(1)。
+    """
+    want = [(floor >> shift) & 0xFF for shift in (24, 16, 8, 0)]
+    if all(lo <= digit <= hi for (lo, hi), digit in zip(octets, want, strict=True)):
+        return floor
+    for pos in range(3, -1, -1):
+        if not all(lo <= want[i] <= hi for i, (lo, hi) in enumerate(octets[:pos])):
+            continue
+        bumped = max(octets[pos][0], want[pos] + 1)
+        if bumped <= octets[pos][1]:
+            digits = want[:pos] + [bumped] + [lo for lo, _ in octets[pos + 1:]]
+            return _octets_to_int(digits)
+    return None
+
+
+def _product_hits_gap(
+    octets: tuple[tuple[int, int], ...], gap_lo: int, gap_hi: int
+) -> bool:
+    """S 是否含有空隙 [gap_lo, gap_hi] 内的元素(命中 = 未被授权覆盖)。"""
+    smallest = _product_min_at_least(octets, gap_lo)
+    return smallest is not None and smallest <= gap_hi
+
+
+def _nmap_range_in_scope(octets: tuple[tuple[int, int], ...], scope: Scope) -> bool:
+    """请求集合(四区间笛卡尔积)被 scope 的 IPv4 CIDR 并集完整覆盖才放行。
+
+    精确(能检出离散并集的空洞)且有界:合并 scope 区间 O(#CIDR),随后对
+    [S_min, S_max] 内每个覆盖空隙做一次 O(1) 命中判定,总工作量 O(#CIDR),
+    与请求集合大小无关(``0-255.0-255.0-255.0-255`` 立即返回)。
+    """
+    s_min = _octets_to_int(lo for lo, _ in octets)
+    s_max = _octets_to_int(hi for _, hi in octets)
+    cursor = s_min  # 已覆盖到 cursor-1;[cursor, s_max] 待覆盖
+    for iv_lo, iv_hi in _v4_scope_intervals(scope):
+        if iv_hi < cursor:
+            continue  # 整段在 S 下界之下
+        if iv_lo > s_max:
+            break  # 之后的区间都在 S 上界之上
+        if iv_lo > cursor and _product_hits_gap(octets, cursor, iv_lo - 1):
+            return False  # 区间之间的空洞被 S 命中
+        cursor = max(cursor, iv_hi + 1)
+        if cursor > s_max:
+            return True  # 已覆盖到 S 上界
+    return not _product_hits_gap(octets, cursor, s_max)  # 尾部空隙
 
 
 def _ip_in_scope(
@@ -226,10 +395,12 @@ def _host_in_scope(host: str, scope: Scope) -> bool:
 def target_in_scope(target: str, scope: Scope) -> bool:
     """单个目标(URL/IP/CIDR/主机名)是否被 scope 覆盖。"""
     if _URL_SCHEME_RE.match(target):
-        if any(target.startswith(prefix) for prefix in scope.url_prefixes):
+        parts = _parse_url_parts(target)
+        if parts is None:
+            return False  # 畸形 URL:fail closed,不回退 host 检查
+        if _url_rules_match(parts, scope):
             return True
-        hostname = urlsplit(target).hostname
-        return hostname is not None and _host_in_scope(hostname, scope)
+        return _host_in_scope(parts.host, scope)
     try:
         return _cidr_in_scope(ipaddress.ip_network(target, strict=False), scope)
     except ValueError:
@@ -240,9 +411,9 @@ def target_in_scope(target: str, scope: Scope) -> bool:
         pass
     nmap_range = _parse_nmap_range(target)
     if nmap_range is not None:
-        # 八位组范围是连续区间,scope CIDR 是凸集:两端在界内 ⟺ 整段在界内
-        low, high = nmap_range
-        return _ip_in_scope(low, scope) and _ip_in_scope(high, scope)
+        # 请求集合是四区间笛卡尔积:必须被 scope v4 CIDR 并集完整覆盖。
+        # 旧「端点凸集」假设只对单一连续区间成立,对离散 CIDR 并集是洞。
+        return _nmap_range_in_scope(nmap_range, scope)
     return _host_in_scope(target, scope)
 
 
