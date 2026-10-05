@@ -31,6 +31,12 @@
   ``main()`` 单次读盘把 scope 字节绑进 ``TUIConfig.scope_bytes``,迎宾
   等待期外部文件被改也不二次读盘(改则 start_run 幂等复开对账不符、
   fail-closed 拒绝启动)。
+- R03-C(2026-10-06,统一运行时资源关闭,E04 收口):``_run_to_end`` /
+  ``action_quit`` / ``_cleanup_resources`` 收敛到 ``foam.runtime.close_run``
+  (幂等;真实 run 终态才收口,idle-wake 待命结构性地不收割);finished 置
+  mark_closed(D4,与 CLI 对齐);StateTool 的 Index 连接随 run 收口(此前
+  永不关闭);cleanup_pending 上叙述流(D2);审计句柄仍在 run 收尾关闭,
+  仪式重开补偿(WP-14c 第二轮对抗审查)保留为文档化例外。
 """
 
 from __future__ import annotations
@@ -82,6 +88,7 @@ from foam.guard.audit import (
     AuditLog,
 )
 from foam.guard.scope import Scope, render_canonical_rules, scope_payload
+from foam.runtime import RunRuntime, cleanup_warning_text, close_run
 from foam.state.files import (
     DEFAULT_ENGAGEMENTS_DIR,
     Engagement,
@@ -223,6 +230,7 @@ class RunHandle:
     bash: BashTool | None = None
     sessions: Any | None = None  # WP-05 SessionTool;None = 会话层未接线
     engagement: Engagement | None = None
+    state: Any | None = None  # R03:StateTool;统一关闭要关其 Index 连接
 
 
 LoopFactory = Callable[[RunContext], RunHandle]
@@ -265,7 +273,9 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
         max_rounds=config.max_rounds,
         wait_on_finish=config.wait_on_finish,  # WP-09 更正当:连续对话待命
     )
-    return RunHandle(loop=loop, bash=bash, sessions=session, engagement=engagement)
+    return RunHandle(
+        loop=loop, bash=bash, sessions=session, engagement=engagement, state=state
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -734,10 +744,13 @@ class MainScreen(Screen):
             engagement = handle.engagement or app.engagement
             if engagement is not None:
                 lines.append(f"engagement {engagement.paths.root}")
-                try:
-                    counts = engagement.index.counts()
-                except (OSError, RuntimeError, ValueError):
-                    counts = None
+                counts = None
+                if not app.runtime_closed:
+                    # R03:收口后不再触碰索引(Engagement.index 懒加载会重开连接)
+                    try:
+                        counts = engagement.index.counts()
+                    except (OSError, RuntimeError, ValueError):
+                        counts = None
                 if counts:
                     lines.append(
                         "索引 "
@@ -838,7 +851,8 @@ class MainScreen(Screen):
             except (OSError, RuntimeError):
                 pass
         engagement = handle.engagement or app.engagement
-        if engagement is not None:
+        if engagement is not None and not app.runtime_closed:
+            # R03:收口后不再触碰索引(Engagement.index 懒加载会重开连接)
             try:
                 self.sidebar.set_counts(engagement.index.counts())
             except (OSError, RuntimeError, ValueError):
@@ -872,6 +886,9 @@ class TuiApp(App[None]):
         self.engagement: Engagement | None = None
         self.run_handle: RunHandle | None = None
         self._audit: AuditLog | None = None
+        # R03:统一关闭句柄集(start_run 装配;_run_to_end/action_quit 共用
+        # close_run,幂等;lock=None——TUI 未接单写者锁,R02 文档化边界 D3)。
+        self._runtime: RunRuntime | None = None
         self._run_task: asyncio.Task[None] | None = None
         self._final_result: RunResult | None = None
         self._fatal: str | None = None
@@ -905,9 +922,14 @@ class TuiApp(App[None]):
         handle = self.run_handle
         if handle is None:
             return None
-        if handle.loop.status in ("finished", "killed", "error"):
+        if handle.loop.status in ("finished", "killed", "error", "cancelled"):
             return None
         return handle.loop
+
+    @property
+    def runtime_closed(self) -> bool:
+        """run 资源是否已统一收口(R03);收口后索引等句柄不再访问(防重开)。"""
+        return self._runtime is not None and self._runtime.closed
 
     @property
     def ceremony_running(self) -> bool:
@@ -1515,6 +1537,17 @@ class TuiApp(App[None]):
         self.engagement = engagement
         self._audit = audit
         self.run_handle = handle
+        # R03:统一关闭句柄集(close_run 的输入;lock=None 见 __init__ 注)
+        self._runtime = RunRuntime(
+            bash=handle.bash,
+            session=handle.sessions,
+            state=handle.state,
+            engagement=engagement,
+            audit=audit,
+            backend=self.config.backend,
+            lock=None,
+            loop=handle.loop,
+        )
         main.statusbar.set_engagement(engagement.paths.root.name, self.operator)
         main.input_dock.input_box.placeholder = _PLACEHOLDER_RUNNING
         self._run_task = asyncio.create_task(self._run_to_end(handle, objective))
@@ -1530,15 +1563,31 @@ class TuiApp(App[None]):
             fatal = repr(exc)
         self._final_result = result
         self._fatal = fatal
-        if self._audit is not None:
-            self._audit.close()
+        # R03 真实 run 终态才收口(结构边界:idle-wake 待命不到这里,不收割):
+        # D4 finished 置 closed(与 CLI 对齐;killed/error 保持 active)→
+        # 统一 close_run(收割已在 loop 终态面完成,此处幂等空转 + 关索引/
+        # 审计/后端)→ cleanup_pending 上屏(D2,不粉饰「全部完成」)。
+        if (
+            result is not None
+            and result.status == "finished"
+            and self.engagement is not None
+        ):
+            try:
+                self.engagement.mark_closed()
+            except (OSError, ValueError) as exc:
+                fatal = fatal or f"mark_closed 失败: {exc!r}"
+        if self._runtime is not None:
+            report = await close_run(self._runtime, run_id="tui", reason="run 收尾")
+            warning = cleanup_warning_text(report)
+            if warning and self._main is not None:
+                self._main.narrative.add_notice("error", warning)
         if self._main is not None:
             self._main.post_message(RunFinishedMsg(result, fatal))
 
     # ---------- 退出 ----------
 
     async def action_quit(self) -> None:
-        """统一退出路径:run 在活动先走 kill switch 清理,再收资源。"""
+        """统一退出路径:run 在活动先走 kill switch 清理,再经 close_run 收口。"""
         loop = self.active_loop
         if loop is not None:
             loop.kill("操作员退出 TUI")
@@ -1551,17 +1600,19 @@ class TuiApp(App[None]):
         self.exit(self._exit_code())
 
     async def _cleanup_resources(self) -> None:
-        if self._audit is not None:
-            self._audit.close()
+        """R03:统一关闭面(close_run 幂等;_run_to_end 已收口时此处空转)。
+
+        退出前仍有 cleanup_pending 时补一次上屏(D2;audit 关闭后补写不进链,
+        叙述流是退出前最后的可见面)。
+        """
+        if self._runtime is not None:
+            report = await close_run(self._runtime, run_id="tui", reason="退出 TUI")
+            warning = cleanup_warning_text(report)
+            if warning and self._main is not None:
+                self._main.narrative.add_notice("error", warning)
             self._audit = None
-        handle = self.run_handle
-        if handle is not None and handle.sessions is not None:
-            try:
-                await handle.sessions.aclose()  # WP-05 aclose 幂等
-            except (OSError, RuntimeError):
-                pass
-        if self.engagement is not None:
-            self.engagement.close()
+            return
+        # 未开跑(迎宾即退):runtime 未建,其余句柄不存在,只关后端
         try:
             await self.config.backend.aclose()
         except (OSError, RuntimeError):

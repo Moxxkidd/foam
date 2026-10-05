@@ -23,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import sqlite3
 from collections import deque
 from pathlib import Path
 
@@ -105,9 +107,10 @@ class ScriptedBackend(LLMBackend):
         self._script = deque(script)
         self.calls: list[list[Message]] = []
         self.chat_count = 0
+        self.aclose_calls = 0  # R03:统一关闭断言用
 
     async def aclose(self) -> None:
-        pass
+        self.aclose_calls += 1
 
     def chat(self, messages, tools=None):
         self.calls.append(list(messages))
@@ -2504,3 +2507,181 @@ def test_tui_created_engagement_resumes_from_different_cwd(
         (tmp_path / "rel.scope").resolve()
     )
     assert verify(root / "audit.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# R03-C:TUI 退出路径与跨入口生命周期(本文件首个 quit 路径覆盖)
+# ---------------------------------------------------------------------------
+
+
+async def _hang_round_forever(_messages):
+    """挂起的 LLM 轮(quit 时序用);kill/cancel 打断,永不自然返回。"""
+    await asyncio.Event().wait()
+    return []  # pragma: no cover
+
+
+async def test_quit_mid_run_kills_and_reaps(tmp_path):
+    """R03-AC01:run 进行中退出 TUI——kill switch 清理、后台 job 收割、
+    kill_switch 先于 run_finished(钉死顺序)、退出码 130、链完整。"""
+    script = [
+        [
+            ToolCall(
+                id="c-bg",
+                name="run_command",
+                arguments={"command": "sleep 31337", "background": True},
+            ),
+            Usage(1, 1),
+        ],
+        _hang_round_forever,
+    ]
+    app = TuiApp(make_config(tmp_path, script))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        await pilot.press(*"recon lab")
+        await pilot.press("enter")
+        await wait_for(lambda: app.run_handle is not None)
+        bash = app.run_handle.bash
+        await wait_for(lambda: len(bash._jobs) == 1)
+        [job] = bash._jobs.values()
+        pid = job.proc.pid
+
+        await app.action_quit()
+
+        assert app._final_result is not None
+        assert app._final_result.status == "killed"
+        assert job.done.is_set() and job.status == "killed"
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)  # 进程真死,不随退出存活
+        records = audit_records(app)
+        kinds = [r["kind"] for r in records]
+        assert kinds[-1] == "run_finished"
+        assert records[-1]["payload"]["status"] == "killed"
+        assert records[-1]["payload"]["cleanup"]["cleanup_status"] == "ok"
+        assert "kill_switch" in kinds
+        assert kinds.index("kill_switch") < kinds.index("run_finished")
+        assert verify(app.engagement.paths.audit_jsonl)
+        assert app._exit_code() == 130
+
+
+async def test_quit_after_finished_no_double_close(tmp_path):
+    """R03-AC04/D4:finished 后退出——engagement 已置 closed、StateTool 索引
+    连接已随 run 收口(此前永不关闭)、close_run 幂等(后端只关一次)。"""
+    app = TuiApp(make_config(tmp_path, [[TextDelta("done"), Usage(1, 1)]]))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        assert app._final_result.status == "finished"
+
+        meta = json.loads(
+            (app.engagement.paths.root / "engagement.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert meta["status"] == "closed"  # D4:TUI finished → mark_closed
+        state = app.run_handle.state
+        assert state is not None
+        with pytest.raises(sqlite3.ProgrammingError):
+            state.index.counts()  # 索引连接已关(R03;此前 TUI 永不关闭)
+        backend = app.config.backend
+        assert backend.aclose_calls == 1  # run 收尾已关
+        await app.action_quit()
+        assert backend.aclose_calls == 1  # 幂等:退出路径不重复关闭
+        assert verify(app.engagement.paths.audit_jsonl)
+        assert app._exit_code() == 0
+
+
+async def test_idle_standby_keeps_background_job_alive(tmp_path):
+    """R03 结构边界:idle-wake 待命 ≠ 退出——待命期间不收割任何东西,
+    只有真实 run 终态(kill)才收口(现有待命钉死 :441-520 不得回归)。"""
+    script = [
+        [
+            ToolCall(
+                id="c-bg",
+                name="run_command",
+                arguments={"command": "sleep 31337", "background": True},
+            ),
+            Usage(1, 1),
+        ],
+        [TextDelta("第一段结论。"), Usage(2, 1)],  # 终答 → idle 待命
+    ]
+    app = TuiApp(make_config(tmp_path, script, wait_on_finish=True))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        await pilot.press(*"recon lab")
+        await pilot.press("enter")
+        await wait_for(lambda: app.run_handle is not None)
+        loop = app.run_handle.loop
+        await wait_for(lambda: loop.status == "idle")
+        bash = app.run_handle.bash
+        [job] = bash._jobs.values()
+        pid = job.proc.pid
+
+        os.kill(pid, 0)  # 待命期间进程存活:不退出的 run 不收割
+        assert job.status == "running"
+        assert app._runtime is not None and not app._runtime.closed
+
+        loop.kill("收工")  # 真实终态才收割
+        await wait_for(lambda: app._final_result is not None)
+        assert job.done.is_set() and job.status == "killed"
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
+async def test_tui_cleanup_failure_surfaces_cleanup_pending(tmp_path, monkeypatch):
+    """R03-AC06/D2:TUI 清理失败在叙述流可见 cleanup_pending,不粉饰「全部完成」。"""
+
+    async def fake_aclose(self):
+        return {
+            "cleanup_status": "partial",
+            "remaining_resources": [
+                {"kind": "bash_job", "job_id": "jTESTONLY", "pid": 999999}
+            ],
+            "errors": ["合成收割失败 TESTONLY"],
+        }
+
+    monkeypatch.setattr(BashTool, "aclose", fake_aclose)
+    app = TuiApp(make_config(tmp_path, [[TextDelta("done"), Usage(1, 1)]]))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        main = await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        assert app._final_result.status == "finished"
+        hits = notices_containing(main, "cleanup_pending")
+        assert hits, "cleanup_pending 未上屏(D2)"
+
+
+async def test_close_run_leaves_unowned_processes_alive(tmp_path):
+    """R03 排除项:不属于本 run 的进程(进程组外)不被收割——close_run
+    只收本 run 登记的进程组。"""
+    outsider = await asyncio.create_subprocess_exec(
+        "sleep", "31337", start_new_session=True  # 独立进程组,非任何 job 后代
+    )
+    try:
+        script = [
+            [
+                ToolCall(
+                    id="c-bg",
+                    name="run_command",
+                    arguments={"command": "sleep 31338", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("done"), Usage(1, 1)],
+        ]
+        app = TuiApp(make_config(tmp_path, script))
+        async with app.run_test(headless=True, size=(140, 40)) as pilot:
+            await pilot.pause(0.2)
+            await enter_main(app, pilot)
+            await start_run_and_wait(app, pilot)
+            assert app._final_result.status == "finished"
+            await app.action_quit()
+        [job] = app.run_handle.bash._jobs.values()
+        with pytest.raises(ProcessLookupError):
+            os.kill(job.proc.pid, 0)  # 本 run 的已收割
+        os.kill(outsider.pid, 0)  # 组外的存活(排除项:不杀不属于本 run 的进程)
+    finally:
+        outsider.kill()
+        await outsider.wait()

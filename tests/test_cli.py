@@ -18,9 +18,15 @@ D13/纯链恢复逐键相等);tui --scope 改可选(过 argparse 关);cli.py 两
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 import re
+import signal
+import subprocess  # noqa: S403  # 仅用于 pgrep 固定参数探针(R03 测试)
+import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -41,6 +47,7 @@ from foam.state.files import (
     Engagement,
     acquire_engagement_lock,
 )
+from foam.tools.bash import BashTool
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
 
@@ -57,7 +64,11 @@ def _isolate_home(tmp_path, monkeypatch):
 
 
 class FakeBackend(LLMBackend):
-    """脚本化后端:calls 记录每轮 messages,tools_seen 记录工具 specs。"""
+    """脚本化后端:calls 记录每轮 messages,tools_seen 记录工具 specs。
+
+    R03 增量:条目可为 callable(messages)(可挂起,Ctrl-C/取消时序用)或
+    Exception(整轮直抛);aclose 计数(统一关闭断言用)。
+    """
 
     provider = "fake"
 
@@ -65,9 +76,10 @@ class FakeBackend(LLMBackend):
         self._script = deque(script)
         self.calls: list[list] = []
         self.tools_seen = None
+        self.aclose_calls = 0
 
     async def aclose(self) -> None:
-        pass
+        self.aclose_calls += 1
 
     def chat(self, messages, tools=None):
         self.calls.append(list(messages))
@@ -75,8 +87,12 @@ class FakeBackend(LLMBackend):
         return self._stream()
 
     async def _stream(self):
-        events = self._script.popleft() if self._script else [Usage(1, 1)]
-        for event in events:
+        entry = self._script.popleft() if self._script else [Usage(1, 1)]
+        if callable(entry):
+            entry = await entry(self.calls[-1])
+        if isinstance(entry, BaseException):
+            raise entry
+        for event in entry:
             yield event
 
 
@@ -1024,3 +1040,204 @@ def test_run_reopens_legacy_dir_with_relative_scope_path(tmp_path, monkeypatch, 
     rc = cli_main(argv, backend_factory=lambda _a: FakeBackend([FINISH]))
     assert rc == 2
     assert "参数冲突" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# R03-C:跨入口生命周期(CLI 面)——E04 回归 / Ctrl-C / 装配异常 / D2
+# ---------------------------------------------------------------------------
+
+
+def _test_sleeps_alive() -> list[int]:
+    """本机 R03 测试用 sleep 进程(唯一时长 3133x,防误配);无则空表。"""
+    probe = subprocess.run(
+        ["pgrep", "-f", "sleep 3133"],  # noqa: S603,S607  # 固定参数,无外部输入
+        capture_output=True,
+        text=True,
+    )
+    return [int(line) for line in probe.stdout.split() if line.strip()]
+
+
+async def _hang_round(_messages):
+    """挂起的 LLM 轮(Ctrl-C 时序用);kill/cancel 打断,永不自然返回。"""
+    await asyncio.sleep(60)
+    return [TextDelta("不应到达"), Usage(1, 1)]  # pragma: no cover
+
+
+def test_run_finished_reaps_leftover_background_job(tmp_path):
+    """R03-AC01(E04 回归·finished 面):正常结束也收割残留后台 job。"""
+    backend = FakeBackend(
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            FINISH,
+        ]
+    )
+    rc, workdir = run_once(tmp_path, backend)
+    assert rc == 0
+    assert _test_sleeps_alive() == []  # 进程不随 run 结束存活(E04 原位)
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "closed"
+    records = audit_records(workdir)
+    finished = [r for r in records if r["kind"] == "run_finished"]
+    assert finished[0]["payload"]["cleanup"]["cleanup_status"] == "ok"
+    assert verify(workdir / "audit.jsonl")
+
+
+def test_run_max_rounds_reaps_background_job_e04(tmp_path):
+    """R03-AC01(E04 原位回归):fake 模型起后台长跑,max_rounds=1 → error
+    收尾后本 run 无活动进程(评估复现原为 sleep 30,测试用唯一时长防误配)。"""
+    backend = FakeBackend(
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31339", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+        ]
+    )
+    scope_file = write_scope(tmp_path)
+    workdir = tmp_path / "eng"
+    rc = cli_main(
+        [
+            "run",
+            "--scope",
+            str(scope_file),
+            "--objective",
+            "侦察本机",
+            "--workdir",
+            str(workdir),
+            "--max-rounds",
+            "1",
+        ],
+        backend_factory=lambda _args: backend,
+    )
+    assert rc == 1  # error 退出码契约不变
+    assert _test_sleeps_alive() == []
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "active"  # R02 边界:killed/error 保持 active
+    records = audit_records(workdir)
+    finished = [r for r in records if r["kind"] == "run_finished"]
+    assert finished[0]["payload"]["status"] == "error"
+    assert finished[0]["payload"]["cleanup"]["cleanup_status"] == "ok"
+    assert verify(workdir / "audit.jsonl")
+
+
+def test_ctrl_c_first_press_kills_and_reaps(tmp_path):
+    """R03-C:第一次 Ctrl-C = kill switch——rc 130、后台 job 收割、
+    kill_switch 先于 run_finished(钉死顺序)、链完整。"""
+    backend = FakeBackend(
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            _hang_round,
+        ]
+    )
+
+    def fire_sigint_when_running() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if len(backend.calls) >= 2:  # 第二轮已挂起,SIGINT handler 已装配
+                os.kill(os.getpid(), signal.SIGINT)  # 第一次 Ctrl-C
+                return
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=fire_sigint_when_running, daemon=True)
+    scope_file = write_scope(tmp_path)
+    workdir = tmp_path / "eng"
+    thread.start()
+    rc = cli_main(
+        [
+            "run",
+            "--scope",
+            str(scope_file),
+            "--objective",
+            "侦察本机",
+            "--workdir",
+            str(workdir),
+        ],
+        backend_factory=lambda _args: backend,
+    )
+    assert rc == 130
+    assert _test_sleeps_alive() == []
+    records = audit_records(workdir)
+    kinds = [r["kind"] for r in records]
+    assert kinds[-1] == "run_finished"
+    assert records[-1]["payload"]["status"] == "killed"
+    assert records[-1]["payload"]["cleanup"]["cleanup_status"] == "ok"
+    assert "kill_switch" in kinds
+    assert kinds.index("kill_switch") < kinds.index("run_finished")
+    assert verify(workdir / "audit.jsonl")
+
+
+def test_assembly_failure_closes_everything(tmp_path, monkeypatch, capsys):
+    """R03-C:装配中途异常——已建句柄(audit/engagement/backend/锁)统一收口。
+
+    修复前:异常路径审计句柄、后端、索引连接、写者锁全部泄漏。
+    """
+
+    def boom_scan(*_a, **_kw):
+        raise RuntimeError("合成装配故障 TESTONLY")
+
+    monkeypatch.setattr("foam.cli.scan_tools", boom_scan)
+    backend = FakeBackend([FINISH])
+    scope_file = write_scope(tmp_path)
+    workdir = tmp_path / "eng"
+    with pytest.raises(RuntimeError, match="合成装配故障"):
+        cli_main(
+            [
+                "run",
+                "--scope",
+                str(scope_file),
+                "--objective",
+                "侦察本机",
+                "--workdir",
+                str(workdir),
+            ],
+            backend_factory=lambda _args: backend,
+        )
+    assert backend.aclose_calls == 1  # 后端已关(旧路径泄漏点)
+    lock = acquire_engagement_lock(workdir)  # 锁已释放:可再次获取
+    lock.release()
+    assert audit_kinds(workdir) == ["scope_loaded"]  # 审计已关,链完整可读
+    assert verify(workdir / "audit.jsonl")
+    assert "cleanup_pending" not in capsys.readouterr().err  # 无残留,不虚报
+
+
+def test_cleanup_failure_shows_cleanup_pending_on_stderr(
+    tmp_path, monkeypatch, capsys
+):
+    """R03-AC06/D2:清理失败上 stderr(cleanup_pending),不呈现「全部完成」;
+    退出码契约不变。"""
+
+    async def fake_aclose(self):
+        return {
+            "cleanup_status": "partial",
+            "remaining_resources": [
+                {"kind": "bash_job", "job_id": "jTESTONLY", "pid": 999999}
+            ],
+            "errors": ["合成收割失败 TESTONLY"],
+        }
+
+    monkeypatch.setattr(BashTool, "aclose", fake_aclose)
+    rc, workdir = run_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0  # 退出码契约不变(D2)
+    err = capsys.readouterr().err
+    assert "cleanup_pending" in err
+    assert "jTESTONLY" in err
+    assert "999999" in err
+    assert verify(workdir / "audit.jsonl")

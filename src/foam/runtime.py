@@ -25,6 +25,7 @@ CLI/TUI 共享同一关闭服务 :func:`close_run`——修复前各入口各自
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,21 +48,36 @@ class RunRuntime:
     loop: Any = None  # AgentLoop(引用;不由本服务驱动)
     closed: bool = False
     close_result: dict[str, Any] | None = None
+    _close_task: asyncio.Task | None = None
 
 
 async def close_run(
     runtime: RunRuntime, *, run_id: str = "", reason: str = ""
 ) -> dict[str, Any]:
-    """统一关闭入口;固定顺序(见模块 docstring),全程幂等。
+    """统一关闭入口;固定顺序(见模块 docstring),全程幂等且并发安全。
 
     ``run_id``/``reason`` 只进返回报告,供入口层(CLI stderr / TUI 通知)
     展示;本服务不写审计——终态记录由 loop 在收割后、本调用前落链(D6)。
-    返回 ``{cleanup_status, remaining_resources, errors, run_id, reason}``;
-    二次调用短路返回首次结果对象。
+    返回 ``{cleanup_status, remaining_resources, errors, run_id, reason}``。
+
+    幂等(AC04):完成后二次调用短路返回首次结果对象。并发安全:首个调用
+    把关闭体建成共享任务,并发调用方 shield 等待同一任务(TUI 的
+    ``action_quit`` 超时与 ``_run_to_end`` 收尾可能同时到达);调用方被
+    取消不中断共享关闭(与 loop 收割的 shield 语义一致)。
     """
     if runtime.close_result is not None:
         return runtime.close_result
-    runtime.closed = True
+    if runtime._close_task is None:
+        runtime._close_task = asyncio.ensure_future(
+            _close_run_impl(runtime, run_id=run_id, reason=reason)
+        )
+    return await asyncio.shield(runtime._close_task)
+
+
+async def _close_run_impl(
+    runtime: RunRuntime, *, run_id: str, reason: str
+) -> dict[str, Any]:
+    runtime.closed = True  # 关闭开始即置位(runtime_closed 读取面;单任务执行)
     remaining: list[dict[str, Any]] = []
     errors: list[str] = []
 
