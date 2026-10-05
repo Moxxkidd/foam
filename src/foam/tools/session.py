@@ -192,7 +192,15 @@ def _write_attempt(fd: int, data: bytes) -> int:
 
 
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
-    """整进程组 SIGKILL(与 WP-01 同模式:kill switch 语义=立即)。"""
+    """整进程组 SIGKILL(与 WP-01 同模式:kill switch 语义=立即)。
+
+    pid/pgid 复用守卫(2026-10-06 对抗评审收口,与 bash 层 _kill_group
+    同语义):leader 已被收割(returncode 非 None)时跳过 killpg——空进程组
+    的 pgid 可被 OS 回收给陌生进程组,不得错杀;leader 已收割但孙代仍在
+    组内的竞态下漏杀该组,如实进 remaining_resources(取舍见 R03.md §7)。
+    """
+    if proc.returncode is not None:
+        return  # leader 已收割:pid/pgid 可能已被复用,不得 killpg
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError):

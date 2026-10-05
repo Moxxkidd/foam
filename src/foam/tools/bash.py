@@ -500,7 +500,20 @@ class BashTool:
 
     @staticmethod
     def _kill_group(job: _Job) -> None:
-        """整进程组 SIGKILL(kill switch 语义=立即,不做 TERM 协商)。"""
+        """整进程组 SIGKILL(kill switch 语义=立即,不做 TERM 协商)。
+
+        pid/pgid 复用守卫(2026-10-06 对抗评审收口):leader 已被收割
+        (returncode 非 None)时跳过 killpg——进程组一旦为空,pgid 可被 OS
+        回收分配给无关新进程组(pid 同理),此时 killpg 会错杀陌生人
+        (违背「不杀不属于本 run 的进程」)。取舍(见 R03.md §7):leader 已
+        收割但孙代仍在组内的竞态下,本守卫漏杀该组——孙代如实进
+        remaining_resources(reaped=true),宁可漏杀这一组也不杀陌生人;
+        组内仍有存活成员时 pgid 不可能被回收,该情形下 killpg 本是对的,
+        跳过是已接受的成本。timeout/kill_job 等既有调用点只作用于存活
+        leader(returncode None),行为不变。
+        """
+        if job.proc.returncode is not None:
+            return  # leader 已收割:pid/pgid 可能已被复用,不得 killpg
         try:
             os.killpg(os.getpgid(job.proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):

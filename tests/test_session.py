@@ -577,3 +577,45 @@ async def test_aclose_reap_failure_stays_honest(tool, monkeypatch):
         session = tool._sessions[s["session_id"]]
         os.killpg(os.getpgid(session.proc.pid), signal.SIGKILL)
         await asyncio.wait_for(session.done.wait(), timeout=5)
+
+
+# ---------- R03 对抗评审收口:pid/pgid 复用守卫(会话层对称) ----------
+
+
+def test_kill_process_group_skips_when_leader_reaped(monkeypatch):
+    """pid/pgid 复用守卫:leader 已收割(returncode 非 None)时不 killpg——
+    pgid 可能已被回收给陌生进程组(与 bash 层 _kill_group 同守卫)。"""
+    from foam.tools.session import _kill_process_group
+
+    calls = []
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 555)  # 证明跳过非因异常
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+
+    class _Proc:
+        pid = 424242
+        returncode = 0  # 已被收割
+
+        def kill(self):
+            calls.append("proc.kill")
+
+    _kill_process_group(_Proc())
+    assert calls == []
+
+
+def test_kill_process_group_kills_live_leader_group(monkeypatch):
+    """对照组:leader 存活(returncode None)时行为不变——整组 SIGKILL。"""
+    from foam.tools.session import _kill_process_group
+
+    calls = []
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 555)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+
+    class _Proc:
+        pid = 424242
+        returncode = None
+
+        def kill(self):
+            calls.append("proc.kill")
+
+    _kill_process_group(_Proc())
+    assert calls == [(555, signal.SIGKILL)]

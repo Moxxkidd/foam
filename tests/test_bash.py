@@ -13,6 +13,7 @@ import signal
 import time
 import tracemalloc
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -448,3 +449,42 @@ async def test_aclose_reap_failure_reports_remaining(tool, monkeypatch):
         monkeypatch.undo()
         os.killpg(os.getpgid(pid), signal.SIGKILL)
         await asyncio.wait_for(asyncio.shield(job.wait_task), timeout=5)
+
+
+# ---------- R03 对抗评审收口:pid/pgid 复用守卫 ----------
+
+
+def test_kill_group_skips_when_leader_reaped(monkeypatch):
+    """pid/pgid 复用守卫:leader 已收割(returncode 非 None)时不 killpg——
+    此刻 pgid 可能已被 OS 回收分配给无关新进程组,killpg 会错杀陌生人
+    (违背「不杀不属于本 run 的进程」排除项)。宁可漏杀,不杀陌生人。"""
+    calls = []
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 555)  # 证明跳过非因异常
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+
+    class _Proc:
+        pid = 424242
+        returncode = -9  # 已被 child watcher 收割
+
+        def kill(self):
+            calls.append("proc.kill")
+
+    BashTool._kill_group(SimpleNamespace(proc=_Proc()))
+    assert calls == []  # 不 killpg、不退化 proc.kill:pid/pgid 都不再可信
+
+
+def test_kill_group_kills_live_leader_group(monkeypatch):
+    """对照组:leader 存活(returncode None)时行为不变——整组 SIGKILL。"""
+    calls = []
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 555)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+
+    class _Proc:
+        pid = 424242
+        returncode = None  # 存活:pgid 仍是本 run 的组
+
+        def kill(self):
+            calls.append("proc.kill")
+
+    BashTool._kill_group(SimpleNamespace(proc=_Proc()))
+    assert calls == [(555, signal.SIGKILL)]
