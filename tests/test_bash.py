@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import signal
 import time
 import tracemalloc
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from foam.tools.bash import (
+    CLOSE_REAP_TIMEOUT_SECONDS,
     DEFAULT_OUTPUT_BUDGET_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
     TOOL_SCHEMAS,
@@ -24,8 +26,10 @@ from foam.tools.bash import (
 
 
 @pytest.fixture
-def tool(tmp_path):
-    return BashTool(tmp_path / "outputs")
+async def tool(tmp_path):
+    t = BashTool(tmp_path / "outputs")
+    yield t
+    await t.aclose()  # R03:用例失败也不留孤儿 job
 
 
 # ---------- 工具 schema 导出契约(WP-03/04/06 依赖的形状) ----------
@@ -294,3 +298,153 @@ async def test_dispatch_roundtrip(tool):
 async def test_dispatch_unknown_tool_raises(tool):
     with pytest.raises(KeyError):
         await tool.dispatch("not-a-tool", {})
+
+
+# ---------- R03-A:统一关闭原语(aclose / 取消安全看管 / 有界收割) ----------
+
+
+def test_close_bound_is_explicit_and_bounded():
+    """R03-AC05 常量面:收割上界显式存在,与 session 层同量级(单次 close 最坏耗时)。"""
+    from foam.tools.session import CLOSE_REAP_TIMEOUT_SECONDS as session_bound
+
+    assert 0 < CLOSE_REAP_TIMEOUT_SECONDS <= 5.0
+    assert 0 < session_bound <= 5.0
+
+
+async def test_close_is_idempotent(tool):
+    """R03-AC04:重复 close 无副作用——二次 aclose 短路返回同一结果对象。"""
+    bg = await tool.run_command("sleep 31337", background=True, timeout_seconds=None)
+    done = await tool.run_command("echo already-done")
+    assert done["status"] == "completed"
+
+    first = await tool.aclose()
+    assert first["cleanup_status"] == "ok"
+    assert first["remaining_resources"] == []
+    assert first["errors"] == []
+
+    job = tool._jobs[bg["job_id"]]
+    assert job.done.is_set()  # 收割完成(非仅标记)
+    assert job.status == "killed"
+    assert job.manifest is not None and job.manifest.sha256  # 终态账目定稿
+    with pytest.raises(ProcessLookupError):
+        os.kill(job.proc.pid, 0)  # 进程真死
+
+    second = await tool.aclose()
+    assert second is first  # 短路:同一结果,零副作用
+
+
+async def test_run_command_refused_after_close(tool):
+    """R03:aclose 后 run_command 拒绝新命令(停止派发的工具层兜底)。"""
+    await tool.aclose()
+    res = await tool.run_command("echo should-not-run")
+    assert "error" in res
+    assert (await tool.list_jobs())["jobs"] == []  # 未注册新 job、未起进程
+
+
+async def test_cancel_foreground_reaps_child(tool):
+    """R03-AC02:前台等待被取消,看管不随之死——子进程不孤儿,aclose 完整收割。
+
+    修复前:外部取消把 _supervise 一起带走,done 永不置位、manifest 丢失、
+    子进程孤儿化;kill 路径再烧 5s 报「未能收割」假阳性。
+    """
+    task = asyncio.create_task(tool.run_command("sleep 31337", timeout_seconds=None))
+    await asyncio.sleep(0.3)
+    [job] = tool._jobs.values()
+    pid = job.proc.pid
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # 看管存活:job 仍在登记册,子进程仍受监督(未被取消带走,也未被杀)
+    assert not job.wait_task.done()
+    os.kill(pid, 0)  # 仍活着 = 等待被取消 ≠ 进程被遗弃死
+
+    result = await tool.aclose()
+    assert result["cleanup_status"] == "ok"
+    assert result["remaining_resources"] == []
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert job.done.is_set()
+    assert job.status == "killed"
+    assert job.manifest is not None  # 终态账目定稿(kill 路径假阳性根修复)
+
+
+async def test_aclose_kills_process_group_with_grandchild(tool):
+    """R03-AC03:整组 SIGKILL——bash job 的孙进程随组被收割(镜像会话层钉死)。"""
+    bg = await tool.run_command(
+        "sleep 31337 & echo BGPID:$!; wait",
+        background=True,
+        timeout_seconds=None,
+    )
+    grandchild = None
+    for _ in range(100):  # 等孙进程 pid 落盘(最多 5s)
+        page = await tool.read_output(bg["job_id"], offset=0, limit=4096)
+        match = re.search(r"BGPID:(\d+)", page["content"])
+        if match:
+            grandchild = int(match.group(1))
+            break
+        await asyncio.sleep(0.05)
+    assert grandchild is not None, "孙进程未启动"
+
+    result = await tool.aclose()
+    assert result["cleanup_status"] == "ok"
+    await asyncio.sleep(0.1)  # SIGKILL 落地
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild, 0)  # 孙进程同死,不孤儿
+    pid = tool._jobs[bg["job_id"]].proc.pid
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+async def test_aclose_mixed_job_states(tool):
+    """R03-AC01 形状:运行中 / 已退出 / 前台取消等待 混合矩阵一次收口。"""
+    running = await tool.run_command(
+        "sleep 31337", background=True, timeout_seconds=None
+    )
+    exited = await tool.run_command("echo done")
+    assert exited["status"] == "completed"
+    task = asyncio.create_task(tool.run_command("sleep 31338", timeout_seconds=None))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    result = await tool.aclose()
+    assert result["cleanup_status"] == "ok"
+    jobs = {j["job_id"]: j for j in (await tool.list_jobs())["jobs"]}
+    assert jobs[running["job_id"]]["status"] == "killed"
+    assert jobs[exited["job_id"]]["status"] == "completed"  # 已退出不被改写
+    statuses = sorted(j["status"] for j in jobs.values())
+    assert statuses == ["completed", "killed", "killed"]  # 取消等待的也被收割
+    assert all(tool._jobs[jid].done.is_set() for jid in jobs)
+
+
+async def test_aclose_reap_failure_reports_remaining(tool, monkeypatch):
+    """R03-AC06:收割失败如实上报——partial + remaining_resources,不粉饰终态。
+
+    AC05 同测:收割等待有总时间上界(把上界与 _kill_group 一并打桩模拟
+    「SIGKILL 落不下去」的极端,断言 aclose 在上界+裕量内返回)。
+    """
+    bg = await tool.run_command("sleep 31337", background=True, timeout_seconds=None)
+    job = tool._jobs[bg["job_id"]]
+    pid = job.proc.pid
+    monkeypatch.setattr(BashTool, "_kill_group", staticmethod(lambda _job: None))
+    monkeypatch.setattr("foam.tools.bash.CLOSE_REAP_TIMEOUT_SECONDS", 0.3)
+    start = time.monotonic()
+    try:
+        result = await tool.aclose()
+        elapsed = time.monotonic() - start
+        assert elapsed < 3  # AC05:有界(0.3s 等待上限 + 调度裕量)
+        assert result["cleanup_status"] == "partial"
+        [entry] = result["remaining_resources"]
+        assert entry["job_id"] == bg["job_id"]
+        assert entry["pid"] == pid
+        # 诚实:未收割的 job 不被粉饰成 killed/completed(done/returncode 为准)
+        assert job.status == "running"
+        assert not job.done.is_set()
+    finally:
+        # 打桩让工具杀不掉,测试自己收拾残局
+        monkeypatch.undo()
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        await asyncio.wait_for(asyncio.shield(job.wait_task), timeout=5)

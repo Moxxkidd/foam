@@ -38,6 +38,9 @@ from .output import OutputManifest, OutputRecorder
 
 #: 同时存活的会话上限(含已退出未关闭的:master fd 仍占着,关了才算释放)。
 DEFAULT_MAX_SESSIONS = 8
+#: aclose 收割等待的总时间上界(秒):与 bash 层同量级;单次 close 的最坏
+#: 耗时上界(R03-AC05;上界内未收割的会话如实进 remaining_resources,不粉饰)。
+CLOSE_REAP_TIMEOUT_SECONDS = 5.0
 #: session_read 单次返回视图的默认原始字节预算。
 DEFAULT_READ_BUDGET_BYTES = 16 * 1024
 #: 每个会话的内存 ring 上限(传 WP-01 输出层;会话完结即释放)。
@@ -356,6 +359,10 @@ class SessionTool:
         self._read_budget = read_budget_bytes
         self._ring_bytes = ring_buffer_bytes
         self._sessions: dict[str, _Session] = {}
+        # R03 统一关闭:_closed 置位后 session_open 拒绝新会话(与 aclose 幂等
+        # 短路配对:开了没人收的口子必须堵上);_close_result 缓存首次清理报告。
+        self._closed = False
+        self._close_result: dict[str, Any] | None = None
 
     # ---------- WP-04 唯一入口 ----------
 
@@ -373,6 +380,12 @@ class SessionTool:
     # ---------- 工具实现 ----------
 
     async def session_open(self, command: str) -> dict[str, Any]:
+        if self._closed:
+            # R03:aclose 后拒绝新会话(停止派发兜底;否则新会话无人收割)
+            return {
+                "error": "会话层已关闭(run 已收尾),拒绝开新会话",
+                "status": "closed",
+            }
         active = [s for s in self._sessions.values() if s.status != "closed"]
         if len(active) >= self._max_sessions:
             return {
@@ -618,25 +631,66 @@ class SessionTool:
             )
         return {"sessions": entries, "count": len(entries)}
 
-    async def aclose(self) -> None:
-        """关闭全部会话(WP-04 kill switch / engagement 收尾用)。"""
+    async def aclose(self) -> dict[str, Any]:
+        """关闭全部会话(R03 统一关闭原语;WP-04 kill switch / 收尾用)。
+
+        语义与 bash 层对齐:无宽限期整组 SIGKILL;收割等待一次
+        ``wait_for(gather(全部 done.wait()))``,总上界
+        ``CLOSE_REAP_TIMEOUT_SECONDS``;幂等——二次调用短路返回首次结果对象。
+
+        R03-AC06 修复:收割上界内未完成的会话**不再强标 closed**(旧实现
+        :634-635 的粉饰),如实列入 ``remaining_resources``(以 done.is_set()
+        为准);transport 仍照常关闭释放本端 fd——直接子进程 SIGKILL 必死,
+        残留形态是组外逃逸后代占着 pty slave,关 master 让读循环尽快落地。
+        closing 标记与自然退出(exited)的区分不变(WP-05 陷阱)。
+        """
+        if self._close_result is not None:
+            return self._close_result
+        self._closed = True
+        errors: list[str] = []
         for session in self._sessions.values():
-            if session.status == "running":
+            if session.status == "running" and not session.done.is_set():
                 session.closing = True
-                _kill_process_group(session.proc)
-        waits = [s.done.wait() for s in self._sessions.values() if not s.done.is_set()]
+                try:
+                    _kill_process_group(session.proc)
+                except OSError as exc:  # _kill_process_group 已自收 Lookup;防御
+                    errors.append(f"会话 {session.session_id}: 杀进程组异常: {exc!r}")
+        waits = [
+            s.done.wait() for s in self._sessions.values() if not s.done.is_set()
+        ]
         if waits:
             try:
-                await asyncio.wait_for(asyncio.gather(*waits), timeout=5)
+                await asyncio.wait_for(
+                    asyncio.gather(*waits), timeout=CLOSE_REAP_TIMEOUT_SECONDS
+                )
             except TimeoutError:
-                pass  # 收割失败的在 close/list 里可见,不在此处抛
+                pass  # 上界到点:下方如实上报残留(R03-AC06)
+        remaining: list[dict[str, Any]] = []
         for session in self._sessions.values():
-            if session.status == "running":
-                session.status = "closed"
+            if session.done.is_set():
+                if session.status == "running":
+                    session.status = "closed"  # 我们杀的;自然退出的保持 exited
+            else:
+                remaining.append(
+                    {
+                        "kind": "session",
+                        "session_id": session.session_id,
+                        "command": session.command,
+                        "pid": session.proc.pid,
+                        "status": session.status,
+                    }
+                )
             try:
                 session.transport.close()
             except OSError:
-                pass
+                pass  # EOF 后 transport 可能已自闭合
+        result: dict[str, Any] = {
+            "cleanup_status": "partial" if (remaining or errors) else "ok",
+            "remaining_resources": remaining,
+            "errors": errors,
+        }
+        self._close_result = result
+        return result
 
     # ---------- 内部:读循环、提示识别、结果装配 ----------
 

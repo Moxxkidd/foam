@@ -159,7 +159,7 @@ def describe_exit_code(exit_code: Any) -> str | None:
         return f"进程被信号 {signum} 终止(非常见信号,请查 kill -l)。"
     note = f"进程被 {name}(信号 {signum})终止"
     if signum == 9:
-        note += ":常见于 kill_job、timeout 整组强杀,或系统 OOM killer。"
+        note += ":常见于 kill_job、timeout 整组强杀、run 结束统一收割,或系统 OOM。"
     elif signum == 15:
         note += ":常见于外部发来的优雅终止请求。"
     elif signum == 13:

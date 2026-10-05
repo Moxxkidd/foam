@@ -494,3 +494,86 @@ async def test_msfconsole_full_flow(tool):
     await tool.session_send(sid, "exit")
     done = await tool.session_close(sid)
     assert done["sha256"] is not None
+
+
+# ---------- R03-A:统一关闭原语(aclose 诚实上报 / 有界收割 / 幂等) ----------
+
+
+async def test_close_is_idempotent(tool):
+    """R03-AC04:重复 close 无副作用——二次 aclose 短路返回同一结果对象。"""
+    running = await tool.session_open("cat")
+    exited = await tool.session_open("true")  # 立即自然退出
+    for _ in range(50):  # 等 exited 终态(最多 5s)
+        r = await tool.session_read(exited["session_id"])
+        if r["status"] != "running":
+            break
+        await asyncio.sleep(0.1)
+    assert r["status"] == "exited"
+
+    first = await tool.aclose()
+    assert first["cleanup_status"] == "ok"
+    assert first["remaining_resources"] == []
+    with pytest.raises(ProcessLookupError):
+        os.kill(running["pid"], 0)  # 进程真死
+    listed = {e["session_id"]: e for e in (await tool.session_list())["sessions"]}
+    assert listed[running["session_id"]]["status"] == "closed"
+    assert listed[exited["session_id"]]["status"] == "exited"  # 自然退出不被改写
+
+    second = await tool.aclose()
+    assert second is first  # 短路:同一结果,零副作用
+
+
+async def test_session_open_refused_after_close(tool):
+    """R03:aclose 后 session_open 拒绝新会话(与幂等短路配对,防开了没人收)。"""
+    await tool.aclose()
+    res = await tool.session_open("cat")
+    assert "error" in res
+    assert (await tool.session_list())["sessions"] == []
+
+
+async def test_cancel_pending_read_then_close_reaps(tool):
+    """R03-AC02 会话侧:挂起的 session_read 等待被取消,aclose 仍完整收割。"""
+    s = await tool.session_open("cat")
+    task = asyncio.create_task(
+        tool.session_read(
+            s["session_id"], wait_pattern="NEVER_MATCH_R03", timeout_seconds=60
+        )
+    )
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    result = await tool.aclose()
+    assert result["cleanup_status"] == "ok"
+    with pytest.raises(ProcessLookupError):
+        os.kill(s["pid"], 0)
+    listed = {e["session_id"]: e for e in (await tool.session_list())["sessions"]}
+    assert listed[s["session_id"]]["status"] == "closed"
+
+
+async def test_aclose_reap_failure_stays_honest(tool, monkeypatch):
+    """R03-AC06:收割超时不再强标 closed——如实 partial + remaining_resources。
+
+    AC05 同测:收割等待有总时间上界(打桩 kill 落空,断言上界+裕量内返回)。
+    """
+    s = await tool.session_open("cat")
+    monkeypatch.setattr("foam.tools.session._kill_process_group", lambda _proc: None)
+    monkeypatch.setattr("foam.tools.session.CLOSE_REAP_TIMEOUT_SECONDS", 0.3)
+    start = time.monotonic()
+    try:
+        result = await tool.aclose()
+        elapsed = time.monotonic() - start
+        assert elapsed < 3  # AC05:有界(0.3s 等待上限 + 调度裕量)
+        assert result["cleanup_status"] == "partial"
+        [entry] = result["remaining_resources"]
+        assert entry["session_id"] == s["session_id"]
+        # 诚实:未收割的会话不被强标 closed(修复前 :634-635 的粉饰)
+        listed = {e["session_id"]: e for e in (await tool.session_list())["sessions"]}
+        assert listed[s["session_id"]]["status"] == "running"
+    finally:
+        # 打桩让工具杀不掉,测试自己收拾残局
+        monkeypatch.undo()
+        session = tool._sessions[s["session_id"]]
+        os.killpg(os.getpgid(session.proc.pid), signal.SIGKILL)
+        await asyncio.wait_for(session.done.wait(), timeout=5)

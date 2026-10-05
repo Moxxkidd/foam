@@ -74,7 +74,9 @@ _SYSTEM_TEMPLATE = """\
 - 大输出:用 output_budget_bytes 控制返回视图;完整输出始终全量落盘(带
   sha256),需要更多内容用 read_output 按字节分页读取,不要把整文件灌进上下文。
 - 长跑命令:background=true 拿 job_id,用 list_jobs 看状态与超时剩余秒数,
-  kill_job 止损。进程只会被超时或 kill_job 终止。
+  kill_job 止损。run 结束(finished/error/kill/取消)时仍未终止的进程由
+  harness 统一收割:整进程组 SIGKILL、有总时间上界、无宽限期;进程组外逃逸
+  (自行 setsid/daemonize 的后代)不在收割范围内。
 - exit_code 为负数表示进程被信号终止(如 -9 = SIGKILL:超时整组强杀、kill_job
   或系统 OOM killer;-15 = SIGTERM)。结合 status 字段判断结束原因。
 - 工作笔记:{engagement_path} 是你的持久记忆,内容每轮自动重新加载进上下文。

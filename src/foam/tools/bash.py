@@ -38,6 +38,9 @@ DEFAULT_OUTPUT_BUDGET_BYTES = 16 * 1024
 DEFAULT_PAGE_BYTES = 32 * 1024
 #: 每个活动 job 的内存 ring 上限(快速 tail 用,job 完结即释放)。
 DEFAULT_RING_BUFFER_BYTES = 256 * 1024
+#: aclose 收割等待的总时间上界(秒):与 session 层同量级;单次 close 的最坏
+#: 耗时上界(R03-AC05;上界内未收割的 job 如实进 remaining_resources,不粉饰)。
+CLOSE_REAP_TIMEOUT_SECONDS = 5.0
 #: 流读取块大小。刻意不用行迭代:无换行的巨量单行会把行缓冲撑爆(验收 3)。
 _READ_CHUNK_BYTES = 64 * 1024
 #: list_jobs 里 command 的展示截断长度(全文不落 LLM 视图,防 context 浪费)。
@@ -54,7 +57,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "等待完成并返回截断视图;background=true 立即返回 job_id 后台运行。"
             "stdout/stderr 始终全量落盘:视图超出 output_budget_bytes 只做"
             " head+tail 截断,绝不因此杀进程;完整内容用 read_output 分页读取。"
-            "进程只会被 timeout_seconds 或 kill_job 终止。"
+            "进程会被 timeout_seconds、kill_job 或 run 结束时的统一收割"
+            "(整进程组 SIGKILL)终止。"
         ),
         "parameters": {
             "type": "object",
@@ -67,7 +71,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": ["number", "null"],
                     "description": (
                         "超时秒数,到点整进程组强杀(status=timeout)。省略默认 "
-                        "1800;null 表示不限时,仅能被 kill_job 终止。"
+                        "1800;null 表示不限时,仅能被 kill_job 或 run 结束收割终止。"
                     ),
                     "default": DEFAULT_TIMEOUT_SECONDS,
                 },
@@ -181,7 +185,7 @@ class _Job:
     kill_requested: bool = False
     error: str | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
-    wait_task: asyncio.Task[None] | None = None  # 仅后台模式:看管协程
+    wait_task: asyncio.Task[None] | None = None  # 看管任务(前台/后台一律独立任务)
 
 
 class BashTool:
@@ -205,6 +209,10 @@ class BashTool:
         self._default_budget = default_output_budget_bytes
         self._ring_bytes = ring_buffer_bytes
         self._jobs: dict[str, _Job] = {}
+        # R03 统一关闭:_closed 置位后 run_command 拒绝新命令(停止派发兜底);
+        # _close_result 非 None 即 aclose 已完成,二次调用短路返回同一结果。
+        self._closed = False
+        self._close_result: dict[str, Any] | None = None
 
     # ---------- WP-04 唯一入口 ----------
 
@@ -228,6 +236,13 @@ class BashTool:
         output_budget_bytes: int = _UNSET,
         background: bool = False,
     ) -> dict[str, Any]:
+        if self._closed:
+            # R03:aclose 后拒绝新命令(停止派发的工具层兜底;主派发闸在 loop)
+            return {
+                "job_id": None,
+                "status": "closed",
+                "error": "exec 层已关闭(run 已收尾),拒绝执行新命令",
+            }
         if timeout_seconds is _UNSET:
             timeout = self._default_timeout
         else:
@@ -267,9 +282,11 @@ class BashTool:
         )
         self._jobs[job_id] = job
 
-        supervise = self._supervise(job)
+        # R03:看管一律为独立任务,前台经 shield 等待——前台等待者被取消不再
+        # 带走看管(修复前:外部取消杀死 _supervise,子进程孤儿化、done 永不
+        # 置位、manifest 丢失,kill 路径再烧 5s 报「未能收割」假阳性)。
+        job.wait_task = asyncio.create_task(self._supervise_guarded(job))
         if background:
-            job.wait_task = asyncio.create_task(supervise)
             return {
                 "job_id": job_id,
                 "status": "running",
@@ -277,7 +294,8 @@ class BashTool:
                 "duration_ms": None,
                 "output_view": (
                     f"已转入后台运行(job_id={job_id})。用 list_jobs 查看状态与"
-                    f"超时剩余时间,read_output 分页读取输出,kill_job 终止。"
+                    f"超时剩余时间,read_output 分页读取输出,kill_job 终止;"
+                    f"run 结束时未终止的 job 由 harness 统一收割。"
                 ),
                 "output_path": str(recorder.combined_path),
                 "sha256": None,
@@ -287,7 +305,7 @@ class BashTool:
                 "stderr_sha256": None,
                 "timeout_seconds": timeout,
             }
-        await supervise
+        await asyncio.shield(job.wait_task)
         return self._result(job)
 
     async def read_output(
@@ -368,7 +386,77 @@ class BashTool:
             }
         return self._result(job)
 
+    async def aclose(self) -> dict[str, Any]:
+        """关闭 exec 层(R03 统一关闭原语):拒绝新命令,收割全部未完结 job。
+
+        语义:无宽限期(与 kill_job/timeout 的既有 SIGKILL 语义一致——run 结束
+        时残留的 job 按定义已无人看管);只杀本工具登记 job 的进程组,不碰组外
+        进程(自行 setsid/daemonize 逃逸组外的后代不在收割范围,见 R03 §7)。
+        收割等待有总时间上界 ``CLOSE_REAP_TIMEOUT_SECONDS``:一次
+        ``wait_for(gather(全部 done.wait()))``,不按 job 逐个累计。
+
+        幂等:二次调用短路返回首次结果对象。返回清理报告:
+        ``cleanup_status`` = "ok" / "partial";``remaining_resources`` 列出
+        上界内未收割的 job(以 done.is_set()/proc.returncode 为准,不看
+        job.status——诚实上报,不粉饰终态);``errors`` 收集杀组异常。
+        """
+        if self._close_result is not None:
+            return self._close_result
+        self._closed = True
+        errors: list[str] = []
+        for job in self._jobs.values():
+            if job.done.is_set():
+                continue
+            job.kill_requested = True  # 看管记账为 killed(非自然完结)
+            try:
+                self._kill_group(job)
+            except Exception as exc:  # _kill_group 已自收 Lookup/Permission;防御
+                errors.append(f"job {job.job_id}: 杀进程组异常: {exc!r}")
+        waits = [
+            job.done.wait() for job in self._jobs.values() if not job.done.is_set()
+        ]
+        if waits:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*waits), timeout=CLOSE_REAP_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                pass  # 上界到点:下方如实上报残留(R03-AC06)
+        remaining: list[dict[str, Any]] = []
+        for job in self._jobs.values():
+            if job.done.is_set() and job.proc.returncode is not None:
+                continue
+            remaining.append(
+                {
+                    "kind": "bash_job",
+                    "job_id": job.job_id,
+                    "command": job.command,
+                    "pid": job.proc.pid,
+                    "reaped": job.proc.returncode is not None,
+                }
+            )
+        result: dict[str, Any] = {
+            "cleanup_status": "partial" if (remaining or errors) else "ok",
+            "remaining_resources": remaining,
+            "errors": errors,
+        }
+        self._close_result = result
+        return result
+
     # ---------- 内部:看管、杀进程、视图渲染 ----------
+
+    async def _supervise_guarded(self, job: _Job) -> None:
+        """看管任务的安全壳:内部异常不裸奔(防 done 永不置位、任务异常无人认领)。"""
+        try:
+            await self._supervise(job)
+        except Exception as exc:  # 理论不到达(_supervise 已尽收);防御兜底
+            job.error = f"看管异常: {exc!r}"
+            try:
+                job.manifest = job.manifest or job.recorder.finalize()
+            except Exception as finalize_exc:
+                # 定稿失败也至少置位 done:aclose 不因此烧上界;异常如实入账
+                job.error += f";定稿异常: {finalize_exc!r}"
+            job.done.set()
 
     async def _supervise(self, job: _Job) -> None:
         """看管一个 job 到终态:喂 recorder、等退出/超时、收尾账目与视图。"""
