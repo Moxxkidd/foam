@@ -101,6 +101,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1268,19 +1269,44 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _atomic_write_report(out_path: Path, text: str) -> None:
+    """报告原子导出:同目录临时文件写完后 os.replace(R04-AC05/D5)。
+
+    任何失败(建临时文件/写盘/替换)都清理临时文件——已有报告逐字节不动,
+    不留貌似完整的半成品;目标目录不存在时 mkstemp 抛 OSError,归退出码 2。
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=out_path.parent, prefix=out_path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, out_path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     root = Path(args.engagement_dir)
     if not root.is_dir():
         print(f"[错误] engagement 目录不存在:{root}", file=sys.stderr)
         return EXIT_USAGE
-    text = build_report(root)
+    try:
+        text = build_report(root)
+    except Exception as exc:
+        # R04(D4):生成失败(分页空页/快照被破坏/读取故障等)→ rc 1,
+        # 目标文件不动,不产出貌似完整的报告;此前异常未捕获直接抛栈。
+        print(f"[错误] 报告生成失败: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     if args.out:
         out_path = Path(args.out)
         try:
-            out_path.write_text(text, encoding="utf-8")
+            _atomic_write_report(out_path, text)
         except OSError as exc:
             print(f"[错误] 报告写入失败: {exc}", file=sys.stderr)
             return EXIT_USAGE
+        # D4:成功提示只在原子替换完成之后
         print(f"[report] 已写入 {out_path}(含凭证全值,按红线处理)", flush=True)
     else:
         print(text)

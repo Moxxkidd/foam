@@ -40,7 +40,7 @@ from foam.agent.scope_compiler import scope_event_payload
 from foam.cli import main as cli_main
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, AuditLog, verify
 from foam.guard.scope import load_scope, parse_scope
-from foam.replay import read_records, recover_scope_record
+from foam.replay import ReportGenerationError, read_records, recover_scope_record
 from foam.state.files import (
     SCOPE_SECTION_BEGIN,
     SCOPE_SECTION_END,
@@ -1241,3 +1241,108 @@ def test_cleanup_failure_shows_cleanup_pending_on_stderr(
     assert "jTESTONLY" in err
     assert "999999" in err
     assert verify(workdir / "audit.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# R04-C:报告导出原子性(失败不留半成品、无成功假提示)
+# ---------------------------------------------------------------------------
+
+
+def _make_report_target(tmp_path):
+    """跑一个 fake run 造 engagement 并先成功导出一份好报告;
+    返回 (workdir, out_path, 原报告字节)。"""
+    rc, workdir = run_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0
+    out_path = tmp_path / "report.md"
+    assert cli_main(["report", str(workdir), "--out", str(out_path)]) == 0
+    return workdir, out_path, out_path.read_bytes()
+
+
+def test_report_write_failure_preserves_previous_file(
+    tmp_path, capsys, monkeypatch
+):
+    """R04-AC05:os.replace 模拟磁盘故障——旧报告逐字节不动、无残留临时
+    文件、stderr 报错、非零退出、无「已写入」成功假提示。"""
+    workdir, out_path, original = _make_report_target(tmp_path)
+    capsys.readouterr()  # 排空成功路径输出
+
+    def boom_replace(_src, _dst):
+        raise OSError(28, "No space left on device (TESTONLY 模拟)")
+
+    monkeypatch.setattr(os, "replace", boom_replace)
+    listing_before = sorted(p.name for p in tmp_path.iterdir())
+    rc = cli_main(["report", str(workdir), "--out", str(out_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert out_path.read_bytes() == original  # 旧报告逐字节不动
+    assert "报告写入失败" in captured.err
+    assert "已写入" not in captured.out  # 无成功假提示
+    # 无残留临时文件:目录清单与失败前一致
+    assert sorted(p.name for p in tmp_path.iterdir()) == listing_before
+
+
+def test_report_write_temp_creation_failure_preserves_previous_file(
+    tmp_path, capsys, monkeypatch
+):
+    """R04-AC05 姊妹场景:临时文件创建即失败(权限/磁盘)——旧报告不动、
+    rc 2、无成功假提示。"""
+    workdir, out_path, original = _make_report_target(tmp_path)
+    capsys.readouterr()
+
+    def boom_mkstemp(*_args, **_kwargs):
+        raise OSError(13, "Permission denied (TESTONLY 模拟)")
+
+    monkeypatch.setattr("foam.cli.tempfile.mkstemp", boom_mkstemp)
+    rc = cli_main(["report", str(workdir), "--out", str(out_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert out_path.read_bytes() == original
+    assert "报告写入失败" in captured.err
+    assert "已写入" not in captured.out
+
+
+def test_report_build_failure_exit_error_target_untouched(
+    tmp_path, capsys, monkeypatch
+):
+    """R04(D4):报告生成失败 → rc 1 + stderr,目标文件逐字节不动,
+    无成功提示(此前 build_report 异常未捕获,直接抛栈)。"""
+    workdir, out_path, original = _make_report_target(tmp_path)
+    capsys.readouterr()
+
+    def boom_build(_root):
+        raise ReportGenerationError("TESTONLY 模拟分页空页")
+
+    monkeypatch.setattr("foam.cli.build_report", boom_build)
+    rc = cli_main(["report", str(workdir), "--out", str(out_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert out_path.read_bytes() == original
+    assert "报告生成失败" in captured.err
+    assert "已写入" not in captured.out
+
+
+def test_report_success_message_only_after_replace(tmp_path, capsys, monkeypatch):
+    """R04(D4/D5):「已写入」只在原子替换成功之后打印;替换发生前旧报告
+    内容仍在目标路径上。"""
+    workdir, out_path, original = _make_report_target(tmp_path)
+    capsys.readouterr()
+
+    observed: dict[str, object] = {}
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        observed["stdout_before"] = capsys.readouterr().out
+        observed["dst_bytes_before"] = Path(dst).read_bytes()
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    rc = cli_main(["report", str(workdir), "--out", str(out_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert observed["dst_bytes_before"] == original  # 替换前旧文件仍在
+    assert "已写入" not in observed["stdout_before"]  # 替换完成前无成功提示
+    assert "已写入" in captured.out  # 替换完成后才提示
