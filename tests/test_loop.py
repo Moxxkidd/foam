@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 from collections import deque
 from types import SimpleNamespace
+
+import pytest
 
 from foam.agent.backends.base import (
     LLMBackend,
@@ -838,3 +842,426 @@ async def test_registry_appendable(tmp_path):
     assert payload == {"ok": True, "echo": "hello"}
     names = [spec.name for spec in env.backend.tools_seen]
     assert "fake_state" in names and "run_command" in names
+
+
+# ---------------------------------------------------------------------------
+# R03-B:统一运行时资源关闭(loop 收割 / 停止派发 / 取消安全)
+# ---------------------------------------------------------------------------
+
+
+async def test_max_rounds_reaps_background_jobs(tmp_path):
+    """R03-AC01(E04 形状):轮数耗尽 error 收尾,后台 job 被收割,终态记录带清理报告。"""
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+        ],
+        loop_kw={"max_rounds": 1},
+    )
+    result = await env.loop.run("长跑")
+    assert result.status == "error"
+    assert "最大轮数" in result.error
+
+    [job] = env.bash._jobs.values()
+    assert job.done.is_set()
+    assert job.status == "killed"
+    with pytest.raises(ProcessLookupError):
+        os.kill(job.proc.pid, 0)  # 进程真死,不随 run 结束存活
+
+    records = audit_records(env)
+    kinds = [r["kind"] for r in records]
+    assert kinds[-1] == "run_finished"
+    finished = records[-1]["payload"]
+    assert finished["status"] == "error"
+    # 终态记录携带收割报告(D2):收割完成才落 run_finished(顺序证据)
+    assert finished["cleanup"]["cleanup_status"] == "ok"
+    assert finished["cleanup"]["remaining_resources"] == []
+    assert verify(env.audit_path)
+
+
+async def test_model_error_reaps_background_jobs(tmp_path):
+    """R03-AC01:模型错误(不可重试)收尾,后台 job 同样被收割。"""
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            ModerationError("[fake] provider 审核拦截: sensitive", provider="fake"),
+        ],
+    )
+    result = await env.loop.run("探测")
+    assert result.status == "error"
+    [job] = env.bash._jobs.values()
+    assert job.done.is_set() and job.status == "killed"
+    with pytest.raises(ProcessLookupError):
+        os.kill(job.proc.pid, 0)
+    finished = [r for r in audit_records(env) if r["kind"] == "run_finished"]
+    assert finished[0]["payload"]["cleanup"]["cleanup_status"] == "ok"
+    assert verify(env.audit_path)
+
+
+async def test_finished_run_reaps_leftover_background_job(tmp_path):
+    """R03-AC01:正常 finished 收尾也不留活动进程(后台 job 统一收割)。"""
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("任务完成,后台留了个尾巴。"), Usage(2, 2)],
+        ],
+    )
+    result = await env.loop.run("侦察")
+    assert result.status == "finished"
+    [job] = env.bash._jobs.values()
+    assert job.done.is_set() and job.status == "killed"
+    with pytest.raises(ProcessLookupError):
+        os.kill(job.proc.pid, 0)
+    finished = [r for r in audit_records(env) if r["kind"] == "run_finished"]
+    assert finished[0]["payload"]["cleanup"]["cleanup_status"] == "ok"
+    assert verify(env.audit_path)
+
+
+async def test_external_cancel_reaps_and_records_cancelled(tmp_path):
+    """R03-AC01/02:外部取消(非 kill)——收割本 run 资源、落 run_finished
+    (status=cancelled)后再如实上传 CancelledError(该路径此前无终态记录)。"""
+    observer = _HookObserver()
+    started = asyncio.Event()
+    observer.action = started.set
+
+    async def hang(_messages):
+        await asyncio.Event().wait()  # 永不返回,直到外部取消
+        return []  # pragma: no cover
+
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            hang,
+        ],
+        loop_kw={"observer": observer},
+    )
+    observer.loop = env.loop
+
+    task = asyncio.create_task(env.loop.run("长跑"))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    for _ in range(1000):
+        if env.backend.chat_count >= 2:
+            break
+        await asyncio.sleep(0.005)
+    assert env.backend.chat_count == 2
+
+    task.cancel()  # 外部取消:非 loop.kill
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    [job] = env.bash._jobs.values()
+    assert job.done.is_set() and job.status == "killed"
+    with pytest.raises(ProcessLookupError):
+        os.kill(job.proc.pid, 0)
+
+    records = audit_records(env)
+    kinds = [r["kind"] for r in records]
+    assert kinds[-1] == "run_finished"
+    finished = records[-1]["payload"]
+    assert finished["status"] == "cancelled"  # 新增终态记录(此前该路径无)
+    assert finished["cleanup"]["cleanup_status"] == "ok"
+    assert env.loop.status == "cancelled"
+    assert verify(env.audit_path)
+
+
+async def test_external_cancel_survives_repeated_cancel(tmp_path):
+    """R03 取消安全:收割进行中再次取消,清理仍跑完(shield 兜底,二次 Ctrl-C 形)。"""
+    observer = _HookObserver()
+    started = asyncio.Event()
+    observer.action = started.set
+
+    async def hang(_messages):
+        await asyncio.Event().wait()
+        return []  # pragma: no cover
+
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            hang,
+        ],
+        loop_kw={"observer": observer},
+    )
+    observer.loop = env.loop
+
+    real_aclose = env.bash.aclose
+
+    async def slow_aclose():
+        await asyncio.sleep(0.3)  # 拉开收割窗口,给二次取消留时机
+        return await real_aclose()
+
+    env.bash.aclose = slow_aclose
+
+    task = asyncio.create_task(env.loop.run("长跑"))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    for _ in range(1000):
+        if env.backend.chat_count >= 2:
+            break
+        await asyncio.sleep(0.005)
+
+    task.cancel()
+    await asyncio.sleep(0.1)  # 收割在途中
+    task.cancel()  # 二次取消:不得打断清理
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    [job] = env.bash._jobs.values()
+    assert job.done.is_set() and job.status == "killed"  # 收割完整落地
+    with pytest.raises(ProcessLookupError):
+        os.kill(job.proc.pid, 0)
+    records = audit_records(env)
+    assert records[-1]["kind"] == "run_finished"
+    assert records[-1]["payload"]["status"] == "cancelled"
+    assert verify(env.audit_path)
+
+
+async def test_cancel_during_foreground_command_reaps(tmp_path):
+    """R03-AC02 主环面:前台命令执行中外部取消——看管不死,子进程被收割定账。"""
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-fg",
+                    "run_command",
+                    {"command": "sleep 31337", "timeout_seconds": None},
+                ),
+                Usage(1, 1),
+            ],
+        ],
+    )
+    task = asyncio.create_task(env.loop.run("前台长跑"))
+    for _ in range(1000):
+        if env.bash._jobs:
+            break
+        await asyncio.sleep(0.005)
+    [job] = env.bash._jobs.values()
+    pid = job.proc.pid
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    assert job.done.is_set() and job.status == "killed"
+    assert job.manifest is not None  # 终态账目定稿
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    records = audit_records(env)
+    assert records[-1]["kind"] == "run_finished"
+    assert records[-1]["payload"]["status"] == "cancelled"
+    assert verify(env.audit_path)
+
+
+async def test_no_dispatch_after_terminal(tmp_path):
+    """R03 停止派发闸:run 终态后 _execute_tool 拒绝执行(不起新进程)。"""
+    env = make_loop(tmp_path, [[TextDelta("完。"), Usage(1, 1)]])
+    result = await env.loop.run("闲聊")
+    assert result.status == "finished"
+
+    refused = await env.loop._execute_tool(
+        ToolCall("late", "run_command", {"command": "echo late"})
+    )
+    assert "error" in refused
+    assert env.bash._jobs == {}  # 未注册新 job、未起进程
+
+
+async def test_kill_reap_has_total_time_bound(tmp_path, monkeypatch):
+    """R03-AC05:kill 收尾收割有总时间上界(不再按 job 逐个 5s 累计)。"""
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-bg",
+                    "run_command",
+                    {"command": "sleep 31337", "background": True},
+                ),
+                ToolCall(
+                    "tc-bg2",
+                    "run_command",
+                    {"command": "sleep 31338", "background": True},
+                ),
+                ToolCall(
+                    "tc-bg3",
+                    "run_command",
+                    {"command": "sleep 31339", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("挂着。"), Usage(1, 1)],
+        ],
+        loop_kw={"wait_on_finish": True},
+    )
+    task = asyncio.create_task(env.loop.run("长跑"))
+    for _ in range(1000):
+        if len(env.bash._jobs) == 3 and env.loop.status == "idle":
+            break
+        await asyncio.sleep(0.005)
+    assert len(env.bash._jobs) == 3
+    pids = [job.proc.pid for job in env.bash._jobs.values()]
+
+    # 打桩:SIGKILL 落不下去 + 收割上界收紧;旧实现将按 job 烧 3×5s
+    monkeypatch.setattr(BashTool, "_kill_group", staticmethod(lambda _job: None))
+    monkeypatch.setattr("foam.tools.bash.CLOSE_REAP_TIMEOUT_SECONDS", 0.3)
+    start = asyncio.get_event_loop().time()
+    try:
+        env.loop.kill("定时 kill")
+        result = await asyncio.wait_for(task, timeout=10)
+        elapsed = asyncio.get_event_loop().time() - start
+        assert result.status == "killed"
+        assert elapsed < 5  # AC05:总上界(0.3s + 裕量),不是 3×5s 逐个累计
+        kills = [r for r in audit_records(env) if r["kind"] == "kill_switch"]
+        assert kills[0]["payload"]["cleanup"]["cleanup_status"] == "partial"
+        assert len(kills[0]["payload"]["cleanup"]["remaining_resources"]) == 3
+    finally:
+        monkeypatch.undo()
+        for pid in pids:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        await asyncio.gather(
+            *(job.done.wait() for job in env.bash._jobs.values()),
+            return_exceptions=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# R03-B:runtime 统一关闭服务(close_run 顺序 / 幂等 / 失败如实)
+# ---------------------------------------------------------------------------
+
+
+class _FakeHandle:
+    """记录关闭调用顺序的假句柄(aclose 或 close/release 两态)。"""
+
+    def __init__(self, events: list[str], name: str, report: dict | None = None):
+        self._events = events
+        self._name = name
+        self._report = report or {
+            "cleanup_status": "ok",
+            "remaining_resources": [],
+            "errors": [],
+        }
+
+    async def aclose(self):
+        self._events.append(f"aclose:{self._name}")
+        return self._report
+
+    def close(self):
+        self._events.append(f"close:{self._name}")
+
+    def release(self):
+        self._events.append(f"release:{self._name}")
+
+
+def _make_runtime(events: list[str], **overrides):
+    from foam.runtime import RunRuntime
+
+    handles = {
+        name: _FakeHandle(events, name, overrides.get(f"{name}_report"))
+        for name in (
+            "bash", "session", "state", "engagement", "audit", "backend", "lock"
+        )
+    }
+    runtime = RunRuntime(**handles)
+    return runtime, handles
+
+
+async def test_close_run_order_and_idempotent():
+    """R03 D5 顺序:收割→state→engagement→审计最后→后端→放锁;二次调用短路。"""
+    from foam.runtime import close_run
+
+    events: list[str] = []
+    runtime, _ = _make_runtime(events)
+    first = await close_run(runtime, run_id="t", reason="测试")
+    assert first["cleanup_status"] == "ok"
+    assert events == [
+        "aclose:bash",
+        "aclose:session",
+        "close:state",
+        "close:engagement",
+        "close:audit",  # 审计永远最后
+        "aclose:backend",
+        "release:lock",
+    ]
+    second = await close_run(runtime, run_id="t", reason="测试")
+    assert second is first
+    assert events.count("close:audit") == 1  # 无副作用
+
+
+async def test_close_run_partial_still_closes_everything():
+    """R03-AC06:收割失败不阻断后续关闭;残留与异常如实进报告。"""
+    from foam.runtime import cleanup_warning_text, close_run
+
+    events: list[str] = []
+    partial = {
+        "cleanup_status": "partial",
+        "remaining_resources": [{"kind": "bash_job", "job_id": "j1", "pid": 4242}],
+        "errors": ["job j1: 杀进程组异常: boom"],
+    }
+    runtime, _ = _make_runtime(events, bash_report=partial)
+    result = await close_run(runtime, run_id="t", reason="测试")
+    assert result["cleanup_status"] == "partial"
+    assert result["remaining_resources"] == partial["remaining_resources"]
+    assert result["errors"] == ["job j1: 杀进程组异常: boom"]
+    # 失败不跳过任何后续步骤
+    assert events == [
+        "aclose:bash",
+        "aclose:session",
+        "close:state",
+        "close:engagement",
+        "close:audit",
+        "aclose:backend",
+        "release:lock",
+    ]
+    warning = cleanup_warning_text(result)
+    assert warning is not None and "cleanup_pending" in warning
+    assert "j1" in warning
+    assert cleanup_warning_text({"cleanup_status": "ok"}) is None
+
+
+async def test_close_run_tolerates_missing_handles():
+    """R03:装配中途失败形状——句柄全 None 也走同一关闭面,不炸。"""
+    from foam.runtime import RunRuntime, close_run
+
+    result = await close_run(RunRuntime(), run_id="t", reason="装配失败")
+    assert result["cleanup_status"] == "ok"
+    assert result["remaining_resources"] == []

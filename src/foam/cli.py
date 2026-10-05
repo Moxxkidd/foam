@@ -74,6 +74,20 @@ R02-B(2026-10-06,CLI 持久恢复):
   mark_closed 置 closed(re-finish 刷新 closed_at);killed/crash 保持
   active + 锁随进程释放 = 中断可恢复(文档化边界,资源收口归 R03)。
 
+R03(2026-10-06,统一运行时资源关闭,E04 收口):
+
+- **统一关闭面**:`foam.runtime.close_run` 为唯一关闭入口——收割(bash/
+  session aclose,各自有界)→ state → engagement → **审计最后** → 后端 →
+  放锁;全程幂等,装配中途失败(句柄随建随挂进 ``_Runtime``)也走同一面。
+  修复旧 `_drive` finally 先关审计后收割会话的倒挂,与 file 流锁拒绝路径
+  的 backend 泄漏;`_drive` 的 backend 形参退役(归 runtime 持有)。
+- **cleanup_pending(D2)**:清理报告 partial 时 stderr 打
+  ``[cleanup_pending]`` 警示行,不粉饰「全部完成」;退出码契约不变
+  (0/130/1/2)。loop 终态记录(run_finished/kill_switch)携 cleanup
+  载荷;外部取消路径新增 run_finished(status=cancelled)(R03.md §7)。
+- **停止派发**:loop 终态置派发闸拒绝新工具调用;bash/session 在 aclose
+  后拒绝新命令/新会话(工具层兜底)。
+
 本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)→
 WP-14b(headless 双通道与 resume 对账)。
 """
@@ -127,6 +141,7 @@ from foam.replay import (
     recover_objective,
     recover_scope_record,
 )
+from foam.runtime import RunRuntime, cleanup_warning_text, close_run
 from foam.state.files import (
     Engagement,
     EngagementLock,
@@ -560,36 +575,47 @@ def _build_backend(args: argparse.Namespace) -> LLMBackend:
 
 
 @dataclass
-class _Runtime:
-    """一次 run/resume 的装配产物(finally 里按序关停)。"""
+class _Runtime(RunRuntime):
+    """一次 run/resume 的装配产物(R03:资源句柄集归 RunRuntime,close_run 收口)。"""
 
-    engagement: Engagement
-    audit: AuditLog
-    session: SessionTool
-    state: StateTool
-    loop: AgentLoop
-    toolmap_line: str
+    toolmap_line: str = ""
     #: 装配时落链的 scope_loaded 记录(R02:仅 --objective 覆盖时的提交标记点)。
-    scope_loaded_record: dict[str, Any]
+    scope_loaded_record: dict[str, Any] | None = None
+
+
+def _report_cleanup_pending(report: dict[str, Any]) -> None:
+    """D2:cleanup_pending 上 stderr(不粉饰「全部完成」;退出码契约不变)。"""
+    warning = cleanup_warning_text(report)
+    if warning:
+        print(f"[cleanup_pending] {warning}", file=sys.stderr)
 
 
 def _assemble_runtime(
     args: argparse.Namespace,
     *,
-    engagement: Engagement,
+    runtime: _Runtime,
     scope: Scope,
     scope_source: str,
     backend: LLMBackend,
     observer: LoopObserver,
 ) -> _Runtime:
-    """engagement 布局 + 三组工具 + 主环的一次性装配(WP-10 接线点①③)。"""
+    """engagement 布局 + 三组工具 + 主环的一次性装配(WP-10 接线点①③)。
+
+    R03:句柄随建随挂进 ``runtime``——装配中途异常时,已建句柄由调用方经
+    close_run 统一收口(旧实现异常路径泄漏 audit/backend/index 句柄)。
+    """
+    engagement = runtime.engagement
     audit = AuditLog(engagement.paths.audit_jsonl)
-    scope_loaded_record = audit.append(
+    runtime.audit = audit
+    runtime.scope_loaded_record = audit.append(
         KIND_SCOPE_LOADED, scope_payload(scope, scope_source)
     )
     bash = BashTool(engagement.paths.outputs)
+    runtime.bash = bash
     session = SessionTool(engagement.paths.outputs / "sessions")
+    runtime.session = session
     state = StateTool(engagement)
+    runtime.state = state
     registry = ToolRegistry()
     registry.register_module(BASH_TOOL_SCHEMAS, bash.dispatch)
     registry.register_module(SESSION_TOOL_SCHEMAS, session.dispatch)
@@ -621,25 +647,19 @@ def _assemble_runtime(
         max_rounds=args.max_rounds,
         **loop_kwargs,
     )
-    return _Runtime(
-        engagement=engagement,
-        audit=audit,
-        session=session,
-        state=state,
-        loop=loop,
-        toolmap_line=render_startup_line(scan),
-        scope_loaded_record=scope_loaded_record,
-    )
+    runtime.loop = loop
+    runtime.toolmap_line = render_startup_line(scan)
+    runtime.backend = backend
+    return runtime
 
 
 async def _drive(
     runtime: _Runtime,
     *,
     objective: str,
-    backend: LLMBackend,
     interject: str | None = None,
 ) -> int:
-    """驱动主环到底:SIGINT 两次语义、收尾关停、退出码映射。"""
+    """驱动主环到底:SIGINT 两次语义、统一关闭(close_run)、退出码映射。"""
     loop = runtime.loop
     if interject:
         loop.interject(interject)
@@ -664,19 +684,20 @@ async def _drive(
         loop.kill("操作员 Ctrl-C")
 
     running_loop.add_signal_handler(signal.SIGINT, _on_sigint)
+    result: RunResult | None = None
     try:
-        result: RunResult = await loop.run(objective)
+        result = await loop.run(objective)
     finally:
         running_loop.remove_signal_handler(signal.SIGINT)
-        runtime.audit.close()
-        runtime.state.close()
-        runtime.engagement.close()
-        # 会话关停幂等:kill 路径 loop 已 aclose,此处兜底 finished/error 路径。
-        await runtime.session.aclose()
-        await backend.aclose()
+        if result is not None and result.status == "finished":
+            # R02:finished 置 closed(re-finish 刷新 closed_at);元数据收尾
+            # 先于 close_run(写 engagement.json 时索引/审计仍在开)
+            runtime.engagement.mark_closed()
+        # R03 统一关闭面:收割→state→engagement→审计最后→后端→放锁;
+        # 修复旧 finally 先关审计后收割的倒挂;幂等(装配失败路径由命令层调)
+        report = await close_run(runtime, run_id="cli", reason="run 收尾")
+        _report_cleanup_pending(report)
 
-    if result.status == "finished":
-        runtime.engagement.mark_closed()
     print(
         f"\n[run {result.status}] {result.rounds} 轮,"
         f"tokens 输入 {result.input_tokens} / 输出 {result.output_tokens}",
@@ -813,7 +834,10 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
     lock = _acquire_lock_or_report(engagement)
     if lock is None:
         engagement.close()
+        await backend.aclose()  # R03:file 流锁拒绝路径补齐后端关闭(对齐 NL 流)
         return EXIT_USAGE  # AC07:第二写者拒绝
+    runtime = _Runtime(engagement=engagement, backend=backend, lock=lock)
+    driven = False
     try:
         # R02:start 置 active(幂等复开 closed 目录时清 closed_at)
         engagement.mark_active()
@@ -826,9 +850,9 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
             "越界命令将被护栏拒绝并记审计",
             flush=True,
         )
-        runtime = _assemble_runtime(
+        _assemble_runtime(
             args,
-            engagement=engagement,
+            runtime=runtime,
             scope=scope,
             scope_source=str(args.scope),
             backend=backend,
@@ -838,9 +862,13 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
         _append_file_scope_confirm(runtime.audit, scope, str(args.scope), scope_digest)
         # D6 写入点①:file 流装配时落动态段
         _write_scope_section(engagement, scope, str(args.scope), scope_digest)
-        return await _drive(runtime, objective=args.objective, backend=backend)
+        driven = True
+        return await _drive(runtime, objective=args.objective)
     finally:
-        lock.release()
+        if not driven:
+            # 装配中途失败:_drive 未接管,同一关闭面收口(R03;句柄随建随挂)
+            report = await close_run(runtime, run_id="cli", reason="装配失败")
+            _report_cleanup_pending(report)
 
 
 async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
@@ -871,6 +899,8 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
         engagement.close()
         await backend.aclose()
         return EXIT_USAGE  # AC07:第二写者拒绝
+    runtime = _Runtime(engagement=engagement, backend=backend, lock=lock)
+    driven = False
     try:
         # W14b-1:同目录已有冻结 scope → 拒绝(headless 无换 scope 通道,fail-closed)
         if engagement.metadata().get("scope") is not None:
@@ -879,8 +909,6 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
                 "请换 --workdir 或另建 engagement",
                 file=sys.stderr,
             )
-            engagement.close()
-            await backend.aclose()
             return EXIT_USAGE
         audit = AuditLog(engagement.paths.audit_jsonl)
         try:
@@ -888,8 +916,6 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
         except ScopeCompileError as exc:
             print(f"[错误] scope 编译失败: {exc}", file=sys.stderr)
             audit.close()
-            engagement.close()
-            await backend.aclose()
             return EXIT_USAGE  # W14b-4:编译失败归 2,无进程内重试(Q6)
         try:
             freeze_scope(
@@ -898,8 +924,6 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
         except OSError as exc:
             print(f"[错误] scope 冻结落盘失败: {exc}", file=sys.stderr)
             audit.close()
-            engagement.close()
-            await backend.aclose()
             return EXIT_ERROR  # 写盘故障归 1(W14b-4)
         audit.close()
 
@@ -920,17 +944,21 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
             print(f"  {rule}", flush=True)
         if not compilation.rules:
             print("  (空——任何网络目标都会被拒)", flush=True)  # Q9 醒目行
-        runtime = _assemble_runtime(
+        _assemble_runtime(
             args,
-            engagement=engagement,
+            runtime=runtime,
             scope=compilation.scope,
             scope_source=str(confirmed_path),
             backend=backend,
             observer=_CliObserver(),
         )
-        return await _drive(runtime, objective=args.objective, backend=backend)
+        driven = True
+        return await _drive(runtime, objective=args.objective)
     finally:
-        lock.release()
+        if not driven:
+            # 编译/冻结/装配失败:同一关闭面收口(R03;编译期自建 audit 已就地关)
+            report = await close_run(runtime, run_id="cli", reason="装配失败")
+            _report_cleanup_pending(report)
 
 
 # ---------------------------------------------------------------------------
@@ -1146,6 +1174,8 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
         briefing,
         record_count,
     ) = prepared
+    runtime = _Runtime(engagement=engagement, lock=lock)
+    driven = False
     try:
         # D6 写入点②:resume 对账完成,动态段幂等重写为恢复后 scope 的渲染。
         _write_scope_section(engagement, scope, scope_source, scope_digest)
@@ -1153,9 +1183,9 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
             backend = backend_factory(args)
             _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
         except ConfigError as exc:
-            engagement.close()
             print(f"[错误] {exc}", file=sys.stderr)
             return EXIT_USAGE
+        runtime.backend = backend
 
         print(
             f"[resume] engagement={engagement.paths.root} backend={args.backend} "
@@ -1163,9 +1193,9 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
             f"{args.recent_rounds} 轮)",
             flush=True,
         )
-        runtime = _assemble_runtime(
+        _assemble_runtime(
             args,
-            engagement=engagement,
+            runtime=runtime,
             scope=scope,
             scope_source=scope_source,
             backend=backend,
@@ -1194,11 +1224,13 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
             engagement.commit_revision(
                 objective=args.objective, marker=runtime.scope_loaded_record
             )
-        return await _drive(
-            runtime, objective=objective, backend=backend, interject=briefing
-        )
+        driven = True
+        return await _drive(runtime, objective=objective, interject=briefing)
     finally:
-        lock.release()
+        if not driven:
+            # 后端装配/装配失败:同一关闭面收口(R03;engagement 与锁在此释放)
+            report = await close_run(runtime, run_id="cli", reason="装配失败")
+            _report_cleanup_pending(report)
 
 
 # ---------------------------------------------------------------------------

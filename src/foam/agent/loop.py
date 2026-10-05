@@ -338,7 +338,12 @@ class LoopObserver:
 
 @dataclass(frozen=True)
 class RunResult:
-    """一次 run 的结局。status: finished / killed / error。"""
+    """一次 run 的结局。status: finished / killed / error / cancelled。
+
+    ``cancelled``(R03 新增):外部取消(asyncio CancelledError,非 kill
+    switch)——loop 收割并落 run_finished 后如实向上重抛,RunResult 本身
+    不返回给调用方,仅用于终态记录载荷。
+    """
 
     status: str
     summary: str
@@ -436,6 +441,11 @@ class AgentLoop:
         self._pause_requested = False
         self._kill_requested = False
         self._kill_reason = ""
+        # R03 停止派发闸:任何终态路径置位后,_execute_tool 拒绝执行新调用
+        # (工具层 aclose 拒绝为兜底;正常流程终态后不会再有调用,此为防线)。
+        self._dispatch_stopped = False
+        # R03 收割报告(kill 路径先收,统一终态面复用,不重复收割)。
+        self._cleanup_report: dict[str, Any] | None = None
         self._wake = asyncio.Event()
         self._run_task: asyncio.Task[None] | None = None
         self._status = "idle"
@@ -492,7 +502,7 @@ class AgentLoop:
         注意(定案 D10):AgentLoop 不加公开 scope 读取面——无 property、无
         getter;loop 内的 Scope 是执行面私有状态,只能经本方法原子换。
         """
-        if self._status in ("finished", "killed", "error"):
+        if self._status in ("finished", "killed", "error", "cancelled"):
             raise RuntimeError("run 已终态,不可更换 scope(D2)")
         self._scope = scope
 
@@ -522,13 +532,39 @@ class AgentLoop:
             result = await self._main()
         except asyncio.CancelledError:
             if not self._kill_requested:
-                self._run_task = None
-                raise  # 外部取消:如实向上传
+                # 外部取消(R03):不直接裸传——先走统一终态面(停止派发、收割、
+                # run_finished(status=cancelled)),再如实重抛。该路径此前无
+                # 终态记录,是 R03 新增(kind 不变,重放兼容;见 R03.md §7)。
+                result = RunResult(
+                    status="cancelled",
+                    summary="",
+                    rounds=self._rounds,
+                    input_tokens=self._total_input,
+                    output_tokens=self._total_output,
+                    error="外部取消(asyncio CancelledError)",
+                )
+                result = await self._finish(result)
+                raise asyncio.CancelledError from None
             result = await self._finalize_killed()
         except BackendError as exc:
             result = self._finalize_error(str(exc))
         except Exception as exc:  # 非预期异常:如实记 error,不炸 headless
             result = self._finalize_error(f"主环内部异常: {exc!r}")
+        return await self._finish(result)
+
+    async def _finish(self, result: RunResult) -> RunResult:
+        """统一终态面(R03 D6):停止派发 → 收割 → run_finished → 置状态。
+
+        任何终态路径(finished/error/max_rounds/killed/外部取消)都先收割本
+        run 进程资源再落终态记录;收割报告进 run_finished 载荷(D2,kind
+        不变)。收割经 shield 兜底:外部取消后再被取消(二次 kill/Ctrl-C)
+        清理仍跑完。kill 路径的 kill_switch 记录由 _finalize_killed 先落
+        (钉死顺序:kill_switch < run_finished),此处收割为幂等空转。
+        """
+        self._dispatch_stopped = True
+        cleanup = self._cleanup_report
+        if cleanup is None:
+            cleanup = await self._reap_shielded()
         self._audit.append(
             KIND_RUN_FINISHED,
             {
@@ -541,6 +577,7 @@ class AgentLoop:
                     result.summary.encode("utf-8")
                 ).hexdigest(),
                 "final_text_chars": len(result.summary),
+                "cleanup": cleanup,
             },
         )
         self._set_status(result.status)
@@ -777,6 +814,10 @@ class AgentLoop:
     # ---------- 工具执行 ----------
 
     async def _execute_tool(self, call: ToolCall) -> dict[str, Any]:
+        # R03 停止派发闸:终态后不再执行任何工具(防线;正常流程到不了这里,
+        # 工具层 aclose 拒绝是兜底)。不开卡不上屏:调用从未发生。
+        if self._dispatch_stopped:
+            return {"error": "run 已收尾,派发已停止;该工具调用未执行(R03)"}
         self._observer.on_tool_call(call)
         if call.name == "run_command":
             command = call.arguments.get("command")
@@ -928,33 +969,98 @@ class AgentLoop:
 
     # ---------- 收尾 ----------
 
+    async def _reap_resources(self) -> dict[str, Any]:
+        """统一收割本 run 进程资源(R03):bash + session 各自 aclose(幂等、有界)。
+
+        返回合并报告(cleanup_status/remaining_resources/errors,另含分层的
+        bash/session 子报告),进 run_finished 与 kill_switch 载荷(D2);工具层
+        异常不裸奔——如实记 errors 继续(AC06)。
+        """
+        remaining: list[dict[str, Any]] = []
+        errors: list[str] = []
+        sub: dict[str, Any] = {}
+        for label, tool in (("bash", self._bash), ("session", self._session)):
+            if tool is None:
+                sub[label] = None
+                continue
+            try:
+                report = await tool.aclose()
+            except Exception as exc:
+                report = {"error": f"{label} 收割异常: {exc!r}"}
+                errors.append(report["error"])
+            if report:
+                remaining.extend(report.get("remaining_resources", []))
+                errors.extend(report.get("errors", []))
+            # 旧式 None 返回(测试桩)按 ok 处理
+            sub[label] = report or {"cleanup_status": "ok"}
+        return {
+            "cleanup_status": "partial" if (remaining or errors) else "ok",
+            "remaining_resources": remaining,
+            "errors": errors,
+            **sub,
+        }
+
+    async def _reap_shielded(self) -> dict[str, Any]:
+        """取消安全的收割:run 任务被(反复)取消时收割仍跑完(R03 清理必须落地)。
+
+        外部取消后的收尾 await 可能被再次取消(二次 kill/Ctrl-C);shield 护住
+        收割任务本身,外层被取消只重等不中断(收割有总上界,不会无限挂起)。
+        """
+        task = asyncio.ensure_future(self._reap_resources())
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue  # 再次取消不打断收割;继续等它完成
+        return task.result()
+
     async def _finalize_killed(self) -> RunResult:
-        """kill 清理:杀全部活动 job、关闭全部 PTY 会话(均尽力而为)、写审计。"""
-        killed_jobs: list[dict[str, Any]] = []
+        """kill 清理:停止派发、统一收割(总上界,不再按 job 逐个 5s 累计)、写审计。"""
+        self._dispatch_stopped = True
+        running_before: list[str] = []
         try:
             jobs = await self._bash.list_jobs()
-            for entry in jobs.get("jobs", []):
-                if entry.get("status") != "running":
-                    continue
-                outcome = await self._bash.kill_job(entry["job_id"])
+            running_before = [
+                entry["job_id"]
+                for entry in jobs.get("jobs", [])
+                if entry.get("status") == "running"
+            ]
+        except (OSError, RuntimeError):
+            running_before = []
+        cleanup = await self._reap_shielded()
+        self._cleanup_report = cleanup  # 统一终态面(_finish)复用,不重复收割
+        killed_jobs: list[dict[str, Any]] = []
+        try:
+            after = {
+                entry["job_id"]: entry
+                for entry in (await self._bash.list_jobs()).get("jobs", [])
+            }
+            for job_id in running_before:
+                entry = after.get(job_id, {})
                 killed_jobs.append(
                     {
-                        "job_id": entry["job_id"],
-                        "status": outcome.get("status"),
-                        "error": outcome.get("error"),
+                        "job_id": job_id,
+                        "status": entry.get("status"),
+                        "error": entry.get("error"),
                     }
                 )
-        except (BackendError, OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError) as exc:
             killed_jobs.append({"error": f"清理异常: {exc!r}"})
-        # WP-10 接线:kill 清理面扩到会话层(WP-05 aclose 幂等,重复调用安全)。
+        # WP-10 接线:kill 清理面含会话层(aclose 幂等,重复调用安全)。
         sessions_aclose: str | None = None
         if self._session is not None:
-            try:
-                await self._session.aclose()
+            session_report = cleanup.get("session") or {}
+            if session_report.get("cleanup_status", "ok") == "ok":
                 sessions_aclose = "ok"
-            except (OSError, RuntimeError) as exc:
-                sessions_aclose = f"清理异常: {exc!r}"
-        payload: dict[str, Any] = {"reason": self._kill_reason, "jobs": killed_jobs}
+            else:
+                sessions_aclose = session_report.get(
+                    "error"
+                ) or ";".join(cleanup["errors"]) or "partial"
+        payload: dict[str, Any] = {
+            "reason": self._kill_reason,
+            "jobs": killed_jobs,
+            "cleanup": cleanup,
+        }
         if sessions_aclose is not None:
             payload["sessions_aclose"] = sessions_aclose
         self._audit.append(KIND_KILL_SWITCH, payload)
