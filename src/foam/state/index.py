@@ -415,13 +415,16 @@ class Index:
 
     @staticmethod
     def _order_by(kind: str) -> str:
+        # R04(D1):末尾 t.id 兜底——并列(同端口 tcp/udp、同用户不同 secret、
+        # 同 kind 不同标题、秒级 ts 并列)时排序确定,分页跨页不重不漏;
+        # 只影响并列行的相对顺序,输出字段与签名不变。
         return {
-            "hosts": "t.ip",
-            "ports": "h.ip, t.port",
-            "creds": "h.ip, t.username",
-            "vulns": "h.ip, t.kind",
-            "loot": "t.ts DESC",
-            "notes": "t.ts DESC",
+            "hosts": "t.ip, t.id",
+            "ports": "h.ip, t.port, t.id",
+            "creds": "h.ip, t.username, t.id",
+            "vulns": "h.ip, t.kind, t.id",
+            "loot": "t.ts DESC, t.id",
+            "notes": "t.ts DESC, t.id",
         }[kind]
 
     # ---------- 汇总(ENGAGEMENT.md / 报告用) ----------

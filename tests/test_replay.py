@@ -9,7 +9,10 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
+
+import pytest
 
 from foam.agent.loop import KIND_RUN_FINISHED, KIND_RUN_STARTED
 from foam.agent.scope_compiler import scope_event_payload
@@ -492,3 +495,136 @@ def test_resume_briefing_without_scope_updated_unchanged(tmp_path):
     briefing = build_resume_briefing(records, recent_rounds=2)
     assert "scope_updated" not in briefing
     assert "nmap -Pn --top-ports 100 127.0.0.1" in briefing  # 原有内容照常
+
+
+# ---------------------------------------------------------------------------
+# R04-A:报告全量分页与真实统计(E05 回归)
+# ---------------------------------------------------------------------------
+
+_R04_KINDS = ("hosts", "ports", "creds", "vulns", "loot", "notes")
+_R04_TIERS = (0, 1, 500, 501, 1001)
+# 文档保留网段(RFC 5737 三个 + RFC 5771 MCAST-TEST-NET),1001 条也够独立。
+_R04_DOC_NETS = ("192.0.2", "198.51.100", "203.0.113", "233.252.0")
+# 固定同一时间戳:loot/notes 全量 ts 并列,检验分页排序的确定性。
+_R04_TS = "2026-10-06T00:00:00+00:00"
+
+
+def _r04_token(kind: str, i: int) -> str:
+    return f"TESTONLY-r04-{kind}-{i:04d}"
+
+
+def _r04_doc_ip(i: int) -> str:
+    return f"{_R04_DOC_NETS[i // 254]}.{i % 254 + 1}"
+
+
+def bulk_insert_rows(index: Index, kind: str, n: int) -> dict[str, int]:
+    """R04 测试专用批量入库:单显式事务直写 index 连接(R04.md §7 记录的
+    test-only 例外——1001 行走公共 API 逐行 commit 会拖慢矩阵;生产代码不动)。
+
+    返回六表预期行数(ports/creds/vulns 会带出一个辅助 host)。除
+    hosts/ports(报告仅统计行)外,每行在正文可见字段嵌入唯一 token 供断言。
+    数据刻意制造排序并列:ports 同端口 tcp/udp 成对、creds 同用户不同
+    secret、vulns 同 kind 不同标题、loot/notes 全部同 ts。
+    """
+    expected = dict.fromkeys(_R04_KINDS, 0)
+    expected[kind] = n
+    statements: list[tuple[str, list[tuple]]] = []
+    if kind == "hosts":
+        statements.append((
+            "INSERT INTO hosts(ip, hostname, first_seen, last_seen)"
+            " VALUES (?, NULL, ?, ?)",
+            [(_r04_doc_ip(i), _R04_TS, _R04_TS) for i in range(n)],
+        ))
+    elif kind == "ports":
+        expected["hosts"] = 1
+        statements.append((
+            "INSERT INTO ports(host_id, port, proto) VALUES (?, ?, ?)",
+            [(-1, i // 2 + 1, ("tcp", "udp")[i % 2]) for i in range(n)],
+        ))
+    elif kind == "creds":
+        expected["hosts"] = 1
+        statements.append((
+            "INSERT INTO creds(host_id, username, secret, source, sensitive,"
+            " first_seen) VALUES (?, ?, ?, 'TESTONLY-r04', 1, ?)",
+            [(-1, f"user{i % 9}", _r04_token(kind, i), _R04_TS) for i in range(n)],
+        ))
+    elif kind == "vulns":
+        expected["hosts"] = 1
+        statements.append((
+            "INSERT INTO vulns(host_id, kind, title, confidence, first_seen)"
+            " VALUES (?, ?, ?, 'low', ?)",
+            [
+                (-1, ("cve", "config", "weak")[i % 3], _r04_token(kind, i), _R04_TS)
+                for i in range(n)
+            ],
+        ))
+    elif kind == "loot":
+        statements.append((
+            "INSERT INTO loot(path, kind, note, size_bytes, ts)"
+            " VALUES (?, 'flag', NULL, ?, ?)",
+            [
+                (f"loot/{_r04_token(kind, i)}.txt", i, _R04_TS)
+                for i in range(n)
+            ],
+        ))
+    else:  # notes
+        statements.append((
+            "INSERT INTO notes(ts, text) VALUES (?, ?)",
+            [(_R04_TS, f"第 {_r04_token(kind, i)} 条") for i in range(n)],
+        ))
+
+    conn = index._conn
+    prior = conn.isolation_level
+    conn.isolation_level = None  # 显式事务控制(测试专用)
+    try:
+        conn.execute("BEGIN")
+        host_id = -1
+        if kind in ("ports", "creds", "vulns"):
+            cursor = conn.execute(
+                "INSERT INTO hosts(ip, hostname, first_seen, last_seen)"
+                " VALUES (?, NULL, ?, ?)",
+                (_r04_doc_ip(0), _R04_TS, _R04_TS),
+            )
+            host_id = int(cursor.lastrowid)
+        for sql, rows in statements:
+            if host_id != -1:
+                rows = [(host_id, *rest) for _, *rest in rows]
+            conn.executemany(sql, rows)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = prior
+    return expected
+
+
+@pytest.mark.parametrize("kind", _R04_KINDS)
+@pytest.mark.parametrize("n", _R04_TIERS)
+def test_report_all_pages(tmp_path, kind, n):
+    """R04-AC01/02/03:六类数据各 0/1/500/501/1001 条——报告正文首末齐全、
+    唯一 token 数 == 入库数(不重不漏),统计行 == 六表真实行数。
+
+    期望值全部来自 fixture 自身(token 清单与预期计数),不经被测分页逻辑推算。
+    """
+    root = make_engagement(tmp_path, with_index=False)
+    with Index(root / "index.sqlite") as index:
+        expected = bulk_insert_rows(index, kind, n)
+
+    text = build_report(root)
+
+    # 统计行:- 索引库:hosts H / ports P / ...(AC03:数值 = 六表真实行数)
+    match = re.search(r"^- 索引库:(.+)$", text, re.MULTILINE)
+    assert match, "统计行缺失"
+    stats = {k: int(v) for k, v in re.findall(r"(\w+) (\d+)", match.group(1))}
+    assert stats == expected
+
+    if kind in ("hosts", "ports"):
+        return  # hosts/ports 仅统计行,报告结构不变(R04 D6)
+    # AC01/02:正文渲染的 token 多重集 == 入库 token 集——不重、不漏,
+    # 首条与末条(501/1001 档旧实现静默丢弃处)天然在内,另显式断言。
+    rendered = sorted(re.findall(rf"TESTONLY-r04-{kind}-(\d{{4}})", text))
+    assert rendered == [f"{i:04d}" for i in range(n)]
+    if n:
+        assert _r04_token(kind, 0) in text  # 首条
+        assert _r04_token(kind, n - 1) in text  # 末条

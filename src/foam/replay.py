@@ -44,10 +44,54 @@ from foam.guard.audit import (
     explain,
 )
 from foam.state.files import Engagement
-from foam.state.index import Index
+from foam.state.index import MAX_QUERY_LIMIT, Index
 
 #: 时间线里命令/文本的展示截断长度。
 _CLIP = 120
+
+#: 报告分页每页请求行数(索引层 MAX_QUERY_LIMIT 同值);推进以实际返回
+#: count 为准,不依赖请求值——limit 会被索引层钳制。
+_REPORT_PAGE_LIMIT = MAX_QUERY_LIMIT
+
+
+class ReportGenerationError(RuntimeError):
+    """报告生成失败(分页空页/快照被破坏等);CLI 捕获后以退出码 1 拒绝交付。"""
+
+
+def _paginate_all(index: Index, kind: str) -> tuple[list[dict[str, Any]], int]:
+    """分页遍历 kind 的全部行,返回 (rows, total)。
+
+    - offset 按结果里的实际 count 推进(limit 会被索引层钳制,不能按请求值
+      推进,否则可能跨不过被钳掉的窗口);
+    - total 未耗尽却返回空页 → ReportGenerationError:宁可中止也不死循环
+      或静默截断(R04-B 验收场景);
+    - 各页 total 必须恒定(调用方负责在同一读快照内分页,R04-B);total
+      变化说明快照语义被破坏,同样拒绝。
+    """
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    total: int | None = None
+    while True:
+        page = index.query(kind, limit=_REPORT_PAGE_LIMIT, offset=offset)
+        if total is None:
+            total = int(page["total"])
+        elif int(page["total"]) != total:
+            raise ReportGenerationError(
+                f"{kind} 分页期间 total 由 {total} 变为 {page['total']}:"
+                "读取未处于一致快照,中止生成"
+            )
+        if page["count"] == 0:
+            if offset < total:
+                raise ReportGenerationError(
+                    f"{kind} 分页中途返回空页(offset={offset}, total={total}),"
+                    "中止生成以避免死循环或静默截断"
+                )
+            break
+        rows.extend(page["rows"])
+        offset += int(page["count"])
+        if offset >= total:
+            break
+    return rows, (total or 0)
 
 
 def _clip(text: Any, limit: int = _CLIP) -> str:
@@ -450,11 +494,14 @@ def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
 
     # ---- 索引库各节(缺库降级) ----
     index_rows: dict[str, list[dict[str, Any]]] = {}
+    index_totals: dict[str, int] = {}
     index_missing = not engagement.paths.index_db.is_file()
     if not index_missing:
         with Index(engagement.paths.index_db) as index:
             for kind in ("hosts", "ports", "creds", "vulns", "loot", "notes"):
-                index_rows[kind] = index.query(kind, limit=10000)["rows"]
+                rows, total = _paginate_all(index, kind)
+                index_rows[kind] = rows
+                index_totals[kind] = total
 
     lines += ["## 发现清单(漏洞)", ""]
     if index_missing:
@@ -535,13 +582,14 @@ def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
         f" / 拒答 {stats['refusals']} 次"
     )
     if not index_missing:
-        counts = {
-            kind: len(index_rows[kind])
-            for kind in ("hosts", "ports", "creds", "vulns", "loot", "notes")
-        }
+        # R04(D3):统计与正文同源——来自分页结果里的真实 total,不再用
+        # 被 500 上限截断的 len(rows)。
         lines.append(
             "- 索引库:"
-            + " / ".join(f"{kind} {count}" for kind, count in counts.items())
+            + " / ".join(
+                f"{kind} {index_totals[kind]}"
+                for kind in ("hosts", "ports", "creds", "vulns", "loot", "notes")
+            )
         )
     lines.append("")
     return "\n".join(lines)
