@@ -24,6 +24,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess  # noqa: S403  # 仅用于 pgrep 固定参数探针(R03 测试)
 import threading
 import time
@@ -1346,3 +1347,19 @@ def test_report_success_message_only_after_replace(tmp_path, capsys, monkeypatch
     assert observed["dst_bytes_before"] == original  # 替换前旧文件仍在
     assert "已写入" not in observed["stdout_before"]  # 替换完成前无成功提示
     assert "已写入" in captured.out  # 替换完成后才提示
+
+
+def test_report_export_file_mode_is_owner_only(tmp_path):
+    """R04 收口跟进(2026-10-06):钉住导出报告文件权限为 0o600(POSIX)。
+
+    mkstemp 默认 0600,os.replace 保留该权限——含全值凭证的报告不再以
+    umask 默认(典型 0o644,全局可读)落盘。此行为已随 R04-C 原子导出
+    上线,本测试为事后补钉(pin):对当前实现应立即通过,防未来重构临时
+    文件创建路径时静默回归(决策与 fsync 边界见 R04.md §7 D5 补记)。
+    """
+    rc, workdir = run_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0
+    out_path = tmp_path / "report.md"
+    assert cli_main(["report", str(workdir), "--out", str(out_path)]) == 0
+    mode = stat.S_IMODE(out_path.stat().st_mode)
+    assert mode == 0o600, f"报告含全值凭证,导出权限应为 0o600,实际 {mode:#o}"
