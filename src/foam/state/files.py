@@ -603,18 +603,24 @@ class Engagement:
 
     # ---------- R02:修订提交与恢复对账 ----------
 
-    def _backup_pre_r02(self) -> None:
-        """legacy 目录(meta 无 revision 键)首次新格式提交前的原样备份。
+    def backup_pre_r02(self) -> bool:
+        """legacy 目录(meta 无 revision 键)的原样备份(幂等)。
 
-        只在备份不存在时写(保留最初的升级前状态);备份只供检查,不自动
-        恢复授权(R02 规格 §1/§7)。audit.jsonl 永不在此触及。
+        R02:第一次 R02 写(状态迁移/修订提交)之前调用,把升级前
+        engagement.json 原文留作 ``engagement.json.pre-r02.bak``;已有
+        revision 键(已是新格式)或备份已存在时不动作(保留最初的升级前
+        状态)。备份只供检查,不自动恢复授权(R02 规格 §1/§7);
+        audit.jsonl 永不在此触及。返回是否新建了备份。
         """
+        if "revision" in self.metadata():
+            return False
         backup = self.paths.root / REVISION_BACKUP_NAME
         if backup.exists():
-            return
+            return False
         data = self.paths.metadata.read_bytes()
         backup.write_bytes(data)
         json.loads(data.decode("utf-8"))  # 验证备份可读(坏 meta 直接炸,不写备份)
+        return True
 
     def commit_revision(
         self,
@@ -640,7 +646,7 @@ class Engagement:
         """
         meta = self.metadata()
         if "revision" not in meta:
-            self._backup_pre_r02()
+            self.backup_pre_r02()
         if scope is not None:
             meta["scope"] = {"path": str(scope["path"]), "sha256": str(scope["sha256"])}
         if objective is not None:

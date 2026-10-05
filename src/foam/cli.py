@@ -54,6 +54,26 @@ scope_loaded/scope_confirmed/scope_updated 三 kind(D13,不新增分支),
 (file 流装配时、resume 对账完成时)各经 render_scope_section +
 update_scope_section 落盘(D6,裁定归本片)。
 
+R02-B(2026-10-06,CLI 持久恢复):
+
+- **覆盖持久化(E03 收口)**:resume --scope/--objective 按 R02 提交协议
+  写 engagement.json——确认记录先落链(scope_confirmed),随后
+  commit_revision 原子重写 meta(绝对路径 + 提交标记);再次 plain resume
+  始终恢复最新授权(AC01/02)。仅 --objective 时 marker 指向本次装配的
+  scope_loaded 记录,目标文本的链上锚点是随后的 run_started(崩溃窗口
+  由 reconcile_with_chain 重建)。
+- **单次读盘绑定**:run/resume 装配全程一次 read_bytes,parse/对账/
+  meta/审计/动态段共用同一份字节与其 sha256(消灭 4 读/2 读 TOCTOU 窗口)。
+- **meta 绝对路径**:file 流 engagement.json 记录 resolve 后绝对路径
+  (resume 不依赖 cwd,AC03);审计 payload/动态段 source 仍记 as-given
+  原串(W14b-2 展示口径不变,与 NL 流的既有双轨一致)。
+- **单写者锁**:run/resume 在 create/open 后立即 acquire_engagement_lock,
+  第二写者中文报错 + 退出码 2(AC07);所有退出路径(含 KeyboardInterrupt)
+  finally 释放;只读命令(replay/report)不取锁。
+- **状态生命周期**:start/resume 经 mark_active 置 active;finished 经
+  mark_closed 置 closed(re-finish 刷新 closed_at);killed/crash 保持
+  active + 锁随进程释放 = 中断可恢复(文档化边界,资源收口归 R03)。
+
 本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)→
 WP-14b(headless 双通道与 resume 对账)。
 """
@@ -96,7 +116,7 @@ from foam.config import (
     validate_profile_name,
 )
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_LOADED, AuditLog
-from foam.guard.scope import GuardDecision, Scope, load_scope, scope_payload
+from foam.guard.scope import GuardDecision, Scope, parse_scope, scope_payload
 from foam.replay import (
     build_report,
     build_resume_briefing,
@@ -107,7 +127,12 @@ from foam.replay import (
     recover_objective,
     recover_scope_record,
 )
-from foam.state.files import Engagement
+from foam.state.files import (
+    Engagement,
+    EngagementLock,
+    EngagementLockedError,
+    acquire_engagement_lock,
+)
 from foam.tools.bash import TOOL_SCHEMAS as BASH_TOOL_SCHEMAS
 from foam.tools.bash import BashTool
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
@@ -544,6 +569,8 @@ class _Runtime:
     state: StateTool
     loop: AgentLoop
     toolmap_line: str
+    #: 装配时落链的 scope_loaded 记录(R02:仅 --objective 覆盖时的提交标记点)。
+    scope_loaded_record: dict[str, Any]
 
 
 def _assemble_runtime(
@@ -557,7 +584,9 @@ def _assemble_runtime(
 ) -> _Runtime:
     """engagement 布局 + 三组工具 + 主环的一次性装配(WP-10 接线点①③)。"""
     audit = AuditLog(engagement.paths.audit_jsonl)
-    audit.append(KIND_SCOPE_LOADED, scope_payload(scope, scope_source))
+    scope_loaded_record = audit.append(
+        KIND_SCOPE_LOADED, scope_payload(scope, scope_source)
+    )
     bash = BashTool(engagement.paths.outputs)
     session = SessionTool(engagement.paths.outputs / "sessions")
     state = StateTool(engagement)
@@ -599,6 +628,7 @@ def _assemble_runtime(
         state=state,
         loop=loop,
         toolmap_line=render_startup_line(scan),
+        scope_loaded_record=scope_loaded_record,
     )
 
 
@@ -666,32 +696,72 @@ async def _drive(
 # ---------------------------------------------------------------------------
 
 
-def _create_engagement(args: argparse.Namespace) -> Engagement:
-    """WP-10 接线点①:目录创建走 WP-06 Engagement.create(幂等复开)。"""
+def _create_engagement(
+    args: argparse.Namespace, *, scope_bytes: bytes | None = None
+) -> Engagement:
+    """WP-10 接线点①:目录创建走 WP-06 Engagement.create(幂等复开)。
+
+    R02:file 流 meta 落 resolve 后绝对路径(resume 不依赖 cwd,AC03);
+    审计 payload/动态段的 source 仍是 as-given 原串(本函数只管 meta 口径)。
+    ``scope_bytes`` 把加载期读出的同一份字节绑进 meta 哈希(单次读盘)。
+    """
+    scope_path = _absolute_scope_path(args.scope) if args.scope else None
     if args.workdir:
         root = Path(args.workdir)
         return Engagement.create(
             base_dir=root.parent if str(root.parent) else Path("."),
             objective=args.objective,
-            scope_path=args.scope,
+            scope_path=scope_path,
             engagement_id=root.name,
+            scope_bytes=scope_bytes,
         )
-    return Engagement.create(objective=args.objective, scope_path=args.scope)
+    return Engagement.create(
+        objective=args.objective, scope_path=scope_path, scope_bytes=scope_bytes
+    )
+
+
+def _absolute_scope_path(scope_arg: str) -> str:
+    """meta 落盘口径(R02):as-given 串 resolve 为绝对路径(resume 不依赖 cwd)。"""
+    return str(Path(scope_arg).resolve())
+
+
+def _read_scope_bytes(scope_arg: str) -> tuple[Scope, bytes, str]:
+    """R02 单次读盘绑定:一次 read_bytes → parse_scope + sha256(同步小文件 IO)。
+
+    run/resume 装配共用:解析、meta、审计、动态段绑定同一份字节与其摘要,
+    消灭「多处各自重读、字节可能漂移」的 TOCTOU 窗口。
+    """
+    data = Path(scope_arg).read_bytes()
+    return parse_scope(data.decode("utf-8")), data, hashlib.sha256(data).hexdigest()
+
+
+def _acquire_lock_or_report(engagement: Engagement) -> EngagementLock | None:
+    """R02:取单写者锁;第二写者打印中文报错并返回 None(调用方归退出码 2)。"""
+    try:
+        return acquire_engagement_lock(engagement.paths.root)
+    except EngagementLockedError as exc:
+        print(
+            f"[错误] {exc};并发写会破坏审计链与元数据,已拒绝。"
+            "请确认没有其他 run/resume 进程在跑该目录后重试",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _append_file_scope_confirm(
-    audit: AuditLog, scope: Scope, scope_source: str
-) -> None:
+    audit: AuditLog, scope: Scope, scope_source: str, digest: str
+) -> dict:
     """file 流补写 scope_confirmed(source="file")(Q8:零仪式 ≠ 无审计)。
 
     payload 语义(W14b-2,经 WP-14a scope_event_payload 单源构造):
-    path=as-given 原串(与 scope_loaded.source、engagement.json meta 同串)、
+    path=as-given 原串(与 scope_loaded.source 同串)、
     canonical_sha256=scope 文件字节 sha256(=meta sha256,冻结物=文件本体)、
     四键=scope.summary()。时机(W14b-3):仅命令行显式传 --scope 时补写,
     与 scope_loaded 相邻、run_started 之前。
+    ``digest`` 由调用方经单次读盘算好传入(R02,不二次读盘);返回落链记录
+    (R02 提交标记用)。
     """
-    digest = hashlib.sha256(Path(scope_source).read_bytes()).hexdigest()
-    audit.append(
+    return audit.append(
         KIND_SCOPE_CONFIRMED,
         scope_event_payload(
             scope, source="file", path=scope_source, canonical_sha256=digest
@@ -700,16 +770,16 @@ def _append_file_scope_confirm(
 
 
 def _write_scope_section(
-    engagement: Engagement, scope: Scope, scope_source: str
+    engagement: Engagement, scope: Scope, scope_source: str, digest: str
 ) -> None:
     """ENGAGEMENT.md 动态段写入(D6,cli.py 两写入点共用)。
 
     渲染唯一来源 WP-14d prompts.render_scope_section(经 14a 交付);
     写入经 WP-14a Engagement.update_scope_section(markers 间原子重写,
-    容错附加恢复)。sha256=scope 文件字节 sha256(与 file 流 meta 同口径);
+    容错附加恢复)。sha256=scope 文件字节 sha256(与 file 流 meta 同口径;
+    ``digest`` 由调用方经单次读盘算好传入,R02 不二次读盘);
     frozen_at=写入时刻(resume 对账完成时为幂等重写,仅信息面)。
     """
-    digest = hashlib.sha256(Path(scope_source).read_bytes()).hexdigest()
     section = render_scope_section(
         scope.rules,
         source=scope_source,
@@ -724,7 +794,8 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
     if args.scope_text is not None:
         return await _cmd_run_nl(args, backend_factory)
     try:
-        scope = load_scope(args.scope)
+        # R02 单次读盘绑定:parse/meta/审计/动态段共用同一份字节与其 sha256
+        scope, scope_bytes, scope_digest = _read_scope_bytes(args.scope)
     except (OSError, ValueError) as exc:
         print(f"[错误] scope 加载失败: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -735,33 +806,41 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
         print(f"[错误] {exc}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        engagement = _create_engagement(args)
+        engagement = _create_engagement(args, scope_bytes=scope_bytes)
     except (OSError, ValueError) as exc:
         print(f"[错误] engagement 目录创建失败: {exc}", file=sys.stderr)
         return EXIT_USAGE
-
-    print(
-        f"[run] engagement={engagement.paths.root} backend={args.backend}",
-        flush=True,
-    )
-    print(
-        f"[scope] {len(scope.rules)} 条规则已加载({args.scope});"
-        "越界命令将被护栏拒绝并记审计",
-        flush=True,
-    )
-    runtime = _assemble_runtime(
-        args,
-        engagement=engagement,
-        scope=scope,
-        scope_source=str(args.scope),
-        backend=backend,
-        observer=_CliObserver(),
-    )
-    # Q8:file 流装配后补确认记录(与 scope_loaded 相邻、run_started 之前)
-    _append_file_scope_confirm(runtime.audit, scope, str(args.scope))
-    # D6 写入点①:file 流装配时落动态段
-    _write_scope_section(engagement, scope, str(args.scope))
-    return await _drive(runtime, objective=args.objective, backend=backend)
+    lock = _acquire_lock_or_report(engagement)
+    if lock is None:
+        engagement.close()
+        return EXIT_USAGE  # AC07:第二写者拒绝
+    try:
+        # R02:start 置 active(幂等复开 closed 目录时清 closed_at)
+        engagement.mark_active()
+        print(
+            f"[run] engagement={engagement.paths.root} backend={args.backend}",
+            flush=True,
+        )
+        print(
+            f"[scope] {len(scope.rules)} 条规则已加载({args.scope});"
+            "越界命令将被护栏拒绝并记审计",
+            flush=True,
+        )
+        runtime = _assemble_runtime(
+            args,
+            engagement=engagement,
+            scope=scope,
+            scope_source=str(args.scope),
+            backend=backend,
+            observer=_CliObserver(),
+        )
+        # Q8:file 流装配后补确认记录(与 scope_loaded 相邻、run_started 之前)
+        _append_file_scope_confirm(runtime.audit, scope, str(args.scope), scope_digest)
+        # D6 写入点①:file 流装配时落动态段
+        _write_scope_section(engagement, scope, str(args.scope), scope_digest)
+        return await _drive(runtime, objective=args.objective, backend=backend)
+    finally:
+        lock.release()
 
 
 async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
@@ -787,63 +866,71 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
         print(f"[错误] engagement 目录创建失败: {exc}", file=sys.stderr)
         await backend.aclose()
         return EXIT_USAGE
-    # W14b-1:同目录已有冻结 scope → 拒绝(headless 无换 scope 通道,fail-closed)
-    if engagement.metadata().get("scope") is not None:
-        print(
-            "[错误] 该 engagement 目录已有冻结 scope;headless 无换 scope 通道,"
-            "请换 --workdir 或另建 engagement",
-            file=sys.stderr,
-        )
+    lock = _acquire_lock_or_report(engagement)
+    if lock is None:
         engagement.close()
         await backend.aclose()
-        return EXIT_USAGE
-    audit = AuditLog(engagement.paths.audit_jsonl)
+        return EXIT_USAGE  # AC07:第二写者拒绝
     try:
-        compilation = await compile_scope(args.scope_text, backend, audit=audit)
-    except ScopeCompileError as exc:
-        print(f"[错误] scope 编译失败: {exc}", file=sys.stderr)
+        # W14b-1:同目录已有冻结 scope → 拒绝(headless 无换 scope 通道,fail-closed)
+        if engagement.metadata().get("scope") is not None:
+            print(
+                "[错误] 该 engagement 目录已有冻结 scope;headless 无换 scope 通道,"
+                "请换 --workdir 或另建 engagement",
+                file=sys.stderr,
+            )
+            engagement.close()
+            await backend.aclose()
+            return EXIT_USAGE
+        audit = AuditLog(engagement.paths.audit_jsonl)
+        try:
+            compilation = await compile_scope(args.scope_text, backend, audit=audit)
+        except ScopeCompileError as exc:
+            print(f"[错误] scope 编译失败: {exc}", file=sys.stderr)
+            audit.close()
+            engagement.close()
+            await backend.aclose()
+            return EXIT_USAGE  # W14b-4:编译失败归 2,无进程内重试(Q6)
+        try:
+            freeze_scope(
+                engagement, audit, compilation, source="nl", nl_text=args.scope_text
+            )
+        except OSError as exc:
+            print(f"[错误] scope 冻结落盘失败: {exc}", file=sys.stderr)
+            audit.close()
+            engagement.close()
+            await backend.aclose()
+            return EXIT_ERROR  # 写盘故障归 1(W14b-4)
         audit.close()
-        engagement.close()
-        await backend.aclose()
-        return EXIT_USAGE  # W14b-4:编译失败归 2,无进程内重试(Q6)
-    try:
-        freeze_scope(
-            engagement, audit, compilation, source="nl", nl_text=args.scope_text
-        )
-    except OSError as exc:
-        print(f"[错误] scope 冻结落盘失败: {exc}", file=sys.stderr)
-        audit.close()
-        engagement.close()
-        await backend.aclose()
-        return EXIT_ERROR  # 写盘故障归 1(W14b-4)
-    audit.close()
 
-    # scope.confirmed 文件名按 D1 硬编码(14a 未导出常量,一致性请求 3 声明);
-    # resolve 口径与 freeze_scope 落 meta/payload 的 path 同串(一致性请求 4)。
-    confirmed_path = (engagement.paths.root / "scope.confirmed").resolve()
-    print(
-        f"[run] engagement={engagement.paths.root} backend={args.backend}",
-        flush=True,
-    )
-    # Q6 非交互自动确认的上屏面:canonical 全文([scope] 行 + 规则逐行)。
-    print(
-        f"[scope] 编译完成:{len(compilation.rules)} 条规则已冻结"
-        f"({confirmed_path});越界命令将被护栏拒绝并记审计",
-        flush=True,
-    )
-    for rule in compilation.rules:
-        print(f"  {rule}", flush=True)
-    if not compilation.rules:
-        print("  (空——任何网络目标都会被拒)", flush=True)  # Q9 醒目行
-    runtime = _assemble_runtime(
-        args,
-        engagement=engagement,
-        scope=compilation.scope,
-        scope_source=str(confirmed_path),
-        backend=backend,
-        observer=_CliObserver(),
-    )
-    return await _drive(runtime, objective=args.objective, backend=backend)
+        # scope.confirmed 文件名按 D1 硬编码(14a 未导出常量,一致性请求 3 声明);
+        # resolve 口径与 freeze_scope 落 meta/payload 的 path 同串(一致性请求 4)。
+        confirmed_path = (engagement.paths.root / "scope.confirmed").resolve()
+        print(
+            f"[run] engagement={engagement.paths.root} backend={args.backend}",
+            flush=True,
+        )
+        # Q6 非交互自动确认的上屏面:canonical 全文([scope] 行 + 规则逐行)。
+        print(
+            f"[scope] 编译完成:{len(compilation.rules)} 条规则已冻结"
+            f"({confirmed_path});越界命令将被护栏拒绝并记审计",
+            flush=True,
+        )
+        for rule in compilation.rules:
+            print(f"  {rule}", flush=True)
+        if not compilation.rules:
+            print("  (空——任何网络目标都会被拒)", flush=True)  # Q9 醒目行
+        runtime = _assemble_runtime(
+            args,
+            engagement=engagement,
+            scope=compilation.scope,
+            scope_source=str(confirmed_path),
+            backend=backend,
+            observer=_CliObserver(),
+        )
+        return await _drive(runtime, objective=args.objective, backend=backend)
+    finally:
+        lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -864,13 +951,17 @@ def _resolve_objective(
 
 def _resolve_scope(
     args: argparse.Namespace, meta: dict[str, Any], records: list[dict[str, Any]]
-) -> tuple[Scope, str]:
+) -> tuple[Scope, str, bytes, str]:
     """scope 恢复:--scope > engagement.json(sha256 对账) > 审计链(摘要对账)。
 
-    成功返回 (scope, source);失败抛 ValueError(调用方转明确报错)。
+    成功返回 (scope, source, data, digest)——R02 单次读盘绑定:解析、对账、
+    落盘共用同一份字节(data)与其 sha256(digest);失败抛 ValueError
+    (调用方转明确报错)。
     """
     if args.scope:
-        return load_scope(args.scope), str(args.scope)
+        data = Path(args.scope).read_bytes()
+        scope = parse_scope(data.decode("utf-8"))
+        return scope, str(args.scope), data, hashlib.sha256(data).hexdigest()
 
     scope_meta = meta.get("scope")
     if scope_meta:
@@ -880,13 +971,14 @@ def _resolve_scope(
                 f"engagement.json 记录的 scope 文件不存在:{path};"
                 "请用 --scope 显式指定(将重新记审计)"
             )
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        data = path.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
         if digest != scope_meta.get("sha256"):
             raise ValueError(
                 f"scope 文件 {path} 与 engagement.json 记录的 sha256 不符"
                 "(文件已变更);如确为重新授权,请用 --scope 显式指定"
             )
-        return load_scope(path), str(path)
+        return parse_scope(data.decode("utf-8")), str(path), data, digest
 
     record = recover_scope_record(records)
     if record is None:
@@ -898,7 +990,8 @@ def _resolve_scope(
     path = Path(str(record.get("source") or ""))
     if not path.is_file():
         raise ValueError(f"审计链记录的 scope 文件不存在:{path};请用 --scope 显式指定")
-    scope = load_scope(path)
+    data = path.read_bytes()
+    scope = parse_scope(data.decode("utf-8"))
     summary = scope.summary()
     mismatched = [
         key
@@ -910,16 +1003,19 @@ def _resolve_scope(
             f"scope 文件 {path} 的解析结果与审计链记录不符(字段 {mismatched});"
             "如确为重新授权,请用 --scope 显式指定"
         )
-    return scope, str(path)
+    return scope, str(path), data, hashlib.sha256(data).hexdigest()
 
 
 def _resume_preflight(
     args: argparse.Namespace,
-) -> tuple[Engagement, Scope, str, str, str, int] | int:
-    """resume 的同步前置:目录/审计链校验、objective/scope 恢复、legacy 修复。
+) -> tuple[Engagement, EngagementLock, Scope, str, str, str, str, int] | int:
+    """resume 的同步前置:目录/审计链校验、单写者锁、meta↔链对账、
+    objective/scope 恢复、legacy 修复。
 
-    成功返回 (engagement, scope, scope_source, objective, briefing, 历史记录数);
-    失败打印明确报错并返回退出码(小文件 IO 集中在此同步函数,不进协程)。
+    成功返回 (engagement, lock, scope, scope_source, scope_digest, objective,
+    briefing, 历史记录数)——lock 已由本函数持有,调用方负责在所有退出路径
+    释放;失败打印明确报错、释放已取资源并返回退出码(小文件 IO 集中在此
+    同步函数,不进协程)。
     """
     root = Path(args.engagement_dir)
     if not root.is_dir():
@@ -946,6 +1042,18 @@ def _resume_preflight(
         return EXIT_ERROR
     records = read_records(audit_path)
 
+    engagement: Engagement | None = None
+    lock: EngagementLock | None = None
+
+    def _abort(rc: int, message: str) -> int:
+        if lock is not None:
+            lock.release()
+        if engagement is not None:
+            engagement.close()
+        if message:
+            print(message, file=sys.stderr)
+        return rc
+
     meta: dict[str, Any] = {}
     metadata_path = root / "engagement.json"
     if metadata_path.is_file():
@@ -954,46 +1062,73 @@ def _resume_preflight(
         except json.JSONDecodeError as exc:
             print(f"[错误] engagement.json 无法解析:{exc}", file=sys.stderr)
             return EXIT_USAGE
-
-    objective = _resolve_objective(args, meta, records)
-    if not objective:
-        print(
-            "[错误] 无法确定 objective(无 engagement.json 且审计链无 "
-            "run_started);请用 --objective 显式给出",
-            file=sys.stderr,
-        )
-        return EXIT_USAGE
-    try:
-        scope, scope_source = _resolve_scope(args, meta, records)
-    except (OSError, ValueError) as exc:
-        print(f"[错误] scope 恢复失败: {exc}", file=sys.stderr)
-        return EXIT_USAGE
-
-    # 目录完整性:有 engagement.json 严格校验;legacy 目录(无元数据)用恢复
-    # 出的 objective/scope 走 create 幂等补齐布局(不动任何已有文件)。
-    if metadata_path.is_file():
+        # 目录完整性:有 engagement.json 严格校验
         engagement = Engagement.open(root)
         layout_problems = engagement.validate()
         if layout_problems:
-            print(
+            return _abort(
+                EXIT_USAGE,
                 "[错误] engagement 目录不完整:" + ";".join(layout_problems),
-                file=sys.stderr,
             )
-            return EXIT_USAGE
-    else:
+        # R02:写者动作(对账重建/修订提交)前先取单写者锁(AC07)
+        lock = _acquire_lock_or_report(engagement)
+        if lock is None:
+            return _abort(EXIT_USAGE, "")
+        try:
+            # R02 恢复对账:marker 与链一致 → 接受;链领先(崩溃窗口)→ 从链
+            # 重建投影;截尾/分叉 → ValueError 明确拒绝(完整性存疑,归 1)
+            meta = engagement.reconcile_with_chain(records)
+        except ValueError as exc:
+            return _abort(EXIT_ERROR, f"[错误] {exc}")
+
+    objective = _resolve_objective(args, meta, records)
+    if not objective:
+        return _abort(
+            EXIT_USAGE,
+            "[错误] 无法确定 objective(无 engagement.json 且审计链无 "
+            "run_started);请用 --objective 显式给出",
+        )
+    try:
+        scope, scope_source, scope_bytes, scope_digest = _resolve_scope(
+            args, meta, records
+        )
+    except (OSError, ValueError) as exc:
+        return _abort(EXIT_USAGE, f"[错误] scope 恢复失败: {exc}")
+
+    if engagement is None:
+        # legacy 目录(无元数据):用恢复出的 objective/scope 走 create 幂等
+        # 补齐布局(不动任何已有文件;同一份字节绑进 meta 哈希)
         try:
             engagement = Engagement.create(
                 base_dir=root.parent if str(root.parent) else Path("."),
                 objective=objective,
                 scope_path=scope_source,
                 engagement_id=root.name,
+                scope_bytes=scope_bytes,
             )
         except (OSError, ValueError) as exc:
-            print(f"[错误] legacy 目录修复失败: {exc}", file=sys.stderr)
-            return EXIT_USAGE
+            return _abort(EXIT_USAGE, f"[错误] legacy 目录修复失败: {exc}")
+        lock = _acquire_lock_or_report(engagement)
+        if lock is None:
+            return _abort(EXIT_USAGE, "")
+    else:
+        # R02:legacy 目录在首次 R02 写(状态迁移/修订提交)前留升级前原文
+        # 备份(幂等;恢复失败的路径走不到这里,不留残迹)
+        engagement.backup_pre_r02()
 
+    # R02:resume 置 active(复开 closed 目录清 closed_at,re-finish 刷新)
+    engagement.mark_active()
     briefing = build_resume_briefing(records, recent_rounds=args.recent_rounds)
-    return engagement, scope, scope_source, objective, briefing, len(records)
+    return (
+        engagement,
+        lock,
+        scope,
+        scope_source,
+        scope_digest,
+        objective,
+        briefing,
+        len(records),
+    )
 
 
 async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
@@ -1001,38 +1136,69 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
     prepared = _resume_preflight(args)
     if isinstance(prepared, int):
         return prepared
-    engagement, scope, scope_source, objective, briefing, record_count = prepared
-    # D6 写入点②:resume 对账完成,动态段幂等重写为恢复后 scope 的渲染。
-    _write_scope_section(engagement, scope, scope_source)
+    (
+        engagement,
+        lock,
+        scope,
+        scope_source,
+        scope_digest,
+        objective,
+        briefing,
+        record_count,
+    ) = prepared
     try:
-        backend = backend_factory(args)
-        _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
-    except ConfigError as exc:
-        engagement.close()
-        print(f"[错误] {exc}", file=sys.stderr)
-        return EXIT_USAGE
+        # D6 写入点②:resume 对账完成,动态段幂等重写为恢复后 scope 的渲染。
+        _write_scope_section(engagement, scope, scope_source, scope_digest)
+        try:
+            backend = backend_factory(args)
+            _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
+        except ConfigError as exc:
+            engagement.close()
+            print(f"[错误] {exc}", file=sys.stderr)
+            return EXIT_USAGE
 
-    print(
-        f"[resume] engagement={engagement.paths.root} backend={args.backend} "
-        f"(历史 {record_count} 条审计记录,链完整;简报取最近 "
-        f"{args.recent_rounds} 轮)",
-        flush=True,
-    )
-    runtime = _assemble_runtime(
-        args,
-        engagement=engagement,
-        scope=scope,
-        scope_source=scope_source,
-        backend=backend,
-        observer=_CliObserver(),
-    )
-    if args.scope:
-        # W14b-3:--scope 显式覆盖 = 命令行重新授权,与 run file 流同义补写
-        # (Q8;plain resume 不补,确认计数不变)。
-        _append_file_scope_confirm(runtime.audit, scope, str(args.scope))
-    return await _drive(
-        runtime, objective=objective, backend=backend, interject=briefing
-    )
+        print(
+            f"[resume] engagement={engagement.paths.root} backend={args.backend} "
+            f"(历史 {record_count} 条审计记录,链完整;简报取最近 "
+            f"{args.recent_rounds} 轮)",
+            flush=True,
+        )
+        runtime = _assemble_runtime(
+            args,
+            engagement=engagement,
+            scope=scope,
+            scope_source=scope_source,
+            backend=backend,
+            observer=_CliObserver(),
+        )
+        if args.scope:
+            # W14b-3:--scope 显式覆盖 = 命令行重新授权,与 run file 流同义补写
+            # (Q8;plain resume 不补,确认计数不变)。R02 提交协议:确认记录
+            # 落链后立即持久化 meta(绝对路径 + 提交标记)——E03 收口,再次
+            # plain resume 始终恢复本次授权(AC01)。
+            record = _append_file_scope_confirm(
+                runtime.audit, scope, str(args.scope), scope_digest
+            )
+            engagement.commit_revision(
+                scope={
+                    "path": _absolute_scope_path(args.scope),
+                    "sha256": scope_digest,
+                },
+                objective=args.objective or None,
+                marker=record,
+            )
+        elif args.objective:
+            # R02:仅 --objective 覆盖——marker 指向本次装配的 scope_loaded
+            # 记录;目标文本的链上锚点是随后的 run_started(loop.run 同步首步
+            # 落链),崩溃窗口由 reconcile_with_chain 从链重建(AC02)。
+            engagement.commit_revision(
+                objective=args.objective, marker=runtime.scope_loaded_record
+            )
+        return await _drive(
+            runtime, objective=objective, backend=backend, interject=briefing
+        )
+    finally:
+        lock.release()
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,12 @@ from foam.cli import main as cli_main
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, AuditLog, verify
 from foam.guard.scope import load_scope, parse_scope
 from foam.replay import read_records, recover_scope_record
-from foam.state.files import SCOPE_SECTION_BEGIN, SCOPE_SECTION_END, Engagement
+from foam.state.files import (
+    SCOPE_SECTION_BEGIN,
+    SCOPE_SECTION_END,
+    Engagement,
+    acquire_engagement_lock,
+)
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
 
@@ -782,3 +787,205 @@ def test_resume_rewrites_scope_section(tmp_path):
         frozen_at=section_frozen_at(section),
     )
     assert section == expected + "\n"
+
+
+# ---------------------------------------------------------------------------
+# R02-B:resume 覆盖持久化 / 单次读盘 / 单写者锁(AC01/02/03/07/08)
+# ---------------------------------------------------------------------------
+
+
+def test_resume_narrowing_persists(tmp_path):
+    """R02-AC01/AC02(E03 收口):A=/24 启动 → resume --scope B=/32
+    --objective 新目标 → 再无覆盖 resume 两次,均保持 B/新目标。"""
+    scope_a = tmp_path / "a.scope"
+    scope_a.write_text("192.0.2.0/24\n", encoding="utf-8")
+    scope_b = tmp_path / "b.scope"
+    scope_b.write_text("192.0.2.7/32\n", encoding="utf-8")
+    workdir = tmp_path / "eng"
+    rc = cli_main(
+        [
+            "run",
+            "--scope",
+            str(scope_a),
+            "--objective",
+            "旧目标",
+            "--workdir",
+            str(workdir),
+        ],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc == 0
+
+    # 收窄 + 改目标(显式重新授权)
+    rc = cli_main(
+        [
+            "resume",
+            str(workdir),
+            "--scope",
+            str(scope_b),
+            "--objective",
+            "新目标",
+        ],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc == 0
+    b_sha = hashlib.sha256(scope_b.read_bytes()).hexdigest()
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["scope"]["sha256"] == b_sha
+    assert meta["objective"] == "新目标"
+    assert meta["revision"]["seq"] > 0  # 提交标记已落(新格式)
+
+    # 两次无覆盖恢复:始终 B/新目标(修复前 meta-first 恢复 A/旧目标)
+    for _ in range(2):
+        resumed = FakeBackend([FINISH])
+        rc = cli_main(
+            ["resume", str(workdir)], backend_factory=lambda _a, b=resumed: b
+        )
+        assert rc == 0
+        meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+        assert meta["scope"]["sha256"] == b_sha
+        assert meta["objective"] == "新目标"
+        started = [
+            r for r in audit_records(workdir) if r["kind"] == "run_started"
+        ]
+        assert started[-1]["payload"]["objective"] == "新目标"
+        # 模型上下文(ENGAGEMENT.md 必载消息)呈现 B 规则、不再见 A 网段
+        context_msg = resumed.calls[0][1].content
+        assert "192.0.2.7/32" in context_msg
+        assert "192.0.2.0/24" not in context_msg
+    assert verify(workdir / "audit.jsonl")
+
+
+def test_resume_from_different_cwd(tmp_path, monkeypatch, capsys):
+    """R02-AC03:run 用相对路径 --scope,engagement.json 落绝对路径 →
+    换 cwd 后 resume 照常(修复前 meta 记 as-given 相对串,换 cwd 即报缺文件)。"""
+    monkeypatch.chdir(tmp_path)
+    Path("lab.scope").write_text(SCOPE_TEXT, encoding="utf-8")
+    workdir = tmp_path / "eng"
+    rc = cli_main(
+        [
+            "run",
+            "--scope",
+            "lab.scope",  # as-given 相对串:审计展示口径照旧
+            "--objective",
+            "侦察本机",
+            "--workdir",
+            str(workdir),
+        ],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc == 0
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["scope"]["path"] == str((tmp_path / "lab.scope").resolve())
+    assert Path(meta["scope"]["path"]).is_absolute()
+    # 审计口径不变:scope_loaded.source 仍是 as-given 原串
+    loaded = [r for r in audit_records(workdir) if r["kind"] == "scope_loaded"]
+    assert loaded[0]["payload"]["source"] == "lab.scope"
+
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    resumed = FakeBackend([FINISH])
+    rc = cli_main(["resume", str(workdir)], backend_factory=lambda _a: resumed)
+    assert rc == 0, capsys.readouterr().err
+    loaded = [r for r in audit_records(workdir) if r["kind"] == "scope_loaded"]
+    assert loaded[-1]["payload"]["source"] == str((tmp_path / "lab.scope").resolve())
+    assert verify(workdir / "audit.jsonl")
+
+
+def test_second_writer_lock_refused(tmp_path, capsys):
+    """R02-AC07:engagement.lock 被持有时,run/resume 拒绝(中文报错 + rc 2);
+    只读命令(replay/report)不取锁照常;锁释放后 resume 恢复。"""
+    rc, workdir = run_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0
+    lock = acquire_engagement_lock(workdir)
+    try:
+        rc = cli_main(
+            ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "另一个运行中的写者" in err and "engagement.lock" in err
+        rc = cli_main(
+            [
+                "run",
+                "--scope",
+                str(tmp_path / "lab.scope"),
+                "--objective",
+                "侦察本机",
+                "--workdir",
+                str(workdir),
+            ],
+            backend_factory=lambda _a: FakeBackend([FINISH]),
+        )
+        assert rc == 2
+        assert "另一个运行中的写者" in capsys.readouterr().err
+        # 只读命令不取锁
+        assert cli_main(["replay", str(workdir)]) == 0
+        assert cli_main(["report", str(workdir)]) == 0
+    finally:
+        lock.release()
+    # 释放后 resume 恢复(锁不是残留态)
+    rc = cli_main(
+        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+    )
+    assert rc == 0
+
+
+def test_resume_override_commits_with_backup_and_chain_prefix_intact(tmp_path):
+    """R02-B 迁移与 AC08:legacy 目录首次提交自动备份 engagement.json
+    (.pre-r02.bak = 升级前原文);marker = 确认记录 seq/hash;旧审计字节
+    逐字节不动(链只追加,不重写)。"""
+    rc, workdir = run_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0
+    meta_before = (workdir / "engagement.json").read_bytes()
+    audit_before = (workdir / "audit.jsonl").read_bytes()
+
+    scope_b = tmp_path / "b.scope"
+    scope_b.write_text("192.0.2.7/32\n", encoding="utf-8")
+    rc = cli_main(
+        ["resume", str(workdir), "--scope", str(scope_b), "--objective", "新目标"],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc == 0
+
+    bak = workdir / "engagement.json.pre-r02.bak"
+    assert bak.read_bytes() == meta_before  # 升级前原样备份
+    audit_after = (workdir / "audit.jsonl").read_bytes()
+    assert audit_after[: len(audit_before)] == audit_before  # AC08:前缀不动
+    assert verify(workdir / "audit.jsonl")
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    confirms = [r for r in audit_records(workdir) if r["kind"] == "scope_confirmed"]
+    assert meta["revision"] == {
+        "seq": confirms[-1]["seq"],
+        "hash": confirms[-1]["hash"],
+    }
+    # 第二次提交不覆盖备份
+    rc = cli_main(
+        ["resume", str(workdir), "--objective", "再改目标"],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc == 0
+    assert bak.read_bytes() == meta_before
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["objective"] == "再改目标"
+
+
+def test_resume_missing_scope_file_requires_reconfirm(tmp_path, capsys):
+    """R02-C 旧格式迁移边界钉死:原 scope 文件缺失 → 拒绝并要求 --scope
+    重新确认;不产生备份、不改 meta(失败不自动退回更宽历史授权)。"""
+    scope_file = write_scope(tmp_path)
+    rc, workdir = run_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0
+    meta_before = (workdir / "engagement.json").read_bytes()
+    scope_file.unlink()
+
+    rc = cli_main(
+        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "scope 文件不存在" in err
+    assert "请用 --scope 显式指定" in err
+    assert not (workdir / "engagement.json.pre-r02.bak").exists()
+    assert (workdir / "engagement.json").read_bytes() == meta_before
