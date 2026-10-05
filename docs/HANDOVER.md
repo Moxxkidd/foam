@@ -631,7 +631,12 @@ WP-13(整合)依赖全部
   run_finished(status=cancelled)（未来 replay 消费者注意）；进程组外
   逃逸（自行 setsid/daemonize）收割不到、如实上报，Linux 全后代隔离
   归 R11。
-- 测试基线：全仓 **641 passed + 2 skipped**（基线 609+2，本条目净增
-  32 例），ruff check 全绿。
+- 2026-10-06 对抗评审收口（跟进提交）：kill 路径补 pid/pgid 复用守卫
+  ——leader 已收割（returncode 非 None）时 `_kill_group`/
+  `_kill_process_group` 跳过 killpg，防向被 OS 回收的 pgid 错杀陌生
+  进程组；leader 已收割但孙代在组内的竞态下漏杀该组、如实上报
+  （AC03 在该竞态让位，决策见 R03.md §7）。
+- 测试基线：全仓 **645 passed + 2 skipped**（基线 609+2，本条目净增
+  36 例，含守卫 4 例），ruff check 全绿。
 - 下一步：按 [R 索引](items/README.md) 评审 [R04](items/R04.md)（报告
   分页漏项，E05；依赖现有索引接口）。
