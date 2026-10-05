@@ -253,7 +253,8 @@ def test_check_command_denies_supernet_sweep():
 
 def test_check_command_denies_range_reaching_out():
     decision = check_command("nmap 192.168.56.250-192.168.57.5", LAB_SCOPE)
-    # 跨段写法其实是逐段范围:上界 192.168.57.5 越界
+    # 该写法不匹配 _NMAP_RANGE_RE(须恰好四个八位组),不按范围解析;
+    # 经主机名兜底判定为不在界内
     assert not decision.allowed
 
 
@@ -370,6 +371,9 @@ BAD_URL_RULES = [
     "http://:8080/",  # 空 host 带端口
     "https://example.com:99999/",  # 端口越界
     "https://example.com:abc/",  # 非数字端口
+    "https://user@example.com/",  # userinfo:旧串前缀只认字面开头,归一忽略会更宽
+    "https://user:pass@example.com/",  # userinfo 带口令
+    "https://@example.com/",  # 空 userinfo 同样拒绝
 ]
 
 

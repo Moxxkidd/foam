@@ -120,9 +120,10 @@ class Scope:
 def parse_scope(text: str) -> Scope:
     """解析 scope 文本(``#`` 注释、空行忽略;行内 ``#`` 起也算注释)。
 
-    URL 规则在加载期校验:空 host、非法/越界端口、无法解析的 authority
-    一律 ``ValueError``(fail closed)——逐字收下 ``https://`` 这类规则会
-    在旧字符串前缀语义下匹配所有 https URL。
+    URL 规则在加载期校验:空 host、非法/越界端口、无法解析的 authority、
+    userinfo 一律 ``ValueError``(fail closed)——逐字收下 ``https://`` 这类
+    规则会在旧字符串前缀语义下匹配所有 https URL;归一静默丢弃 userinfo
+    会把规则放宽到整个 origin。
     """
     cidrs: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     hosts: set[str] = set()
@@ -135,7 +136,7 @@ def parse_scope(text: str) -> Scope:
             continue
         rules.append(line)
         if _URL_SCHEME_RE.match(line):
-            if _parse_url_parts(line) is None:
+            if _parse_url_parts(line, for_rule=True) is None:
                 raise ValueError(f"scope 第 {lineno} 行:非法 URL 规则 {line!r}")
             url_prefixes.append(line)
             continue
@@ -209,18 +210,26 @@ class _UrlParts(NamedTuple):
     suffix: str
 
 
-def _parse_url_parts(url: str) -> _UrlParts | None:
+def _parse_url_parts(url: str, *, for_rule: bool = False) -> _UrlParts | None:
     """解析并规范化 URL;畸形返回 None(调用方按 fail closed 处理)。
 
     畸形 = scheme 缺失、host 为空、端口非数字或越界、authority 无法解析。
     注意 ``SplitResult.port`` 是惰性校验:非法端口在**访问**时才抛
     ``ValueError``;``urlsplit`` 自身也可能因不配对 IPv6 括号等抛出——
     全部归为畸形,绝不上抛。
+
+    ``for_rule=True``(scope 规则)另拒 userinfo:规则里的 ``user@`` 在旧
+    字符串前缀语义下只匹配字面开头,origin 归一静默丢弃会把规则放宽到整个
+    origin(§1 规范化不得扩大规则);空 userinfo(``https://@h/``)同样拒绝。
+    **目标** URL 的 userinfo 不受影响——按真实 host 判定(``a@b`` 的 host
+    是 ``b``)。
     """
     try:
         parts = urlsplit(url)
         host = parts.hostname
         port = parts.port  # 访问即校验:非法端口在此抛 ValueError
+        if for_rule and (parts.username is not None or parts.password is not None):
+            return None
     except ValueError:
         return None
     scheme = parts.scheme.lower()
@@ -247,7 +256,7 @@ def _url_rules_match(target: _UrlParts, scope: Scope) -> bool:
     """URL 目标是否命中某条 URL 规则:规范化 origin 相同,且目标 suffix
     以规则 suffix 为前缀。"""
     for rule in scope.url_prefixes:
-        rule_parts = _parse_url_parts(rule)
+        rule_parts = _parse_url_parts(rule, for_rule=True)
         if rule_parts is None:
             continue  # 畸形规则已在 parse_scope 拒绝;此处防御性跳过
         if (

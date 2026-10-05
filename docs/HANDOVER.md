@@ -576,8 +576,11 @@ WP-13(整合)依赖全部
   （`target_in_scope`/`check_command`/`Scope.url_prefixes` 原始串）无漂移。
 - 遗留：`src/foam/agent/scope_compiler.py` 编译器 prompt 仍描述旧「字符串
   前缀语义」（比实际执行更宽，fail-closed 方向，建议后续小条目修正）。
-- 测试基线：全仓 **582 passed + 2 skipped**（HEAD 3a9d07c 实测基线
-  533+2，本条目净增 49 例；旧记录 526 为 WP-14c 时点数，已漂移），
+- 测试基线：全仓 **585 passed + 2 skipped**（HEAD 3a9d07c 实测基线
+  533+2，本条目净增 52 例；旧记录 526 为 WP-14c 时点数，已漂移），
   ruff check 全绿。验证实录见 R01.md §6。
+- 2026-10-05 对抗评审收口（跟进提交）：规则侧 userinfo 被 origin 归一
+  静默丢弃（比旧语义更宽）→ parse_scope 加载期拒绝，目标侧行为不变；
+  另修正一处误述机制的测试注释。决策与证据见 R01.md §7 决策 6、§6 追加。
 - 下一步：按 [R 索引](items/README.md) 评审 [R02](items/R02.md)（scope
   冻结/恢复一致性，依赖 R01 已满足）；版本清单 v0.1.2 已同步 R01 完成。
