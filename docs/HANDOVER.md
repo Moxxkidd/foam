@@ -613,3 +613,25 @@ WP-13(整合)依赖全部
   sha256 不符仍冲突。决策与红绿实录见 R02.md §7 决策 8/9、§6 追加。
 - 下一步：按 [R 索引](items/README.md) 评审 [R03](items/R03.md)（各退出
   路径资源清理，E04；依赖 R02 已满足）。
+
+
+## 当前状态（2026-10-06：R03 关闭）
+
+- [R03](items/R03.md) 完成并推送 main：修复 E04（错误/正常结束后后台
+  进程未回收）并统一 CLI/TUI 运行时资源关闭。三个分片提交：R03-A
+  （bash 看管独立任务+shield、双层幂等有界 aclose、收割失败诚实上报）、
+  R03-B（`foam/runtime.py` 的 close_run 统一关闭面、loop 统一终态面
+  先收割再落 run_finished、CLI 装配随建随挂）、R03-C（TUI
+  _run_to_end/action_quit/_cleanup_resources 收敛 close_run、首个
+  quit 路径测试）。逐条验收证据见 R03.md §5，验证实录见 §6。
+- 关键边界：无宽限期（run 终止即整组 SIGKILL，上界 5s/层、总上界两层
+  之和可测）；cleanup_pending 面=审计 cleanup 载荷 + CLI stderr/TUI
+  叙述流，退出码契约不变；TUI 单写者锁仍未接（R02 边界，D3）；TUI
+  finished 置 mark_closed、killed/error 保持 active；外部取消路径新增
+  run_finished(status=cancelled)（未来 replay 消费者注意）；进程组外
+  逃逸（自行 setsid/daemonize）收割不到、如实上报，Linux 全后代隔离
+  归 R11。
+- 测试基线：全仓 **641 passed + 2 skipped**（基线 609+2，本条目净增
+  32 例），ruff check 全绿。
+- 下一步：按 [R 索引](items/README.md) 评审 [R04](items/R04.md)（报告
+  分页漏项，E05；依赖现有索引接口）。
