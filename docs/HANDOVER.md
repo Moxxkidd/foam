@@ -584,3 +584,28 @@ WP-13(整合)依赖全部
   另修正一处误述机制的测试注释。决策与证据见 R01.md §7 决策 6、§6 追加。
 - 下一步：按 [R 索引](items/README.md) 评审 [R02](items/R02.md)（scope
   冻结/恢复一致性，依赖 R01 已满足）；版本清单 v0.1.2 已同步 R01 完成。
+
+
+## 当前状态（2026-10-06：R02 关闭）
+
+- [R02](items/R02.md) 完成并推送 main：修复 E03（resume --scope/--objective
+  覆盖不持久化）与 E07（TUI file 流首轮上下文「尚未冻结」占位），另收口
+  engagement.json 非原子写、scope 多次读盘 TOCTOU（run 4 读、resume 2 读
+  各收为 1 读）、相对路径换 cwd 无法恢复、同目录无写者锁。三个分片提交：
+  R02-A（原子写+单写者锁+修订提交协议）、R02-B（CLI 持久恢复）、
+  R02-C（TUI 开跑前预备）；逐条验收证据见 R02.md §5，验证实录见 §6。
+- 关键边界：as-given 契约保留（file 流 engagement.json 记原文件绝对
+  路径+字节 sha256；外部文件改动 → resume 漂移拒绝，须 --scope 重新
+  授权）；「engagement 内冻结副本」为未裁定拟议修订，未实施
+  （R02.md §7 待用户裁定）。单写者锁 engagement.lock 只约束 R02 感知
+  写者（旧进程不持锁仍可并发追加；TUI 本轮未接锁）；killed/crash 保持
+  status=active + 锁随进程释放 = 中断可恢复（退出路径资源收口归 R03）。
+- 恢复对账语义：meta 带 revision 标记且与链一致 → 接受；链领先（崩溃
+  窗口）→ 从链重建 scope/objective 投影；截尾/分叉 → 明确拒绝；无标记
+  legacy 目录走既有路径不重建，首次 R02 写前自动备份
+  engagement.json.pre-r02.bak（只供检查，不自动恢复授权）。
+- 状态迁移：start/resume 置 active；finished 置 closed（re-finish 刷新
+  closed_at）。测试基线：全仓 **606 passed + 2 skipped**（基线 585+2，
+  本条目净增 21 例），ruff check 全绿。
+- 下一步：按 [R 索引](items/README.md) 评审 [R03](items/R03.md)（各退出
+  路径资源清理，E04；依赖 R02 已满足）。
