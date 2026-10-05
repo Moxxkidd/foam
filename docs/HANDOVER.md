@@ -640,3 +640,27 @@ WP-13(整合)依赖全部
   36 例，含守卫 4 例），ruff check 全绿。
 - 下一步：按 [R 索引](items/README.md) 评审 [R04](items/R04.md)（报告
   分页漏项，E05；依赖现有索引接口）。
+
+
+## 当前状态（2026-10-06：R04 关闭）
+
+- [R04](items/R04.md) 完成并推送 main：修复 E05（报告超 500 条静默漏项）。
+  三个分片提交：R04-A（`_order_by` 追加 `t.id` 并列兜底 + 报告六表全量
+  分页 `_paginate_all` + 统计改取分页真实 total）、R04-B（新增
+  `Index.snapshot()` 显式只读事务，报告六表在同一快照分页；并发写者
+  COMMIT 被 SQLITE_BUSY 明确拒绝）、R04-C（`foam report --out` 改
+  mkstemp+os.replace 原子导出、失败清理临时文件；build_report 失败
+  rc 1 目标不动，写盘 OSError rc 2，成功提示只在替换之后）。
+  逐条验收证据见 R04.md §5，红基线/分片/全量实录见 §6。
+- 关键边界：query 签名/返回字段、MAX_QUERY_LIMIT、LLM state_query 500
+  上限、报告章节结构（hosts/ports 仍仅统计行、凭证全值契约）全部不变；
+  build_report 仍返回 str（内存随报告体积，未虚称流式）。快照拒绝语义
+  经实测修正：pysqlite 默认 timeout=5.0 busy 重试耗尽后才拒绝（非立即），
+  短快照下写者可能只是延迟到快照结束后提交成功——两种结果报告均为同一
+  一致快照（AC04）；写者侧 ROLLBACK 瞬时，快照结束写入恢复（WP-06 写
+  路径行为注记见 R04.md §7 D2）。`Index.__init__` 失败现关闭连接防僵尸
+  RESERVED 锁，并新增 keyword-only `timeout` 透传（默认 5.0 不变）。
+- 测试基线：全仓 **684 passed + 2 skipped**（基线 645+2，本条目净增
+  39 例：分页矩阵 30、快照/空页 5、导出原子性 4），ruff check 全绿。
+- 下一步：按 [R 索引](items/README.md) 评审 [R05](items/R05.md)（版本/
+  安装包/回归基座一致——v0.1.2 发布门槛前最后一项；依赖 R01–R04 已满足）。
