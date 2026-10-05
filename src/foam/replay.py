@@ -498,10 +498,13 @@ def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
     index_missing = not engagement.paths.index_db.is_file()
     if not index_missing:
         with Index(engagement.paths.index_db) as index:
-            for kind in ("hosts", "ports", "creds", "vulns", "loot", "notes"):
-                rows, total = _paginate_all(index, kind)
-                index_rows[kind] = rows
-                index_totals[kind] = total
+            # R04-AC04:全部六表在同一读快照内分页遍历——正文与统计同源,
+            # 快照期间并发写者被 SQLITE_BUSY 明确拒绝(见 Index.snapshot)。
+            with index.snapshot():
+                for kind in ("hosts", "ports", "creds", "vulns", "loot", "notes"):
+                    rows, total = _paginate_all(index, kind)
+                    index_rows[kind] = rows
+                    index_totals[kind] = total
 
     lines += ["## 发现清单(漏洞)", ""]
     if index_missing:

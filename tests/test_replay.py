@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from foam.guard.audit import (
 )
 from foam.guard.scope import load_scope, parse_scope, scope_payload
 from foam.replay import (
+    ReportGenerationError,
     audit_stats,
     build_report,
     build_resume_briefing,
@@ -628,3 +630,96 @@ def test_report_all_pages(tmp_path, kind, n):
     if n:
         assert _r04_token(kind, 0) in text  # 首条
         assert _r04_token(kind, n - 1) in text  # 末条
+
+
+# ---------------------------------------------------------------------------
+# R04-B:一致读快照(并发写入拒绝 / 空页报错)
+# ---------------------------------------------------------------------------
+
+
+def test_report_concurrent_write_during_pagination(tmp_path, monkeypatch):
+    """R04-AC04:分页中途并发写入——常驻写者的 COMMIT 被 SQLITE_BUSY 明确
+    拒绝,报告仍对应同一个快照(旧行齐全、新行不出现);快照结束写入恢复。"""
+    root = make_engagement(tmp_path, with_index=False)
+    db_path = root / "index.sqlite"
+    with Index(db_path) as index:
+        bulk_insert_rows(index, "notes", 600)  # 两页:500 + 100
+    # 模拟生产常驻写者:快照前已建连(如 StateTool/Engagement.index);
+    # timeout 调小只为测试提速,拒绝语义与默认 5.0s 相同(R04.md §7)。
+    writer = Index(db_path, timeout=0.2)
+
+    outcome: dict[str, str | None] = {}
+
+    class MidWriteIndex(Index):
+        """测试钩子:notes 首页返回后,经常驻写者连接尝试写入一条新笔记。"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._fired = False
+
+        def query(self, kind, *args, **kwargs):
+            page = super().query(kind, *args, **kwargs)
+            if kind == "notes" and not self._fired:
+                self._fired = True
+                try:
+                    writer.add_note("TESTONLY-r04-midwrite 新笔记")
+                except sqlite3.OperationalError as exc:
+                    outcome["refused"] = str(exc)
+                else:
+                    outcome["refused"] = None
+            return page
+
+    try:
+        monkeypatch.setattr("foam.replay.Index", MidWriteIndex)
+        text = build_report(root)
+
+        # 写者被明确拒绝:读者快照持 SHARED,写者 COMMIT 的 busy 重试
+        # 耗尽(ROLLBACK 瞬时清理,不碰 db 文件)——R04.md §7 行为注记。
+        assert outcome["refused"] is not None
+        assert "locked" in outcome["refused"]
+        writer._conn.rollback()
+        # 报告一致:600 条旧笔记不重不漏,快照期间的新笔记不出现
+        rendered = sorted(re.findall(r"TESTONLY-r04-notes-(\d{4})", text))
+        assert rendered == [f"{i:04d}" for i in range(600)]
+        assert "TESTONLY-r04-midwrite" not in text
+        # 快照结束后写入恢复可用(拒绝是快照期的,不是持久损坏)
+        writer.add_note("TESTONLY-r04-midwrite 新笔记")
+        assert writer.counts()["notes"] == 601
+    finally:
+        writer.close()
+
+
+def test_report_empty_page_with_unexhausted_total_raises(tmp_path, monkeypatch):
+    """R04-B:total 未耗尽却返回空页 → 明确报错,不死循环、不静默截断。
+    用违反契约的 query stub(恒空页但 total>0)证明循环立即终止。"""
+    root = make_engagement(tmp_path, with_index=False)
+    calls = 0
+
+    class EmptyPageIndex:
+        def __init__(self, _db_path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def snapshot(self):
+            return self  # 复用上面的 __enter__/__exit__
+
+        def query(self, kind, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return {
+                "kind": kind,
+                "total": 100,
+                "count": 0,
+                "truncated": True,
+                "rows": [],
+            }
+
+    monkeypatch.setattr("foam.replay.Index", EmptyPageIndex)
+    with pytest.raises(ReportGenerationError, match="空页"):
+        build_report(root)
+    assert calls == 1  # 首页即空且 total 未耗尽 → 立即报错,循环不挂

@@ -21,6 +21,8 @@ tools/state.py 的 LLM 工具都走这层统一的 upsert/查询接口。
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -112,18 +114,25 @@ def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
 class Index:
     """一个 engagement 一个实例:持有 index.sqlite 连接。"""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, timeout: float = 5.0):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.executescript(_DDL)
-        self._conn.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
-            ("schema_version", str(SCHEMA_VERSION)),
-        )
-        self._conn.commit()
+        self._conn = sqlite3.connect(self.db_path, timeout=timeout)
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.executescript(_DDL)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                ("schema_version", str(SCHEMA_VERSION)),
+            )
+            self._conn.commit()
+        except BaseException:
+            # R04:初始化被拒(如报告快照期间 DDL/元信息 commit 拿不到
+            # EXCLUSIVE)时关闭连接——不留持 RESERVED 的僵尸连接阻塞后续
+            # 写者。timeout 透传 sqlite3(默认 5.0 不变):busy 重试上界。
+            self._conn.close()
+            raise
 
     def close(self) -> None:
         self._conn.close()
@@ -428,6 +437,33 @@ class Index:
         }[kind]
 
     # ---------- 汇总(ENGAGEMENT.md / 报告用) ----------
+
+    @contextmanager
+    def snapshot(self) -> Iterator[Index]:
+        """同一连接上的显式只读事务(BEGIN … COMMIT/ROLLBACK):事务内全部
+        query 看到同一个数据库快照(R04-AC04,报告分页用)。
+
+        rollback-journal 模式下,快照期间并发写者的 COMMIT 拿不到
+        EXCLUSIVE 锁:pysqlite 默认 timeout=5.0 的 busy 重试耗尽后以
+        SQLITE_BUSY 明确失败(快照很短时,写者也可能只是被延迟到快照结束
+        后才提交成功——两种结果下读者看到的都是同一快照,报告一致)。拒绝
+        只发生在快照期间,快照结束后写入恢复。注意 Index.__init__ 的
+        DDL/元信息写入发生在进入快照之前,不属于快照内容;快照期间新建
+        Index 的初始化 commit 同样会被拒。新增接口,纯叠加不改既有方法语义。
+        """
+        prior = self._conn.isolation_level
+        self._conn.isolation_level = None  # 显式事务,关掉隐式 BEGIN
+        try:
+            self._conn.execute("BEGIN")
+            try:
+                yield self
+            except BaseException:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
+        finally:
+            self._conn.isolation_level = prior
 
     def counts(self) -> dict[str, int]:
         """各表行数,供 ENGAGEMENT.md 进展段与报告头部使用(表名均为上方白名单

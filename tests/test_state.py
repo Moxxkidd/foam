@@ -274,6 +274,60 @@ def test_query_pagination(index):
     assert len(set(ips)) == 7
 
 
+# ================================================================ R04-B
+# 一致读快照:并发写者拒绝,读者视角恒定
+
+def test_snapshot_consistent_read_and_writer_refused(index):
+    """R04-AC04:snapshot() 内全部 query 看到同一快照;并发写者的 COMMIT
+    拿不到 EXCLUSIVE,busy 重试耗尽后被 SQLITE_BUSY 明确拒绝;快照结束后
+    写入恢复。writer 模拟生产常驻写者(快照前已建连,如 StateTool);
+    timeout 调小只为测试提速——拒绝语义与默认 5.0s 相同(见 R04.md §7)。"""
+    writer = Index(index.db_path, timeout=0.2)
+    try:
+        for i in range(3):
+            index.add_note(f"TESTONLY-r04-快照前笔记 {i}")
+
+        with index.snapshot():
+            assert index.query("notes", limit=500)["total"] == 3
+            # 快照期间写入:读者持 SHARED,写者 COMMIT 升级 EXCLUSIVE 失败
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                writer.add_note("TESTONLY-r04-快照期间新笔记")
+            writer._conn.rollback()  # 被拒 COMMIT 后清理事务:瞬时,不碰 db 文件
+            # 读者视角不变(一致快照):total 与内容都不含新行
+            page = index.query("notes", limit=500)
+            assert page["total"] == 3
+            assert not any("快照期间" in r["text"] for r in page["rows"])
+        # 快照结束后写入恢复可用(拒绝是快照期的,不是持久损坏)
+        writer.add_note("TESTONLY-r04-快照后笔记")
+        assert index.query("notes", limit=500)["total"] == 4
+    finally:
+        writer.close()
+
+
+def test_index_init_refused_during_snapshot_leaves_no_zombie(index):
+    """R04-AC04 边界:快照期间新建 Index 的 DDL/元信息 commit 同样被拒;
+    __init__ 失败必须关闭连接——否则泄漏的连接持 RESERVED,快照后的写者
+    会被无主僵尸阻塞(实施评审实测发现,见 R04.md §7)。"""
+    with index.snapshot():
+        index.query("notes", limit=500)  # 持 SHARED
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            Index(index.db_path, timeout=0.2)
+    # 快照结束后:新建与写入立刻恢复,无 5s 级僵尸阻塞
+    with Index(index.db_path, timeout=0.2) as writer:
+        writer.add_note("TESTONLY-r04-僵尸检查")
+    assert index.query("notes", limit=500)["total"] == 1
+
+
+def test_snapshot_rollback_on_error(index):
+    """snapshot() 内抛错 → ROLLBACK 且不向上吞异常;连接恢复可写。"""
+    index.add_note("TESTONLY-r04-回滚前笔记")
+    with pytest.raises(RuntimeError, match="故意"), index.snapshot():
+        raise RuntimeError("故意")
+    # 连接已退出显式事务并恢复默认隔离级别,后续读写正常
+    index.add_note("TESTONLY-r04-回滚后笔记")
+    assert index.query("notes", limit=500)["total"] == 2
+
+
 # ================================================================ 验收 3
 # 脱敏专项:LLM 视图拿不到完整 secret
 
