@@ -23,8 +23,14 @@
   在首条消息到达即建(``scope_path=None``)。``/scope`` 裸命令只读展示
   (数据源为 TUI 侧权威引用 ``TUIConfig.scope``,D10),带参经同一仪式
   热换(确认后 ``loop.replace_scope`` 原子换,D2)。file 流零仪式照旧,
-  唯一有意变更:链上 ``scope_loaded`` 之后补一条
-  ``scope_confirmed(source="file")``(Q8,payload 语义对齐 14b W14b-2)。
+  链上 ``scope_loaded`` 之后补一条 ``scope_confirmed(source="file")``
+  (Q8,payload 语义对齐 14b W14b-2)。
+- R02-C(2026-10-06,file 流开跑前预备,E07 收口):
+  ``_prepare_file_run_engagement`` 与 NL 侧预备对称——``start_run`` 前
+  同一同步块建/开 engagement 并写动态段,首轮上下文即含真实规则;
+  ``main()`` 单次读盘把 scope 字节绑进 ``TUIConfig.scope_bytes``,迎宾
+  等待期外部文件被改也不二次读盘(改则 start_run 幂等复开对账不符、
+  fail-closed 拒绝启动)。
 """
 
 from __future__ import annotations
@@ -173,6 +179,10 @@ class TUIConfig:
     - ``wait_on_finish``:传给 loop 的待命开关(WP-09 更正当);TUI 是连续
       对话场景,默认 True——终答转 idle 待命,插话续段;headless 默认
       False 不受影响。
+    - ``scope_bytes``(R02-C,单次读盘绑定):main() 加载 scope 时读出的
+      原始字节;file 流开跑前预备的 meta/动态段 sha256 一律取它,不二次
+      读盘(迎宾等待期外部文件被改不影响已绑定的授权物)。None(旧式
+      程序化装配)时退回按 ``scope_source`` 读文件一次,行为与既往一致。
     """
 
     scope: Scope | None
@@ -186,6 +196,7 @@ class TUIConfig:
     wait_on_finish: bool = True
     loop_factory: LoopFactory | None = None
     config_home: str | Path | None = None
+    scope_bytes: bytes | None = None
 
     @property
     def home_path(self) -> Path:
@@ -930,10 +941,14 @@ class TuiApp(App[None]):
     def _scope_sha(self) -> str:
         if self.config.scope is None:
             return "—"  # NL 仪式流(D9):冻结前无文件可哈希
-        try:
-            data = Path(self.config.scope_source).read_bytes()
-        except OSError:
-            return "(不可读)"
+        # R02-C:优先取加载期绑定的字节(与 engagement meta/动态段同一份),
+        # 不在迎宾后二次读盘;旧式配置(无 scope_bytes)退回读文件
+        data = self.config.scope_bytes
+        if data is None:
+            try:
+                data = Path(self.config.scope_source).read_bytes()
+            except OSError:
+                return "(不可读)"
         return hashlib.sha256(data).hexdigest()[:12]
 
     async def confirm_operator(self, name: str) -> None:
@@ -987,6 +1002,10 @@ class TuiApp(App[None]):
                 # 下 create_task 同步开跑,开跑后再写段首轮上下文只剩占位
                 # (第二轮对抗审查修复)。
                 self._prepare_nl_run_engagement(text)
+            else:
+                # R02-C(E07 收口):file 流同样在 start_run 前同一同步块备好
+                # engagement + 动态段,首轮上下文即含真实规则
+                self._prepare_file_run_engagement(text)
             self.start_run(text)
             if not self._scope_frozen_via_nl:
                 self._append_file_scope_confirm()
@@ -1101,6 +1120,87 @@ class TuiApp(App[None]):
                 )
                 sha256 = (engagement.metadata().get("scope") or {}).get(
                     "sha256", ""
+                )
+        except (OSError, ValueError):
+            return  # start_run 同参重试 create 时给出自己的报错指引
+        try:
+            engagement.update_scope_section(
+                render_scope_section(
+                    scope.rules,
+                    source=self.config.scope_source,
+                    sha256=sha256,
+                    frozen_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                )
+            )
+        except OSError as exc:
+            main.narrative.add_notice("error", f"scope 动态段写入失败:{exc}")
+
+    def _prepare_file_run_engagement(self, text: str) -> None:
+        """file 流开跑前 engagement 预备(R02-C,E07 收口;与 NL 侧
+        ``_prepare_nl_run_engagement`` 对称;``start_run`` 本体一字不动,
+        其后的幂等复开因本预备而同参通过):
+
+        - ``start_run`` 前同一同步块建/开 engagement 并写动态段——生产
+          eager_task_factory 下 create_task 同步开跑,首轮 messages[1]
+          即读到真实规则而非「尚未冻结」占位(AC04/AC05);
+        - meta 与动态段的 sha256 绑定 ``config.scope_bytes``(main() 加载期
+          读出的同一份字节,单次读盘);无 scope_bytes 的旧式配置退回读
+          文件一次(行为与既往一致);
+        - 目录已存在(同 objective 此前跑过旧 scope):meta.scope 对账为当前
+          加载 scope——否则 start_run 的幂等复开撞 scope 一致性检查;漂移
+          在 run 链上留痕(``scope_updated``/``scope_confirmed``,
+          source="file",path=as-given 原串,Q8/W14b-2 口径);并
+          ``mark_active``(R02 状态迁移,start 置 active);
+        - start_run 随后的幂等复开按 ``_scope_metadata`` 重读文件对账:
+          迎宾等待期文件被改 → 对账不符、拒绝启动(fail-closed,operator
+          重启 TUI 重新加载)——绝不静默把新字节绑给旧规则。
+
+        create/open/对账失败时不重复报错:start_run 将以同参重试 create
+        并给出自己的「engagement 创建失败」指引。
+        """
+        scope = self.config.scope
+        main = self._main
+        if scope is None or main is None:
+            return
+        data = self.config.scope_bytes
+        if data is None:
+            try:
+                data = Path(self.config.scope_source).read_bytes()
+            except OSError:
+                return  # start_run 同参重试 create 时给出自己的报错指引
+        sha256 = hashlib.sha256(data).hexdigest()
+        root = Path(self.config.engagements_dir) / _default_engagement_id(text)
+        try:
+            if (root / "engagement.json").exists():
+                engagement = Engagement.open(root)
+                old_scope_meta = engagement.metadata().get("scope") or {}
+                new_scope_meta = engagement.update_scope_metadata_bytes(
+                    self.config.scope_source, data
+                )["scope"]
+                engagement.mark_active()
+                if old_scope_meta != new_scope_meta:
+                    audit = AuditLog(engagement.paths.audit_jsonl)
+                    try:
+                        audit.append(
+                            KIND_SCOPE_UPDATED
+                            if old_scope_meta.get("sha256")
+                            else KIND_SCOPE_CONFIRMED,
+                            scope_event_payload(
+                                scope,
+                                source="file",
+                                path=self.config.scope_source,
+                                canonical_sha256=sha256,
+                                old_sha256=old_scope_meta.get("sha256"),
+                            ),
+                        )
+                    finally:
+                        audit.close()
+            else:
+                engagement = Engagement.create(
+                    self.config.engagements_dir,
+                    text,
+                    scope_path=self.config.scope_source,
+                    scope_bytes=data,
                 )
         except (OSError, ValueError):
             return  # start_run 同参重试 create 时给出自己的报错指引
@@ -1484,17 +1584,20 @@ def main(args) -> int:
     复用」);密钥只由后端从环境变量读取,本层不接触。
 
     WP-14c:``--scope`` 由 CLI 侧改可选(cli.py 归属 14b);``args.scope``
-    为 None 时跳过 ``load_scope``,以 ``scope=None, scope_source=""`` 进 NL
-    确认仪式流;给定时逐字节照旧。
+    为 None 时跳过加载,以 ``scope=None, scope_source=""`` 进 NL 确认仪式流。
+    R02-C:给定时一次 read_bytes 完成解析与字节绑定(``scope_bytes`` 随
+    config 下行),迎宾等待期外部文件被改不二次读盘。
     """
     from foam.cli import ENV_MODEL, EXIT_USAGE, _build_backend
-    from foam.guard.scope import load_scope
+    from foam.guard.scope import parse_scope
 
     scope: Scope | None = None
     scope_source = ""
+    scope_bytes: bytes | None = None
     if args.scope is not None:
         try:
-            scope = load_scope(args.scope)
+            scope_bytes = Path(args.scope).read_bytes()
+            scope = parse_scope(scope_bytes.decode("utf-8"))
         except (OSError, ValueError) as exc:
             print(f"[错误] scope 加载失败: {exc}", file=sys.stderr)
             return EXIT_USAGE
@@ -1516,6 +1619,7 @@ def main(args) -> int:
         model_label=args.model or os.environ.get(ENV_MODEL) or "",
         engagements_dir=args.workdir or DEFAULT_ENGAGEMENTS_DIR,
         max_rounds=getattr(args, "max_rounds", 0) or 0,
+        scope_bytes=scope_bytes,
         **kwargs,
     )
     return run_tui(config)

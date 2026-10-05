@@ -50,6 +50,7 @@ from foam.agent.loop import (
     extract_phase,
 )
 from foam.agent.prompts import build_system_prompt
+from foam.cli import main as cli_main
 from foam.guard.audit import (
     KIND_KILL_SWITCH,
     KIND_OPERATOR_INTERJECT,
@@ -2300,3 +2301,118 @@ def test_scope_ceremony_eager_finished_worker_releases_guard(
     monkeypatch.setattr(app, "run_worker", fake_running)
     app.start_scope_ceremony("recon lab", mode="startup")
     assert app._ceremony is not None  # 活动中:正常持有守卫
+
+
+# ---------------------------------------------------------------------------
+# R02-C:file 流首轮上下文(E07 收口)/ eager 一致 / as-given 钉死
+# ---------------------------------------------------------------------------
+
+
+async def test_file_flow_first_round_context_has_rules(tmp_path):
+    """R02-AC04(E07 收口):file 流首轮 loop messages[1](每轮自
+    ENGAGEMENT.md 动态段刷新)必须含真实规则、无「尚未冻结」占位——
+    _prepare_file_run_engagement 在 start_run 前同一同步块写段(与 NL 侧
+    test_scope_predeclare_first_round_context_has_rules 镜像)。"""
+    app = TuiApp(make_config(tmp_path, [[TextDelta("跑完。"), Usage(1, 1)]]))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        assert app._final_result.status == "finished"
+        context_msg = app.run_handle.loop.messages[1].content
+        assert "127.0.0.0/8" in context_msg and "localhost" in context_msg
+        assert "尚未冻结" not in context_msg
+
+
+async def test_file_flow_section_written_synchronously_before_task(tmp_path):
+    """R02-AC05 结构面:submit_text 同步返回时(中间零 await)动态段已落盘
+    含真实规则——段写发生在 start_run 的 create_task 之前同一同步块,故
+    eager/普通调度下首轮上下文一致(该时序契约的结构依据钉死于此)。"""
+    app = TuiApp(make_config(tmp_path, [[TextDelta("跑完。"), Usage(1, 1)]]))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        app.submit_text("recon lab")  # 同步调用,返回即断言,不等任何任务
+        assert app.engagement is not None
+        section = scope_section_text(app.engagement.paths.root)
+        assert "127.0.0.0/8" in section and "localhost" in section
+        assert "尚未冻结" not in section
+        await wait_for(lambda: app._final_result is not None)
+
+
+async def test_file_flow_first_round_context_eager_task_factory(tmp_path):
+    """R02-AC05 eager 面:eager_task_factory 下 create_task 同步开跑
+    (run 可能在 start_run 返回前跑完),首轮 messages[1] 与普通调度一致——
+    真实规则在场、无占位。"""
+    app = TuiApp(make_config(tmp_path, [[TextDelta("跑完。"), Usage(1, 1)]]))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        running_loop = asyncio.get_running_loop()
+        running_loop.set_task_factory(asyncio.eager_task_factory)
+        try:
+            app.submit_text("eager recon")
+        finally:
+            running_loop.set_task_factory(None)
+        await wait_for(lambda: app._final_result is not None)
+        context_msg = app.run_handle.loop.messages[1].content
+        assert "127.0.0.0/8" in context_msg and "localhost" in context_msg
+        assert "尚未冻结" not in context_msg
+
+
+async def test_file_scope_changed_during_welcome_refuses_start(tmp_path):
+    """R02-C 边界(单次读盘绑定):main() 加载后、首条消息前外部文件被改
+    (迎宾等待期)——meta/动态段绑定的是加载时字节,start_run 幂等复开按
+    当前文件对账不符,拒绝启动(fail-closed,不静默把新字节绑给旧规则;
+    operator 重启 TUI 即重新加载)。"""
+    config = make_config(tmp_path, [[TextDelta("跑完。"), Usage(1, 1)]])
+    scope_path = Path(config.scope_source)
+    config.scope_bytes = scope_path.read_bytes()  # 模拟 main() 的加载期绑定
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        main = await enter_main(app, pilot)
+        scope_path.write_text("10.0.0.0/8\n", encoding="utf-8")  # 等待期被改
+        await pilot.press(*"recon lab")
+        await pilot.press("enter")
+        await wait_for(lambda: notices_containing(main, "engagement 创建失败") != [])
+        assert app.run_handle is None  # 未启动
+        assert app.config.scope is not None
+        assert app.config.scope.rules == ("127.0.0.0/8", "localhost")  # 内存不动
+
+
+async def test_file_scope_modified_after_start_run_unaffected_and_resume_refuses(
+    tmp_path, capsys
+):
+    """R02-C as-given 钉死(现行 Q8/D13 裁定,冻结副本方案未实施):启动后
+    改外部原文件——运行中 engagement 不受影响(护栏/meta 绑定启动时字节);
+    resume 对 sha256 漂移拒绝,须 --scope 显式重新确认。"""
+    config = make_config(tmp_path, [[TextDelta("跑完。"), Usage(1, 1)]])
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        assert app._final_result.status == "finished"
+        root = app.engagement.paths.root
+
+    Path(config.scope_source).write_text("10.0.0.0/8\n", encoding="utf-8")
+    # 运行不受影响:内存 scope 与 meta 仍绑定启动时字节
+    assert app.config.scope is not None
+    assert app.config.scope.rules == ("127.0.0.0/8", "localhost")
+    loop = app.run_handle.loop
+    assert loop._scope.rules == ("127.0.0.0/8", "localhost")
+    meta = json.loads((root / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["scope"]["sha256"] == hashlib.sha256(SCOPE_TEXT.encode()).hexdigest()
+    # 动态段仍是启动时规则(信息面与执行面一致)
+    section = scope_section_text(root)
+    assert "127.0.0.0/8" in section and "10.0.0.0/8" not in section
+    # resume 漂移拒绝,要求 --scope 重新确认(cli_main 内部 asyncio.run,
+    # 须离开本测试的事件循环,放线程里跑)
+    rc = await asyncio.to_thread(
+        cli_main,
+        ["resume", str(root)],
+        backend_factory=lambda _a: ScriptedBackend([[TextDelta("x"), Usage(1, 1)]]),
+    )
+    assert rc == 2
+    assert "sha256 不符" in capsys.readouterr().err
