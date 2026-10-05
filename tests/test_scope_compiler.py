@@ -572,3 +572,58 @@ def test_scope_event_payload_file_flow_as_given():
     assert rich["new_sha256"] == "cd" * 32
     assert rich["nl_chars"] == len("改 scope")
     assert rich["compile_attempts"] == 3
+
+
+def test_freeze_crash_before_meta_write_leaves_drift_refusable_state(
+    engagement, monkeypatch
+):
+    """R02-A 冻结崩溃窗口钉死(定案 D13 兜底):scope.confirmed 已原子落盘、
+    engagement.json meta 未更新即崩溃(注入 update_scope_metadata 失败)
+    → meta 仍指旧冻结物;此后按既有 meta-first 对账,meta 哈希与新文件
+    不符即 drift 拒绝(fail-closed,可经重新确认恢复),绝不静默采纳。
+
+    D13 写序(① scope.confirmed → ② meta → ③ objective → ④ 动态段 → ⑤
+    审计)不改;R02 把 ②③ 的落盘换成原子写,消灭的是「半截 JSON」窗口。
+    """
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    first = ScopeCompilation(
+        canonical_text="192.0.2.0/24\n",
+        scope=parse_scope("192.0.2.0/24\n"),
+        rules=("192.0.2.0/24",),
+    )
+    old_sha = freeze_scope(engagement, audit, first, source="nl", nl_text="先冻")
+    meta_after_first = engagement.paths.metadata.read_bytes()
+
+    second = ScopeCompilation(
+        canonical_text="198.51.100.0/24\n",
+        scope=parse_scope("198.51.100.0/24\n"),
+        rules=("198.51.100.0/24",),
+    )
+
+    def crash_before_meta(path):
+        raise OSError("注入:冻结②前崩溃")
+
+    monkeypatch.setattr(
+        Engagement, "update_scope_metadata", lambda self, p: crash_before_meta(p)
+    )
+    with pytest.raises(OSError, match="注入"):
+        freeze_scope(
+            engagement, audit, second, source="nl", nl_text="改范围", old_sha256=old_sha
+        )
+    audit.close()
+
+    # ① 已完成:scope.confirmed 是新内容;②③④⑤ 未达:meta 字节不变、链上无
+    # 第二条 scope 记录、动态段仍是旧规则
+    confirmed = engagement.paths.root / "scope.confirmed"
+    assert confirmed.read_text(encoding="utf-8") == "198.51.100.0/24\n"
+    assert engagement.paths.metadata.read_bytes() == meta_after_first
+    assert engagement.metadata()["scope"]["sha256"] == old_sha
+    kinds = [r["kind"] for r in read_records(engagement.paths.audit_jsonl)]
+    assert kinds.count("scope_confirmed") == 1 and "scope_updated" not in kinds
+    assert "198.51.100.0/24" not in engagement.read_progress()
+    # drift 判定面:meta 哈希 ≠ scope.confirmed 文件哈希 → 既有 meta-first
+    # 对账必拒绝(resume 侧报错路径由 test_cli 的 drift 测试钉死)
+    assert engagement.metadata()["scope"]["sha256"] != hashlib.sha256(
+        confirmed.read_bytes()
+    ).hexdigest()
+    assert verify(engagement.paths.audit_jsonl)
