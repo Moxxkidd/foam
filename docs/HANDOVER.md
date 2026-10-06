@@ -664,3 +664,37 @@ WP-13(整合)依赖全部
   39 例：分页矩阵 30、快照/空页 5、导出原子性 4），ruff check 全绿。
 - 下一步：按 [R 索引](items/README.md) 评审 [R05](items/R05.md)（版本/
   安装包/回归基座一致——v0.1.2 发布门槛前最后一项；依赖 R01–R04 已满足）。
+
+
+## 当前状态（2026-10-06：R05 关闭）
+
+- [R05](items/R05.md) 完成并推送 main：v0.1.2 条目 5/5 全部完成。
+  编号 0.1.2 经盘点冻结（本地+远端 tag 仅 v0.1.0/v0.1.1，release 仅
+  v0.1.0）；pyproject/`__version__`/CLI/wheel METADATA 统一 0.1.2；
+  sdist 改白名单（未跟踪草稿污染清零、自洽重构复验）；新增
+  `constraints-dev.txt` 钉开发/CI 工具链（pytest 9.1.1 /
+  pytest-asyncio 1.4.0 / ruff 0.16.3，运行依赖不钉）。E08 关闭：
+  坐实 v0.1.1 tag 指向提交包元数据仍为 0.1.0（历史「版本号补同步」
+  只改文档），历史 tag 不动，异常记录于 v0.1.2.md 与 R05 §6/§7。
+- **离线 CI 已建立**（`.github/workflows/ci.yml`）：pytest
+  (ubuntu/macos × py3.12/3.13) + ruff 五 job。run #1 真实暴露三处
+  环境敏感测试并根修（e2e 去 nmap 依赖改 `bash --version`；失败卡片
+  断言对齐 Q2 契约 `exit [1-9]\d*`；3.13 会话测试钉
+  `PYTHON_BASIC_REPL=1`——PyREPL 语义未支持，记为边界）；run #2 全绿：
+  <https://github.com/Moxxkidd/foam/actions/runs/37438177289>
+  （各 leg 686 passed + 1 skipped；runner 有 sshd，ssh 集成项实跑，
+  仅 msfconsole skip）。决策与契约保持论证见 R05 §7 决策 5/6/7。
+- 干净 venv 安装 0.1.2 wheel 验证：`foam --version`=`Foam 0.1.2`、
+  `fm --help` 一致；安装包（非 src 树）回归
+  test_scope/state/cli/replay/tui 五文件 350 例全绿；report/replay
+  对合成 engagement sanity 通过。临时产物均在 /tmp，未入库。
+- 测试基线：全仓 **685 passed + 2 skipped**（2026-10-06，HEAD e6451f8，
+  macOS py3.12.14；与 R04 收口后一致，R05 无产品代码变更），ruff 全绿。
+- **发布门槛仍是用户裁定**：本轮仅发布准备——未打 tag、未建 GitHub
+  release、未上传包。剩余门槛项（跨条目整链旅程、版本级迁移说明、
+  发布授权/tag/产物对应）清单见 [v0.1.2.md](releases/v0.1.2.md)；
+  pipx 安装路径未实测（本机无 pipx），3.13 本机未跑（CI+Kali 先例覆盖）。
+- 推送通道注记：HTTPS 凭据无 workflow scope，含 ci.yml 提交改经同账户
+  SSH 推送（R05 §7 注记）；恢复 HTTPS 需凭据加 workflow scope。
+- 下一步：发布门槛剩余项由用户裁定后按授权执行；或按
+  [R 索引](items/README.md) 推进下一版本条目。
