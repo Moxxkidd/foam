@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 # 正式定名 Foam(2026-08-22;显示名在 __app_name__,本文件为包名/命令名唯一来源)。
 name = "foam"
-version = "0.1.0"
+version = "0.1.2"
 description = "Foam — a Kali-native LLM harness for authorized security testing"
 readme = "README.md"
 license = "GPL-3.0-only"
@@ -41,6 +41,21 @@ fm = "foam.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/foam"]
+
+# sdist 显式白名单:hatchling 默认收集「未被 gitignore 的全部文件」,
+# 会把工作区里未提交的草稿/未跟踪文件打进 sdist(R05 实测:docs/items/R05+
+# 未跟踪草稿与 .claude/settings.local.json 均混入 0.1.0 红基线 sdist)。
+# 模式一律以 / 锚定根目录:无斜杠的裸模式按 gitignore 语义会在任意深度
+# 按 basename 命中(实测 "README.md" 把 docs/items/README.md 也打了进去)。
+# 构建自洽所需:src/ + pyproject.toml + README.md + LICENSE(pyproject 引用
+# 后两者);tests/ 与 docs/ 留在 git 仓库,不进 sdist(R05.md §7 决策)。
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

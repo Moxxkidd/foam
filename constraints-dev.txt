@@ -1,0 +1,14 @@
+# 开发/CI 工具链约束(R05,2026-10-06)
+#
+# 用途:CI(.github/workflows/ci.yml)与本机开发用
+#   python -m pip install -c constraints-dev.txt ".[dev]"
+# 将测试/lint 工具钉到本机实测验证过的版本(macOS arm64,Python 3.12.14,
+# 全量 685 passed + 2 skipped),防止上游新版本静默改变 CI 行为。
+#
+# 刻意不钉:运行依赖 httpx/rich/textual —— 保持 pyproject.toml 的保守区间,
+# 服从 Kali/Debian 官方源长期目标(AGENTS.md §5;R05.md §7 决策)。
+# 构建后端 hatchling 由 build-system.requires 自带下限,发布构建环境实测
+# 版本记录在 R05.md §6(build 1.6.1 / hatchling 1.32.4)。
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.3
