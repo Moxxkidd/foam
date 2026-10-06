@@ -696,8 +696,18 @@ WP-13(整合)依赖全部
   `fm --help` 一致；安装包（非 src 树）回归
   test_scope/state/cli/replay/tui 五文件 350 例全绿；report/replay
   对合成 engagement sanity 通过。临时产物均在 /tmp，未入库。
-- 测试基线：全仓 **685 passed + 2 skipped**（2026-10-06，HEAD e6451f8，
-  macOS py3.12.14；与 R04 收口后一致，R05 无产品代码变更），ruff 全绿。
+- 测试基线：全仓 **686 passed + 2 skipped**（2026-10-06 评审收口后；
+  收口新增版本一致性守卫 1 例，原基线 685+2 @ HEAD e6451f8，
+  R05 无产品代码变更），ruff 全绿。
+- 2026-10-06 评审收口（跟进提交）：① E08 根因守卫
+  `test_config.py::test_version_consistency_pyproject_matches_package`
+  （tomllib 断言 pyproject version == `__version__`，v0.1.1 漂移类
+  standing guard，兼作 AC02 常设证据）；② ci.yml 头注勘误——run
+  37438177289 逐 leg 日志实测：ssh 集成项在 ubuntu 与 macOS runner
+  均实跑通过（各 leg 686 passed + 1 skipped，唯一 skip 为
+  msfconsole），初版「runner 无 sshd/预期 2 skipped」与实测相反，
+  已按实况改写；③ 干净安装 pip freeze 依赖溯源补记 R05.md §6；
+  ④ `.claude/` 入仓库 .gitignore（此前仅个人全局覆盖）。
 - **发布门槛仍是用户裁定**：本轮仅发布准备——未打 tag、未建 GitHub
   release、未上传包。剩余门槛项（跨条目整链旅程、版本级迁移说明、
   发布授权/tag/产物对应）清单见 [v0.1.2.md](releases/v0.1.2.md)；

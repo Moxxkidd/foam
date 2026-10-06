@@ -22,6 +22,8 @@
 - CLI fail-closed 集成(第三轮):--save-profile 遇不可解析 base_url
   退出码 2 且临时 HOME 零落盘;上屏 base_url 占位符;profile 名两条
   回显路径过可打印过滤。
+- 版本一致性守卫(R05 收口追加):pyproject project.version ==
+  foam.__version__(E08/v0.1.1 漂移类常设 pin,兼作 R05-AC02 常设证据)。
 
 CLI 集成组说明:cli.py 的 --profile/--save-profile 接线
 (resolve_backend_args)已同批落地,本组为硬依赖(2026-09-12 移除
@@ -33,11 +35,13 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tomllib
 from collections import deque
 from pathlib import Path
 
 import pytest
 
+import foam
 from foam import cli
 from foam.agent.backends.base import LLMBackend, TextDelta, Usage
 from foam.config import (
@@ -1032,3 +1036,18 @@ def test_cli_profile_flag_missing_name_printable_filtered(isolated_home, capsys)
     assert "\x1b" not in err  # 无裸转义字符
     assert "\\x1b" in err  # 以转义形态可见
     assert "\n伪造" not in err  # 换行未伪造出独立行
+
+
+def test_version_consistency_pyproject_matches_package():
+    """E08 根因守卫(常设 pin):pyproject project.version == foam.__version__。
+
+    v0.1.1 漂移类实证:该 tag 指向提交的 pyproject 与 __init__.py 仍为
+    0.1.0(彼时「版本号补同步」只改了文档),两处元数据同源此前无任何
+    锁;R05 统一为 0.1.2 后立此守卫。本用例对当前代码即时通过,价值在
+    漂移复发时立即变红——非修复验证,是 standing guard;兼作 R05-AC02
+    「foam/fm/help/version 一致」的常设证据(R05.md §5 引用)。
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    with open(repo_root / "pyproject.toml", "rb") as f:
+        project_version = tomllib.load(f)["project"]["version"]
+    assert project_version == foam.__version__

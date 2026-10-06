@@ -19,5 +19,9 @@ engagements/
 *.local.scope
 .env
 
+# 本地工具配置(agent/编辑器在本机的私有设置,不随仓分发;此前仅靠个人
+# 全局 gitignore 覆盖,R05 收口补进仓库级)
+.claude/
+
 # 系统垃圾
 .DS_Store

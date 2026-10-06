@@ -5,12 +5,17 @@
 #
 # 环境门控 skip 面(AC04,逐项说明,见 tests/test_session.py):
 #   1. test_ssh_localhost_password_prompt —— 需本机 sshd 监听 :22 且口令
-#      登录可触发 password 提示;runner 无 sshd,按规格 skip「本机 sshd
-#      未运行(集成项按规格 skip)」。
-#   2. test_msfconsole_full_flow —— 需 msfconsole(Kali 才有);非 Kali
-#      环境 skipif,待 Kali 实测补跑。
-# 本机基线(macOS arm64,py3.12.14,685 passed + 2 skipped)的 2 个 skip
-# 即上述两项,CI 各 leg 预期同样 2 skipped。
+#      登录可触发 password 提示。实测(run 37438177289):ubuntu 与 macOS
+#      runner 均满足条件,该集成项四 leg 全部实际执行并通过(各 leg
+#      686 passed + 1 skipped;ssh 项从未出现在失败/skip 名单);无 sshd
+#      的开发机(如维护本机)按规格 skip「本机 sshd 未运行(集成项按
+#      规格 skip)」。
+#   2. test_msfconsole_full_flow —— 需 msfconsole(Kali 才有);CI 四类
+#      runner 与非 Kali 本机均 skipif,待 Kali 实测补跑。
+# 即:CI 各 leg 恰 1 skipped(msfconsole 项);本机基线(macOS arm64,
+# py3.12.14)为 685 passed + 2 skipped;同一套件总用例数恒 687。
+# (2026-10-06 收口修正:初版注释误称 runner 无 sshd、预期 2 skipped,
+# 与上述实测相反,已按 run 日志实况改写。)
 #
 # 工具链钉 constraints-dev.txt(pytest==9.1.1 / pytest-asyncio==1.4.0 /
 # ruff==0.16.3,R05-A 决策 4);Python 3.13 为受支持较新版本
