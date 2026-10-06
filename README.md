@@ -132,15 +132,24 @@ key/token/secret 字样的键一律剔除、不落盘。
 
 ## 项目状态
 
-**v0.1.0(2026-09-08)**:13/13 工作包关闭,里程碑门 M1–M4 全部通过,
-383 项测试通过。后续分两条线:
+**v0.1.2(发布准备完成,未发布;2026-10-06)**:维护批次 R01–R05 完成——
+授权目标判定(E01/E02)、scope 冻结/恢复一致(E03/E07)、退出资源收口
+(E04)、报告全量分页(E05)修复,版本元数据/安装包/回归基座统一。
+包元数据与 CLI 版本一致为 0.1.2;**未打 tag、未建 release、未上传包**
+(发布授权见 `docs/releases/v0.1.2.md` 发布门槛)。
 
-- **v0.1.x 维护批**:实战反复验证的审计与核验缺口(会话操作进审计链、
-  `foam verify` 子命令、结项证据页等)
-- **v0.2 波次**:nftables 网络级出口护栏、多后端 failover、报告模板化、
-  meterpreter 语义层等
-
-完整清单见 `docs/HANDOVER.md`「v1 立项清单」节。
+- 测试基线:**685 passed + 2 skipped**(2026-10-06,HEAD `e6451f8`,
+  macOS arm64 py3.12.14;2 项 skip 为 ssh/msfconsole 环境门控,理由见
+  `.github/workflows/ci.yml` 头注)。
+- 离线 CI:pytest(py3.12/3.13 × ubuntu/macos)+ ruff 五 job 全绿,
+  实测 <https://github.com/Moxxkidd/foam/actions/runs/37438177289>
+  (CI 各 leg 686 passed + 1 skipped:ssh 集成项在 runner 实跑通过)。
+- 历史发布:v0.1.0(2026-09-08,唯一 GitHub release)。v0.1.1 仅有 tag
+  与文档宣告,包元数据当时未同步(仍为 0.1.0)——历史 tag 不改动,
+  异常如实记录于 `docs/releases/v0.1.2.md`。
+- 逐条验收证据:`docs/items/R01.md`–`R05.md`;版本排期与发布门槛:
+  `docs/releases/v0.1.2.md`;后续批次方向见 `docs/HANDOVER.md`
+  「v1 立项清单」节。
 
 ## License
 
