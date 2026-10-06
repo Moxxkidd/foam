@@ -1,0 +1,57 @@
+# R05-B(2026-10-06):离线回归 CI。
+#
+# 套件离线 by design:后端全部 fake,无任何 API key/网络依赖,本 workflow
+# 也不注入任何密钥;不因 CI 环境全局跳过测试(AGENTS.md §7 / R05.md §1 风险)。
+#
+# 环境门控 skip 面(AC04,逐项说明,见 tests/test_session.py):
+#   1. test_ssh_localhost_password_prompt —— 需本机 sshd 监听 :22 且口令
+#      登录可触发 password 提示;runner 无 sshd,按规格 skip「本机 sshd
+#      未运行(集成项按规格 skip)」。
+#   2. test_msfconsole_full_flow —— 需 msfconsole(Kali 才有);非 Kali
+#      环境 skipif,待 Kali 实测补跑。
+# 本机基线(macOS arm64,py3.12.14,685 passed + 2 skipped)的 2 个 skip
+# 即上述两项,CI 各 leg 预期同样 2 skipped。
+#
+# 工具链钉 constraints-dev.txt(pytest==9.1.1 / pytest-asyncio==1.4.0 /
+# ruff==0.16.3,R05-A 决策 4);Python 3.13 为受支持较新版本
+# (Kali Rolling arm64 py3.13.7 实测先例,见 docs/HANDOVER.md 2026-08-22 补测)。
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install (dev toolchain pinned via constraints-dev.txt)
+        run: python -m pip install -c constraints-dev.txt ".[dev]"
+      - name: pytest (offline suite)
+        run: python -m pytest -q
+
+  ruff:
+    name: ruff check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install ruff (pinned via constraints-dev.txt)
+        run: python -m pip install -c constraints-dev.txt ruff
+      - name: ruff check
+        run: ruff check .
