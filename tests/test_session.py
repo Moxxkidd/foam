@@ -147,7 +147,11 @@ def test_prompt_library_covers_spec_families():
 
 
 async def test_python_interactive_multi_round(tool):
-    s = await tool.session_open("python3 -i")
+    # R05:py3.13 起默认 PyREPL(重绘/转义序列不同,本用例的稳定回显假设
+    # 不成立);PYTHON_BASIC_REPL=1 强制经典 REPL(3.12 无此变量,静默忽略)。
+    # harness 提示库本就不收 python REPL(见上方 fixtures 注释),PyREPL 交互
+    # 语义属未支持边界,见 R05.md §8。
+    s = await tool.session_open("PYTHON_BASIC_REPL=1 python3 -i")
     sid = s["session_id"]
     r = await tool.session_read(sid, wait_pattern=r">>> ", timeout_seconds=10)
     assert r["matched"] is True

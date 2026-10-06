@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from collections import deque
 from pathlib import Path
@@ -649,7 +650,9 @@ async def test_failed_command_card_auto_expands(tmp_path):
         card = narrative_blocks(main, ToolCard)[0]
         assert card.expanded is True  # Q2 自动展开
         header = card.query_one(".card-header").content
-        assert header.startswith("✗") and "exit 1" in header
+        # R05:ls 不存在路径的退出码因平台而异(BSD/macOS=1,GNU/Linux=2),
+        # Q2 契约是「非零退出上屏」,不断言具体码值。
+        assert header.startswith("✗") and re.search(r"exit [1-9]\d*", header)
         body = card.query_one(".card-body").content
         assert "No such file or directory" in body
         assert "落盘" in body and "sha256:" in body

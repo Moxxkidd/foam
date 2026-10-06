@@ -4,8 +4,9 @@
   事件列表 / (事件列表, 末尾抛出的异常) / Exception(整轮直接抛)/
   callable(messages)——可挂起、可延迟,用于 kill/超时等时序测试。
 - e2e 走真实 BashTool + 真实 AuditLog(tmp_path),命令全部无害
-  (echo/python3 print/nmap --version);越界用例的越界命令只到护栏为止,
-  永不执行。
+  (echo/python3 print/bash --version——R05 由 nmap --version 改来:CI runner
+  无 nmap(exit 127),契约「真实执行输出进 tool 结果」不变);越界用例的
+  越界命令只到护栏为止,永不执行。
 - fixture 凭据不出现;scope 文本为合成网段。
 """
 
@@ -155,7 +156,7 @@ async def test_e2e_happy_path(tmp_path):
         [
             [
                 TextDelta("先确认工具版本与目标写法。"),
-                ToolCall("tc-1", "run_command", {"command": "nmap --version"}),
+                ToolCall("tc-1", "run_command", {"command": "bash --version"}),
                 ToolCall("tc-2", "run_command", {"command": "echo recon 127.0.0.1"}),
                 Usage(100, 20),
             ],
@@ -177,16 +178,16 @@ async def test_e2e_happy_path(tmp_path):
     assert kinds.count("exec_result_meta") == 2
     records = audit_records(env)
     exec_requests = [r for r in records if r["kind"] == "exec_request"]
-    assert exec_requests[0]["payload"]["targets"] == []  # nmap --version 无目标
+    assert exec_requests[0]["payload"]["targets"] == []  # bash --version 无目标
     assert exec_requests[1]["payload"]["targets"] == ["127.0.0.1"]
     for rec in [r for r in records if r["kind"] == "exec_result_meta"]:
         assert rec["payload"]["exit_code"] == 0
         assert rec["payload"]["sha256"]
     assert verify(env.audit_path)
 
-    # 真实执行:nmap 版本输出进了 tool 结果;两个 tool 结果按序配对
+    # 真实执行:bash 版本输出进了 tool 结果;两个 tool 结果按序配对
     tc1 = tool_messages(env, "tc-1")
-    assert len(tc1) == 1 and "Nmap version" in tc1[0].content
+    assert len(tc1) == 1 and "GNU bash" in tc1[0].content
     assert_protocol_consistent(env.loop.messages)
     final = env.loop.messages[-1]
     assert final.role == "assistant" and not final.tool_calls
