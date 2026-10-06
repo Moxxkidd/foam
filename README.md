@@ -127,7 +127,7 @@ key/token/secret 字样的键一律剔除、不落盘。
 - 实弹报告:`docs/e2e/scenario1-report.md`、`docs/demo/scenario2-report.md`、
   `docs/demo/htb-meow-20260908/`
 - 已知问题:`docs/known-issues.md`
-- 交接文档(含 23 条已知陷阱与里程碑记录):`docs/HANDOVER.md`
+- 交接文档(含 24 条已知陷阱与里程碑记录):`docs/HANDOVER.md`
 - 规格与逐条核销:`docs/work-packages/`、`docs/spec-verification.md`
 
 ## 项目状态

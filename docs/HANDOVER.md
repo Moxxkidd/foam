@@ -455,6 +455,14 @@ WP-13(整合)依赖全部
     值),带前导空格的 `  FOO=bar` 静默不生效。改 zshenv 用行号手术
     或整体重写,改完 `ssh host 'env | grep -c FOAM'` 类只数不印值
     的方式验证。
+24. **TUI pilot 测试的 8s `wait_for` 在 CI 高负载 runner 偶发超时**
+    (R05 踩,2026-10-06):test_tui.py 的 `wait_for` 轮询上限 8.0s,
+    GitHub 共享 runner 上 textual 渲染/异步收敛偶超——同一代码树
+    4 次全量跑 3 绿 1 红(红腿各挂 1 个不同的 TUI 用例,重跑即过)。
+    判据:同 SHA 前后跑出绿、失败项每次不同、重跑恢复 = 时序抖动,
+    非回归。未根因治理(调超时/加重试属测试基建条目);见 R05.md §8。
+    另:git HTTPS OAuth 凭据无 `workflow` scope 时推不了
+    .github/workflows/——同账户 SSH 推送不受此限(R05 §7 注记)。
 
 ## 当前状态(2026-09-04 协调层记录两条,总指挥拍板)
 
