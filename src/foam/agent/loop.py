@@ -467,6 +467,9 @@ class AgentLoop:
         # 任务集供 _finish 排空(R06-C);pending 字典登记未消费完成的事件。
         self._job_exit_tasks: set[asyncio.Task[None]] = set()
         self._job_exit_pending: dict[str, JobExitEvent] = {}
+        # 消费任务异常错误面(done_callback 取回入账,防 never-retrieved 噪音;
+        # 事件仍留 pending 由 drain 兜底)——并入 drain 报告 errors。
+        self._job_exit_errors: list[str] = []
         if self._index is not None:
             self._bash.on_job_exit = self._schedule_job_exit
 
@@ -938,7 +941,18 @@ class AgentLoop:
         self._job_exit_pending[event.event_id] = event
         task = asyncio.create_task(self._consume_job_exit(event))
         self._job_exit_tasks.add(task)
-        task.add_done_callback(self._job_exit_tasks.discard)
+        task.add_done_callback(self._on_job_exit_task_done)
+
+    def _on_job_exit_task_done(self, task: asyncio.Task[None]) -> None:
+        """消费任务完成回调:移出任务集;取回异常入错误面(不取则 asyncio
+        报 "exception was never retrieved" 噪音)。行为不变:事件仍留
+        pending(任务内未 pop),由 drain 兜底登记。"""
+        self._job_exit_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._job_exit_errors.append(f"job_exit 消费任务异常: {exc!r}")
 
     async def _consume_job_exit(self, event: JobExitEvent) -> None:
         """消费终态事件:解析 → 索引单事务(登记+facts) → 审计 → 回写。
@@ -1176,6 +1190,9 @@ class AgentLoop:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.sleep(0)  # 让已完成任务的 done_callback 落地(取回异常)
+        if self._job_exit_errors:
+            report["errors"].extend(self._job_exit_errors)  # 消费异常错误面
         for event_id, event in list(self._job_exit_pending.items()):
             try:
                 if self._index is not None and self._index.register_job_exit_pending(

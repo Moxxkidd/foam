@@ -561,9 +561,15 @@ async def test_replay_after_index_reopen_not_double(tmp_path, monkeypatch):
 
 
 async def test_shutdown_drains_completions(tmp_path, monkeypatch):
-    """R06-AC06:临界完成竞态——job 在 _finish 收割期间到达终态,
-    run_finished 落链前该事件已消费或明确登记 pending(本例:已消费)。"""
-    # shim 睡 0.8s 才输出,backend 0.3s 后 FINISH:job 在收割期间到终态
+    """R06-AC06(killed-during-reap 路径):shim 睡 0.8s 而 backend 0.3s
+    FINISH——SIGKILL 必然先于自然完成,job 在收割期间被杀到终态;
+    run_finished 落链前该 killed 事件已消费或明确登记(本例:已消费)。
+
+    评审收口(2026-10-08):原断言 `reason in ("completed","killed")` 把两条
+    路径和稀泥——本例时序钉死为 killed;真实 completed 临界由
+    test_completed_exit_consumed_before_run_finished 覆盖。
+    """
+    # shim 睡 0.8s 才输出,backend 0.3s 后 FINISH:job 在收割期间被杀
     nmap_shim(tmp_path, monkeypatch, sleep_seconds=0.8)
     live = make_live_env(tmp_path / "live", backend_delay=0.3, wait_jobs=False)
     result = await live.loop.run("后台侦察 192.0.2.0/24")
@@ -576,14 +582,43 @@ async def test_shutdown_drains_completions(tmp_path, monkeypatch):
     assert len(finished) == 1
     # 审计顺序钉死:job_exit* < run_finished
     assert job_exits[0]["seq"] < finished[0]["seq"]
+    assert job_exits[0]["payload"]["reason"] == "killed"
     row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
     assert row["status"] == "consumed"  # 收割期终态被 drain 接住消费
-    assert row["reason"] in ("completed", "killed")
+    assert row["reason"] == "killed"
+    assert row["exit_code"] == -9  # SIGKILL(不引入 signal 常量,读性优先)
     assert row["audit_seq"] == job_exits[0]["seq"]
     drain = finished[0]["payload"]["job_exit_drain"]
     assert drain["registered_pending"] == []
     assert drain["errors"] == []
     assert finished[0]["payload"]["run_id"] == live.loop._run_id
+    assert verify(live.audit_path)
+    live.index.close()
+
+
+async def test_completed_exit_consumed_before_run_finished(tmp_path, monkeypatch):
+    """R06-AC06(真实 completed 临界):shim 即时退出 + wait_jobs 闸门——
+    job 在收割开始前自然完成,reason=completed 的 job_exit 在
+    run_finished 落链前已消费(审计 seq 顺序钉死)。"""
+    nmap_shim(tmp_path, monkeypatch)  # 即时完成
+    live = make_live_env(tmp_path / "live")  # wait_jobs=True:FINISH 前 job 已终态
+    result = await live.loop.run("后台侦察 192.0.2.0/24")
+    assert result.status == "finished"
+
+    records = audit_records(live)
+    job_exits = [r for r in records if r["kind"] == "job_exit"]
+    finished = [r for r in records if r["kind"] == "run_finished"]
+    assert len(job_exits) == 1
+    assert job_exits[0]["payload"]["reason"] == "completed"
+    assert job_exits[0]["payload"]["exit_code"] == 0
+    assert job_exits[0]["seq"] < finished[0]["seq"]  # 顺序钉死
+    row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
+    assert row["status"] == "consumed"
+    assert row["reason"] == "completed"
+    assert row["audit_seq"] == job_exits[0]["seq"]
+    drain = finished[0]["payload"]["job_exit_drain"]
+    assert drain["registered_pending"] == []
+    assert drain["errors"] == []
     assert verify(live.audit_path)
     live.index.close()
 
@@ -722,5 +757,111 @@ async def test_background_parse_failure_keeps_artifacts(tmp_path, monkeypatch):
     assert on_disk.decode("utf-8").endswith("不是任何工具输出\n")
     job_exits = [r for r in records if r["kind"] == "job_exit"]
     assert len(job_exits) == 1
+    assert verify(live.audit_path)
+    live.index.close()
+
+
+async def test_close_run_full_form_drains_before_state_close(tmp_path, monkeypatch):
+    """评审收口(2026-10-08):全形态 RunRuntime(state/engagement/audit/
+    backend 齐备)——后台 job 竞态完成,close_run 的 drain 在 state.close
+    之前消费:若顺序倒挂,consume 撞已关连接,errors 非空或事件 pending。
+    断言行 consumed、errors 为空、库内 facts 落账、审计链完整。"""
+    import sqlite3
+
+    from foam.runtime import RunRuntime, close_run
+    from foam.state.files import Engagement
+    from foam.tools.state import StateTool
+
+    nmap_shim(tmp_path, monkeypatch)
+    scope_file = tmp_path / "lab.scope"
+    scope_file.write_text(SCOPE_TEXT, encoding="utf-8")
+    engagement = Engagement.create(
+        tmp_path / "engagements",
+        "评审收口全形态",
+        scope_path=scope_file,
+        engagement_id="r06-full-form",
+    )
+    state = StateTool(engagement)
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    bash = BashTool(tmp_path / "outputs")
+    backend = FakeBackend()  # 不跑 run;loop 仅作 drain 源(run 未到 _finish)
+    loop = AgentLoop(
+        backend=backend,
+        bash=bash,
+        scope=parse_scope(SCOPE_TEXT),
+        audit=audit,
+        workdir=tmp_path,
+        system_prompt=build_system_prompt(workdir=tmp_path),
+        index=state.index,
+    )
+    bg = await bash.run_command(BG_NMAP_CMD, background=True)
+    assert bg["status"] == "running"
+    # 等 job 自然完成(输出全量落盘、事件已触发);close_run 的收割幂等空转
+    job = bash._jobs[bg["job_id"]]
+    await asyncio.wait_for(job.done.wait(), timeout=5)
+    # 让消费任务慢半拍:close_run 的 drain 真正承担等待(否则任务抢跑,
+    # drain 空转测不出「drain 在 state.close 前」)
+    original_consume = AgentLoop._consume_job_exit
+
+    async def slow_consume(self, event):
+        await asyncio.sleep(0.1)
+        return await original_consume(self, event)
+
+    monkeypatch.setattr(AgentLoop, "_consume_job_exit", slow_consume)
+
+    runtime = RunRuntime(
+        bash=bash,
+        state=state,
+        engagement=engagement,
+        audit=audit,
+        backend=backend,
+        loop=loop,
+    )
+    report = await close_run(runtime, run_id="test", reason="全形态收口")
+    assert report["errors"] == []
+    assert report["cleanup_status"] == "ok"
+
+    # state 已关:换干净连接读库核对——行 consumed 即 drain 先于 close 钉住
+    conn = sqlite3.connect(engagement.paths.index_db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM job_events").fetchone()
+    assert row["status"] == "consumed"
+    assert row["audit_seq"] is not None
+    assert row["reason"] in ("completed", "killed")  # 收割时序两可,均已消费
+    assert conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0] == 2
+    conn.close()
+
+    records = [
+        json.loads(line)
+        for line in engagement.paths.audit_jsonl.read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    assert len([r for r in records if r["kind"] == "job_exit"]) == 1
+    assert verify(engagement.paths.audit_jsonl)
+
+
+async def test_consume_task_exception_recorded_not_lost(tmp_path, monkeypatch):
+    """评审收口(2026-10-08):消费任务抛非 sqlite 异常时,done_callback
+    取回异常入账(_job_exit_errors 错误面)——不产生 "exception was never
+    retrieved" 噪音;事件留 pending,drain 兜底登记,run_finished 载荷可见。"""
+    nmap_shim(tmp_path, monkeypatch)
+    live = make_live_env(tmp_path / "live")
+
+    async def boom(self, event):
+        raise RuntimeError("消费面炸了(注入)")
+
+    monkeypatch.setattr(AgentLoop, "_consume_job_exit", boom)
+    result = await live.loop.run("后台侦察 192.0.2.0/24")
+    assert result.status == "finished"  # 消费面异常不炸主环
+
+    assert any("消费面炸了" in e for e in live.loop._job_exit_errors)
+    row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
+    assert row["status"] == "pending"  # 事件未消费,drain 兜底登记
+    finished = [r for r in audit_records(live) if r["kind"] == "run_finished"][0]
+    drain = finished["payload"]["job_exit_drain"]
+    assert row["event_id"] in drain["registered_pending"]
+    assert any("消费面炸了" in e for e in drain["errors"])  # 错误面进载荷
     assert verify(live.audit_path)
     live.index.close()

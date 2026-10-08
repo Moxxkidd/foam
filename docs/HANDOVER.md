@@ -738,3 +738,15 @@ WP-13(整合)依赖全部
   例），ruff 全绿；schema v1↔v2 双向兼容有测试（旧程序读写新库不受影响）。
 - 下一步：按 [R 索引](items/README.md) 评审 [R07](items/R07.md)（PTY
   操作审计与提示事件）。
+
+- 2026-10-08 对抗评审收口（跟进提交）：两路独立评审无阻断；修一真 bug
+  ——`_transaction` COMMIT 失败（busy 被读锁挡）不回滚致连接毒化
+  （滞留活跃事务，实测 re-BEGIN 报 cannot start a transaction within a
+  transaction），修为 rollback 再上抛并钉 busy 注入测试；补 pending 占位
+  行补消费、真实 completed 临界完成（原 shutdown 例收窄为
+  killed-during-reap）、close_run 全形态集成（drain 在 state.close 前）
+  三类测试；消费任务异常改由 done_callback 取回入 `_job_exit_errors`
+  错误面（并入 drain 报告），消除 never-retrieved 噪音。TUI quit 5s
+  预算未覆盖收割+drain 延长链、收割上界耗尽后逃逸 job 事件蒸发、兜底
+  事件 reason="running"、busy 同步等待冻结事件循环四项只记录不修
+  （见 R06.md §7/§8，归测试基建/恢复条目）。净增测试 5 例。

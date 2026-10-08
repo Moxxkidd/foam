@@ -1209,3 +1209,109 @@ def test_v1_program_reads_v2_db_unaffected(tmp_path):
 
     with Index(db) as index:  # 新程序再打开:两个写入都在
         assert index.counts()["hosts"] == 2
+
+
+# ================================================================
+# R06 评审收口(2026-10-08):busy 毒化修复 + pending 补消费覆盖
+# ================================================================
+
+
+def _make_exit_event(event_id="job_exit:rev01", job_id="rev01"):
+    """合成 JobExitEvent(明显合成路径,不依赖真实进程)。"""
+    from foam.tools.bash import JobExitEvent
+
+    return JobExitEvent(
+        event_id=event_id,
+        run_id="run-test",
+        job_id=job_id,
+        command="nmap -sV 192.0.2.10",
+        reason="completed",
+        exit_code=0,
+        duration_ms=12,
+        ended_at="2026-10-08T00:00:00+00:00",
+        output_path="TESTONLY-outputs/rev01.log",  # 合成引用,不读真实文件
+        sha256="ab" * 32,
+        stdout_path=None,
+        stdout_sha256=None,
+        stderr_path=None,
+        stderr_sha256=None,
+        total_bytes=100,
+        total_lines=4,
+    )
+
+
+def test_consume_job_exit_busy_failure_no_poison(tmp_path):
+    """评审收口:COMMIT 被读锁挡(busy)失败后连接不得毒化。
+
+    修复前:BEGIN IMMEDIATE 持 RESERVED,COMMIT 拿不到 EXCLUSIVE 超时
+    失败后无 rollback——连接滞留开事务,后续 _transaction 的 BEGIN 报
+    "cannot start a transaction within a transaction",直到某个事务外
+    upsert 碰巧提交才自愈。修复后:commit 失败即 rollback,读侧释放后
+    同一 Index 直接重试成功。
+    """
+    db = tmp_path / "index.sqlite"
+    index = Index(db, timeout=0.2)  # busy 重试上界收窄,测试快速失败
+    # 读侧:第二连接 BEGIN + SELECT 持 SHARED(与 R04 snapshot 同机制)
+    reader = sqlite3.connect(db)
+    reader.isolation_level = None
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM hosts").fetchone()
+
+    event = _make_exit_event()
+    facts = [{"kind": "host", "ip": "192.0.2.10"}]
+    with pytest.raises(sqlite3.OperationalError):  # busy 如实失败
+        index.consume_job_exit(event, facts)
+
+    reader.execute("COMMIT")  # 读侧释放
+    reader.close()
+
+    # 同一 Index 直接重试(无任何事务外 upsert 碰巧救场):必须成功
+    outcome, stats = index.consume_job_exit(event, facts)
+    assert outcome == "consumed"
+    assert stats["hosts"] == 1
+    row = index.job_event(event.event_id)
+    assert row["status"] == "consumed"
+    assert index.query("hosts")["rows"][0]["ip"] == "192.0.2.10"
+    index.close()
+
+
+def test_pending_placeholder_completed_by_consume(tmp_path):
+    """评审收口:drain 登记的 pending 占位行,迟到补消费升级为 consumed——
+    facts 真实入库、终态字段被正式值覆盖;补消费后重复投递仍幂等。"""
+    index = Index(tmp_path / "index.sqlite")
+    event = _make_exit_event("job_exit:pend01", "pend01")
+    assert index.register_job_exit_pending(event) is True
+    row = index.job_event(event.event_id)
+    assert row["status"] == "pending"
+    assert row["audit_seq"] is None
+    assert row["parse_tool"] is None
+
+    facts = [
+        {"kind": "host", "ip": "192.0.2.10"},
+        {
+            "kind": "port",
+            "host": "192.0.2.10",
+            "port": 445,
+            "service": "microsoft-ds",
+        },
+    ]
+    outcome, stats = index.consume_job_exit(event, facts, parse_tool="nmap")
+    assert outcome == "consumed"
+    assert stats["hosts"] == 1 and stats["ports"] == 1
+    row = index.job_event(event.event_id)
+    assert row["status"] == "consumed"
+    assert row["run_id"] == "run-test"  # 正式值覆盖占位
+    assert row["reason"] == "completed"
+    assert row["parse_tool"] == "nmap"
+    assert row["consumed_at"] is not None
+    assert index.counts()["hosts"] == 1
+    assert index.counts()["ports"] == 1
+
+    # 幂等底色不变:审计回写后再投递同事件 duplicate,facts 零增量
+    index.mark_job_event_audited(event.event_id, 1)
+    outcome2, stats2 = index.consume_job_exit(event, facts, parse_tool="nmap")
+    assert outcome2 == "duplicate"
+    assert stats2 is None
+    assert index.counts()["hosts"] == 1
+    assert index.job_event(event.event_id)["audit_seq"] == 1
+    index.close()

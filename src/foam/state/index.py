@@ -205,7 +205,14 @@ class Index:
                 self._conn.rollback()
                 raise
             else:
-                self._conn.commit()
+                try:
+                    self._conn.commit()
+                except BaseException:
+                    # COMMIT 失败(如 busy 被读锁挡)不回滚会毒化连接:
+                    # 滞留开事务,后续 BEGIN 报 cannot start a transaction
+                    # within a transaction(2026-10-08 评审坐实,实测钉死)。
+                    self._conn.rollback()
+                    raise
         finally:
             self._tx_depth -= 1
             self._conn.isolation_level = prior
