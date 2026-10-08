@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -164,6 +165,36 @@ async def _read_chunks(
         yield chunk
 
 
+@dataclass(frozen=True)
+class JobExitEvent:
+    """后台/前台 job 到达终态的完成事件(R06 决策 1/2)。
+
+    每 job 恰生产一次:`_supervise` 在 finalize 之后、done 置位之前触发
+    (`_supervise_guarded` 兜底路径同)。``event_id`` 由 job_id 确定性派生
+    (``job_exit:<job_id>``),重复通知/重放天然同 ID;``run_id`` 生产方不填
+    (None),由消费方(loop)接线时补。manifest 引用定稿后的落盘账目;
+    兜底路径 finalize 失败时 manifest 相关字段为 None 并携带 error。
+    """
+
+    event_id: str
+    run_id: str | None
+    job_id: str
+    command: str
+    reason: str  # completed / timeout / killed(与 job.status 终态同源)
+    exit_code: int | None
+    duration_ms: int | None
+    ended_at: str  # UTC ISO-8601
+    output_path: str
+    sha256: str | None
+    stdout_path: str | None
+    stdout_sha256: str | None
+    stderr_path: str | None
+    stderr_sha256: str | None
+    total_bytes: int | None
+    total_lines: int | None
+    error: str | None = None
+
+
 @dataclass
 class _Job:
     """一次 run_command 的全部运行时状态。"""
@@ -184,6 +215,7 @@ class _Job:
     manifest: OutputManifest | None = None
     kill_requested: bool = False
     error: str | None = None
+    exit_event_sent: bool = False  # R06:完成事件每 job 恰一次的守卫
     done: asyncio.Event = field(default_factory=asyncio.Event)
     wait_task: asyncio.Task[None] | None = None  # 看管任务(前台/后台一律独立任务)
 
@@ -213,6 +245,9 @@ class BashTool:
         # _close_result 非 None 即 aclose 已完成,二次调用短路返回同一结果。
         self._closed = False
         self._close_result: dict[str, Any] | None = None
+        # R06:job 终态事件回调(可选,由消费方接线;同步调用,消费方自行调度
+        # 异步任务)。在 finalize 之后、done 置位之前触发,每 job 恰一次。
+        self.on_job_exit: Callable[[JobExitEvent], None] | None = None
 
     # ---------- WP-04 唯一入口 ----------
 
@@ -456,7 +491,52 @@ class BashTool:
             except Exception as finalize_exc:
                 # 定稿失败也至少置位 done:aclose 不因此烧上界;异常如实入账
                 job.error += f";定稿异常: {finalize_exc!r}"
+            self._emit_job_exit(job)  # R06:兜底路径同样生产终态事件
             job.done.set()
+
+    def _emit_job_exit(self, job: _Job) -> None:
+        """终态事件生产(R06 决策 1):finalize 之后、done 置位之前,每 job 恰一次。
+
+        回调异常捕获进 ``job.error``,绝不影响 done 置位与收尾账目(生产
+        侧不为消费方买单)。回调同步调用;异步消费由消费方自行调度。
+        """
+        if job.exit_event_sent:
+            return
+        job.exit_event_sent = True
+        callback = self.on_job_exit
+        if callback is None:
+            return
+        manifest = job.manifest
+        event = JobExitEvent(
+            event_id=f"job_exit:{job.job_id}",  # 决策 2:确定性派生
+            run_id=None,  # 由消费方(loop)接线时补
+            job_id=job.job_id,
+            command=job.command,
+            reason=job.status,
+            exit_code=job.exit_code,
+            duration_ms=job.duration_ms,
+            ended_at=datetime.now(UTC).isoformat(timespec="milliseconds"),
+            output_path=str(
+                manifest.output_path if manifest else job.recorder.combined_path
+            ),
+            sha256=manifest.sha256 if manifest else None,
+            stdout_path=(
+                str(manifest.stdout_path) if manifest and manifest.stdout_path else None
+            ),
+            stdout_sha256=manifest.stdout_sha256 if manifest else None,
+            stderr_path=(
+                str(manifest.stderr_path) if manifest and manifest.stderr_path else None
+            ),
+            stderr_sha256=manifest.stderr_sha256 if manifest else None,
+            total_bytes=manifest.total_bytes if manifest else None,
+            total_lines=manifest.total_lines if manifest else None,
+            error=job.error,
+        )
+        try:
+            callback(event)
+        except Exception as exc:
+            note = f"完成事件回调异常: {exc!r}"
+            job.error = f"{job.error};{note}" if job.error else note
 
     async def _supervise(self, job: _Job) -> None:
         """看管一个 job 到终态:喂 recorder、等退出/超时、收尾账目与视图。"""
@@ -489,6 +569,7 @@ class BashTool:
         job.manifest = job.recorder.finalize()
         job.output_view = self._render_view(job)
         job.recorder.release_ring()  # 完结 job 释放 ring:内存只随活动 job 数增长
+        self._emit_job_exit(job)  # R06:finalize 之后、done 置位之前
         job.done.set()
 
     @staticmethod

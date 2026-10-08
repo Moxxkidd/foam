@@ -12,6 +12,7 @@ import re
 import signal
 import time
 import tracemalloc
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ from foam.tools.bash import (
     DEFAULT_TIMEOUT_SECONDS,
     TOOL_SCHEMAS,
     BashTool,
+    JobExitEvent,
 )
 
 
@@ -488,3 +490,108 @@ def test_kill_group_kills_live_leader_group(monkeypatch):
 
     BashTool._kill_group(SimpleNamespace(proc=_Proc()))
     assert calls == [(555, signal.SIGKILL)]
+
+
+# ---------- R06-A:后台 job 完成事件生产(决策 1/2,规格 §4 R06-A) ----------
+
+
+@pytest.fixture
+async def exit_events(tool):
+    """收集 on_job_exit 事件;回调为同步调用,append 后即返回。"""
+    events: list = []
+    tool.on_job_exit = events.append
+    return events
+
+
+async def _wait_events(events, n=1, within=5.0):
+    """等事件到齐(不调用 list_jobs——R06-A 核心:不靠轮询副作用完成感知)。"""
+    deadline = time.monotonic() + within
+    while len(events) < n:
+        assert time.monotonic() < deadline, f"事件未到齐: {len(events)}/{n}"
+        await asyncio.sleep(0.02)
+
+
+async def test_completion_without_poll(tool, exit_events):
+    """R06-AC02:不调用 list_jobs,后台完成后回调恰收到一个完成事件。"""
+    bg = await tool.run_command("printf 'hello-bg\\n'", background=True)
+    assert bg["status"] == "running"
+
+    await _wait_events(exit_events)
+    assert len(exit_events) == 1  # 恰一个逻辑终态
+    event = exit_events[0]
+    assert isinstance(event, JobExitEvent)
+    assert event.event_id == f"job_exit:{bg['job_id']}"  # 决策 2:确定性派生
+    assert event.job_id == bg["job_id"]
+    assert event.command == "printf 'hello-bg\\n'"
+    assert event.reason == "completed"
+    assert event.exit_code == 0
+    assert event.duration_ms is not None and event.duration_ms >= 0
+    assert event.run_id is None  # 生产方不填,消费方(loop)补
+    datetime.fromisoformat(event.ended_at)  # UTC ISO 时间戳可解析
+
+    # 决策 1:回调触发时 manifest 已 finalize——事件哈希与落盘复算一致
+    combined = Path(event.output_path).read_bytes()
+    assert combined == b"hello-bg\n"
+    assert hashlib.sha256(combined).hexdigest() == event.sha256
+    stdout_bytes = Path(event.stdout_path).read_bytes()
+    assert hashlib.sha256(stdout_bytes).hexdigest() == event.stdout_sha256
+    assert (
+        hashlib.sha256(Path(event.stderr_path).read_bytes()).hexdigest()
+        == event.stderr_sha256
+    )
+    assert event.total_bytes == len(combined)
+    assert event.total_lines == 1
+
+    # 同 job 不重发:已完结后 kill(no-op)与 aclose 都不再出事件
+    await tool.kill_job(bg["job_id"])
+    await asyncio.sleep(0.1)
+    assert len(exit_events) == 1
+
+
+async def test_exit_event_terminal_states(tool, exit_events):
+    """R06-AC03:completed/timeout/killed 各恰一个逻辑终态事件。"""
+    done = await tool.run_command("true", background=True)
+    timed = await tool.run_command("sleep 30", background=True, timeout_seconds=0.3)
+    victim = await tool.run_command("sleep 30", background=True, timeout_seconds=None)
+
+    await _wait_events(exit_events, 1)  # completed 先到
+    await tool.kill_job(victim["job_id"])
+    await _wait_events(exit_events, 3)
+
+    by_job = {e.job_id: e for e in exit_events}
+    assert len(by_job) == 3  # 每 job 恰一个事件
+    assert by_job[done["job_id"]].reason == "completed"
+    assert by_job[timed["job_id"]].reason == "timeout"
+    assert by_job[timed["job_id"]].exit_code == -signal.SIGKILL
+    assert by_job[victim["job_id"]].reason == "killed"
+    assert by_job[victim["job_id"]].exit_code == -signal.SIGKILL
+    assert all(e.sha256 for e in exit_events)  # 各终态都有定稿账目
+
+
+async def test_exit_event_callback_exception_does_not_break_job(tool):
+    """回调异常不破坏 job 收尾:done 置位、终态账目完整、异常如实入账。"""
+    calls = []
+
+    def bad_callback(event):
+        calls.append(event)
+        raise RuntimeError("消费方炸了")
+
+    tool.on_job_exit = bad_callback
+    res = await tool.run_command("echo survive", background=True)
+    await _wait_events(calls)
+    job = tool._jobs[res["job_id"]]
+    await asyncio.wait_for(job.done.wait(), timeout=5)
+    assert job.status == "completed"
+    assert job.manifest is not None
+    assert "消费方炸了" in (job.error or "")
+
+
+async def test_exit_event_not_fired_without_callback(tmp_path):
+    """未配置回调(默认 None)行为不变:后台完成无人通知也不报错。"""
+    plain = BashTool(tmp_path / "outputs")
+    res = await plain.run_command("echo quiet", background=True)
+    job = plain._jobs[res["job_id"]]
+    await asyncio.wait_for(job.done.wait(), timeout=5)
+    assert job.status == "completed"
+    assert job.error is None
+    await plain.aclose()
