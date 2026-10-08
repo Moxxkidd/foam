@@ -33,9 +33,12 @@ WP 扩展新 kind)。
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import re
+import sqlite3
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -64,6 +67,7 @@ from foam.agent.refusal import KIND_REFUSAL_DETECTED
 from foam.agent.refusal import detect as refusal_detect
 from foam.guard.audit import (
     KIND_EXEC_RESULT_META,
+    KIND_JOB_EXIT,
     KIND_KILL_SWITCH,
     KIND_LLM_EXCHANGE_META,
     KIND_OPERATOR_INTERJECT,
@@ -73,7 +77,7 @@ from foam.guard.audit import (
 from foam.guard.scope import GuardDecision, Scope, check_command
 from foam.state.files import Engagement
 from foam.state.index import Index
-from foam.tools.bash import TOOL_SCHEMAS, BashTool
+from foam.tools.bash import TOOL_SCHEMAS, BashTool, JobExitEvent
 from foam.tools.output import read_page
 from foam.tools.parse import apply_facts, maybe_parse
 from foam.tools.session import SessionTool
@@ -455,6 +459,14 @@ class AgentLoop:
         self._total_output = 0
         # tool_call_id → (output_path, sha256):压缩占位要用的落盘线索
         self._result_hints: dict[str, tuple[str, str]] = {}
+        # R06:run 标识(决策 5)——run_started 与 job_exit 审计载荷携带(纯追加)。
+        self._run_id = uuid.uuid4().hex[:12]
+        # R06:后台终态事件消费(决策 3)——bash 与 index 都在时接线完成回调;
+        # 任务集供 _finish 排空(R06-C);pending 字典登记未消费完成的事件。
+        self._job_exit_tasks: set[asyncio.Task[None]] = set()
+        self._job_exit_pending: dict[str, JobExitEvent] = {}
+        if self._index is not None:
+            self._bash.on_job_exit = self._schedule_job_exit
 
     # ---------- 公开只读面 ----------
 
@@ -526,6 +538,7 @@ class AgentLoop:
                 "objective": objective,
                 "provider": self._backend.provider,
                 "workdir": str(self._workdir),
+                "run_id": self._run_id,  # R06 决策 5:纯追加字段,重放兼容
             },
         )
         try:
@@ -905,6 +918,119 @@ class AgentLoop:
             except (OSError, ValueError):
                 pass  # 读失败静默退视图文本——解析永不为门槛
         return view
+
+    # ---------- R06:后台 job 终态事件消费(决策 3/5/8) ----------
+
+    def _schedule_job_exit(self, event: JobExitEvent) -> None:
+        """``bash.on_job_exit`` 接线(同步回调):补 run_id、建消费任务。
+
+        生产侧(bash 看管任务)在事件循环上同步调用本方法;真正的消费
+        (解析/索引/审计)调度为独立任务,由 ``_finish`` 排空(R06-C)。
+        """
+        event = dataclasses.replace(event, run_id=self._run_id)
+        self._job_exit_pending[event.event_id] = event
+        task = asyncio.create_task(self._consume_job_exit(event))
+        self._job_exit_tasks.add(task)
+        task.add_done_callback(self._job_exit_tasks.discard)
+
+    async def _consume_job_exit(self, event: JobExitEvent) -> None:
+        """消费终态事件:解析 → 索引单事务(登记+facts) → 审计 → 回写。
+
+        幂等(决策 3):重复投递同 event_id 不动 facts 不动审计;崩溃窗口
+        (audit_seq NULL)重放只补审计(可辨识重复,规格 §7 允许)。索引
+        busy/已关闭如实放弃本轮——事件留在 ``_job_exit_pending``,由
+        drain 登记 pending 或恢复路径重放,不静默丢。
+        """
+        parsed = maybe_parse(
+            event.command,
+            self._load_event_parse_text(event),
+            output_path=event.output_path,
+            audit=self._audit,
+        )
+        facts = parsed.facts if parsed is not None else []
+        parse_tool = parsed.tool if parsed is not None else None
+        index = self._index
+        if index is None:
+            # 接线前提(决策 3:bash 与 index 都在)不成立属编程错误,显式失败
+            raise RuntimeError("job_exit 消费任务在 index=None 下被调度")
+        try:
+            outcome, stats = index.consume_job_exit(
+                event, facts, parse_tool=parse_tool
+            )
+        except sqlite3.Error:
+            return  # busy/已关:保持未消费(等 drain 登记;不碰已关索引)
+        if outcome == "duplicate":
+            self._job_exit_pending.pop(event.event_id, None)
+            return
+        # (b) 审计落链。崩溃/失败于此前:audit_seq 保持 NULL,重放补审计。
+        try:
+            record = self._audit.append(
+                KIND_JOB_EXIT,
+                self._job_exit_payload(event, outcome, stats, parse_tool),
+            )
+        except Exception:
+            # 行已 consumed,facts 已入;审计悬空由重放补——不算未消费
+            self._job_exit_pending.pop(event.event_id, None)
+            return
+        # (c) 回写 audit_seq(独立小事务);失败保持 NULL,重放可辨识重复
+        try:
+            index.mark_job_event_audited(event.event_id, record["seq"])
+        except sqlite3.Error:
+            pass
+        self._job_exit_pending.pop(event.event_id, None)
+
+    def _load_event_parse_text(self, event: JobExitEvent) -> str:
+        """后台终态的解析文本:落盘全文(≤ 预算);读失败/超限退空串
+        (无 output_view 可退;空文本走 maybe_parse 的 no_match 回退)。"""
+        if (
+            event.total_bytes is not None
+            and 0 <= event.total_bytes <= PARSE_TEXT_BUDGET_BYTES
+        ):
+            try:
+                return read_page(
+                    Path(event.output_path), 0, PARSE_TEXT_BUDGET_BYTES
+                ).text
+            except (OSError, ValueError):
+                pass  # 解析永不为门槛
+        return ""
+
+    @staticmethod
+    def _job_exit_payload(
+        event: JobExitEvent,
+        outcome: str,
+        stats: dict[str, int] | None,
+        parse_tool: str | None,
+    ) -> dict[str, Any]:
+        """job_exit 审计载荷:event_id 全程对账(决策 3b);manifest 引用
+        落盘账目;解析命中记 tool/facts 计数(与 exec_result_meta 同形)。"""
+        payload: dict[str, Any] = {
+            "event_id": event.event_id,
+            "run_id": event.run_id,
+            "job_id": event.job_id,
+            "command": event.command,
+            "reason": event.reason,
+            "exit_code": event.exit_code,
+            "duration_ms": event.duration_ms,
+            "ended_at": event.ended_at,
+            "output_path": event.output_path,
+            "sha256": event.sha256,
+            "stdout_path": event.stdout_path,
+            "stdout_sha256": event.stdout_sha256,
+            "stderr_path": event.stderr_path,
+            "stderr_sha256": event.stderr_sha256,
+            "total_bytes": event.total_bytes,
+            "total_lines": event.total_lines,
+            "replayed": outcome == "replay_audit",  # 可辨识重复,不谎称恰好一次
+        }
+        if event.error:
+            payload["error"] = event.error
+        if stats is not None:
+            payload["parsed"] = {
+                "tool": parse_tool,
+                "facts": sum(v for k, v in stats.items() if k != "skipped"),
+                "facts_applied": stats,
+            }
+        return payload
 
     def _tool_result_content(self, call: ToolCall, result: dict[str, Any]) -> str:
         path, sha = result.get("output_path"), result.get("sha256")

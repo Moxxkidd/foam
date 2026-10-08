@@ -1099,3 +1099,113 @@ def test_reconcile_legacy_dir_without_marker_keeps_existing_behavior(tmp_path):
     assert meta.get("revision") is None  # 仍 legacy
     assert meta["scope"]["sha256"] == a_digest  # meta-first 原样,未采纳 B
     assert engagement.paths.metadata.read_bytes() == meta_before  # 未重写
+
+
+# ================================================================
+# R06-B:schema v2(job_events 表)迁移与双向兼容(决策 4)
+# ================================================================
+
+#: v0.1.2 时代(schema v1)的 DDL 子集:模拟旧程序打开新库/旧库的行为面。
+_LEGACY_V1_DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hosts (
+    id INTEGER PRIMARY KEY,
+    ip TEXT NOT NULL UNIQUE,
+    hostname TEXT,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+"""
+
+
+def _meta_version(conn) -> str:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'schema_version'"
+    ).fetchone()
+    return row[0]
+
+
+def test_schema_v2_job_events_table_created(tmp_path):
+    """新库直接建 schema v2:meta=2 且 job_events 表可用。"""
+    from foam.state.index import SCHEMA_VERSION
+
+    with Index(tmp_path / "index.sqlite") as index:
+        assert SCHEMA_VERSION == 2
+        assert _meta_version(index._conn) == "2"
+        # job_events 已建表(列面冻结:event_id 主键 + audit_seq 可空)
+        cols = {
+            row[1] for row in index._conn.execute("PRAGMA table_info(job_events)")
+        }
+        assert {
+            "event_id", "job_id", "run_id", "reason", "status", "exit_code",
+            "duration_ms", "ended_at", "command", "output_refs",
+            "parse_tool", "parse_stats", "consumed_at", "audit_seq",
+        } <= cols
+        index._conn.execute("SELECT COUNT(*) FROM job_events").fetchone()
+
+
+def test_schema_v1_db_upgraded_on_open(tmp_path):
+    """旧库(v1)打开自动建表升版本;既有数据不动,六表读写不受影响。"""
+    db = tmp_path / "legacy.sqlite"
+    conn = sqlite3.connect(db)
+    conn.executescript(_LEGACY_V1_DDL)
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')")
+    conn.execute(
+        "INSERT INTO hosts(ip, hostname, first_seen, last_seen) "
+        "VALUES ('192.0.2.10', 'legacy-host', '2026-09-01T00:00:00+00:00', "
+        "'2026-09-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    with Index(db) as index:
+        assert _meta_version(index._conn) == "2"  # 版本已升
+        index._conn.execute("SELECT COUNT(*) FROM job_events").fetchone()  # 表已建
+        rows = index.query("hosts")["rows"]  # 旧数据原样可读
+        assert [r["ip"] for r in rows] == ["192.0.2.10"]
+        assert rows[0]["hostname"] == "legacy-host"
+        host_id = index.upsert_host("192.0.2.11")  # 升级后写入正常
+        assert index.upsert_port(host_id, 445, service="microsoft-ds")
+
+
+def test_v1_program_reads_v2_db_unaffected(tmp_path):
+    """反向:v0.1.2 旧程序(模拟其 v1 DDL + meta 写入 + 六表读写)操作新库
+    不受影响——SQLite 忽略未知表,meta 不被回退,job_events 行不动。"""
+    db = tmp_path / "index.sqlite"
+    with Index(db) as index:
+        index.upsert_host("192.0.2.10", "new-host")
+        index._conn.execute(
+            "INSERT INTO job_events(event_id, job_id, status) "
+            "VALUES ('job_exit:abc123', 'abc123', 'consumed')"
+        )
+        index._conn.commit()
+
+    # 旧程序语义:v1 DDL(IF NOT EXISTS 幂等)+ INSERT OR IGNORE meta + 六表读写
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_LEGACY_V1_DDL)
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1')"
+    )
+    conn.commit()
+    assert _meta_version(conn) == "2"  # 不回退新版本号
+    rows = conn.execute("SELECT ip, hostname FROM hosts").fetchall()
+    assert [(r["ip"], r["hostname"]) for r in rows] == [("192.0.2.10", "new-host")]
+    conn.execute(
+        "INSERT INTO hosts(ip, first_seen, last_seen) "
+        "VALUES ('192.0.2.11', '2026-10-08T00:00:00+00:00', "
+        "'2026-10-08T00:00:00+00:00')"
+    )
+    conn.commit()
+    # job_events 行不受旧程序影响
+    row = conn.execute(
+        "SELECT status FROM job_events WHERE event_id = 'job_exit:abc123'"
+    ).fetchone()
+    assert row["status"] == "consumed"
+    conn.close()
+
+    with Index(db) as index:  # 新程序再打开:两个写入都在
+        assert index.counts()["hosts"] == 2

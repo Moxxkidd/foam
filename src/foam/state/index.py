@@ -20,14 +20,21 @@ tools/state.py 的 LLM 工具都走这层统一的 upsert/查询接口。
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from foam.tools.bash import JobExitEvent
+
+#: v2(R06):追加 job_events 表(后台 job 终态事件的持久消费记录)。
+#: 纯追加 DDL,旧库打开自动建表升版本;v1 旧程序读写新库不受影响
+#: (SQLite 忽略未知表,meta 版本号只升不降)。
+SCHEMA_VERSION = 2
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -87,6 +94,25 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE INDEX IF NOT EXISTS idx_ports_port ON ports(port);
 CREATE INDEX IF NOT EXISTS idx_creds_host ON creds(host_id);
 CREATE INDEX IF NOT EXISTS idx_vulns_host ON vulns(host_id);
+-- R06(schema v2):后台 job 终态事件的持久消费记录。event_id 主键幂等;
+-- status: consumed(已消费) / pending(drain 超时登记的未消费占位);
+-- audit_seq 可空:NULL = 审计未落链(崩溃窗口),恢复重放据此补审计。
+CREATE TABLE IF NOT EXISTS job_events (
+    event_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    run_id TEXT,
+    reason TEXT,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    duration_ms INTEGER,
+    ended_at TEXT,
+    command TEXT,
+    output_refs TEXT,
+    parse_tool TEXT,
+    parse_stats TEXT,
+    consumed_at TEXT,
+    audit_seq INTEGER
+);
 """
 
 #: query() 通用接口允许的 kind 及各自可过滤字段(白名单)。
@@ -118,6 +144,7 @@ class Index:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, timeout=timeout)
+        self._tx_depth = 0  # R06:显式事务深度;>0 时 upsert 不各自 commit
         try:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
@@ -125,6 +152,12 @@ class Index:
             self._conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION)),
+            )
+            # R06:schema v2 纯追加——旧库(v1)打开升版本;更高版本不回退
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version' "
+                "AND CAST(value AS INTEGER) < ?",
+                (str(SCHEMA_VERSION), SCHEMA_VERSION),
             )
             self._conn.commit()
         except BaseException:
@@ -143,6 +176,196 @@ class Index:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    # ---------- R06:显式事务(consume_job_exit 用) ----------
+
+    def _maybe_commit(self) -> None:
+        """事务感知提交点:显式事务内不提交(由事务出口统一 COMMIT);
+        事务外保持既有逐条 commit 语义,公开方法签名/语义不变。"""
+        if self._tx_depth == 0:
+            self._conn.commit()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[Index]:
+        """显式写事务(BEGIN IMMEDIATE … COMMIT/ROLLBACK)。
+
+        事务内 upsert 经 ``_maybe_commit`` 不各自提交;busy(如报告快照
+        持读锁期间 COMMIT 拿不到 EXCLUSIVE)如实上抛 sqlite3.Error 并
+        ROLLBACK——调用方据此保持事件未消费,不静默丢。不支持嵌套。
+        """
+        if self._tx_depth > 0:
+            raise RuntimeError("Index 写事务不支持嵌套")
+        prior = self._conn.isolation_level
+        self._conn.isolation_level = None  # 显式事务,关掉隐式 BEGIN
+        self._tx_depth += 1
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self
+            except BaseException:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
+        finally:
+            self._tx_depth -= 1
+            self._conn.isolation_level = prior
+
+    # ---------- R06:job 终态事件的幂等消费(决策 3/4) ----------
+
+    @staticmethod
+    def _job_event_refs(event: JobExitEvent) -> str:
+        return json.dumps(
+            {
+                "output_path": event.output_path,
+                "sha256": event.sha256,
+                "stdout_path": event.stdout_path,
+                "stdout_sha256": event.stdout_sha256,
+                "stderr_path": event.stderr_path,
+                "stderr_sha256": event.stderr_sha256,
+                "total_bytes": event.total_bytes,
+                "total_lines": event.total_lines,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def consume_job_exit(
+        self,
+        event: JobExitEvent,
+        facts: list[dict[str, Any]],
+        *,
+        parse_tool: str | None = None,
+    ) -> tuple[str, dict[str, int] | None]:
+        """幂等消费 job 终态事件:登记行与 facts 写入在同一事务提交。
+
+        返回 ``(outcome, stats)``:
+
+        - ``"consumed"``:首次消费(或补完 drain 登记的 pending 占位行),
+          facts 已同事务应用,stats 为 apply_facts 计数;
+        - ``"duplicate"``:重复投递(行已 consumed 且审计已回写),
+          未动 facts,stats 为 None;
+        - ``"replay_audit"``:行已 consumed 但 ``audit_seq`` NULL(崩溃
+          窗口),未动 facts——调用方应补审计再 ``mark_job_event_audited``;
+          补写产生同 event_id 的可辨识重复审计(规格 §7 允许)。
+
+        busy(报告快照持锁期间)如实以 sqlite3.Error 上抛并 ROLLBACK:
+        事件保持未消费,不静默丢。
+        """
+        from foam.tools.parse import apply_facts  # 延迟导入:避免 tools↔state 环
+
+        refs = self._job_event_refs(event)
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO job_events(
+                    event_id, job_id, run_id, reason, status, exit_code,
+                    duration_ms, ended_at, command, output_refs,
+                    parse_tool, parse_stats, consumed_at, audit_seq
+                ) VALUES (?, ?, ?, ?, 'consumed', ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+                """,
+                (
+                    event.event_id,
+                    event.job_id,
+                    event.run_id,
+                    event.reason,
+                    event.exit_code,
+                    event.duration_ms,
+                    event.ended_at,
+                    event.command,
+                    refs,
+                    parse_tool,
+                    _utc_now_iso(),
+                ),
+            )
+            if cursor.rowcount == 0:
+                row = self._conn.execute(
+                    "SELECT status, audit_seq FROM job_events WHERE event_id = ?",
+                    (event.event_id,),
+                ).fetchone()
+                if row["status"] == "pending":
+                    # drain 登记的占位行:补完正式消费(同事务 apply facts)
+                    stats = apply_facts(self, facts)
+                    self._conn.execute(
+                        """
+                        UPDATE job_events SET
+                            status = 'consumed', reason = ?, exit_code = ?,
+                            duration_ms = ?, ended_at = ?, command = ?,
+                            output_refs = ?, parse_tool = ?, parse_stats = ?,
+                            consumed_at = ?
+                        WHERE event_id = ?
+                        """,
+                        (
+                            event.reason,
+                            event.exit_code,
+                            event.duration_ms,
+                            event.ended_at,
+                            event.command,
+                            refs,
+                            parse_tool,
+                            json.dumps(stats, sort_keys=True),
+                            _utc_now_iso(),
+                            event.event_id,
+                        ),
+                    )
+                    return "consumed", stats
+                return (
+                    "replay_audit" if row["audit_seq"] is None else "duplicate"
+                ), None
+            stats = apply_facts(self, facts)
+            self._conn.execute(
+                "UPDATE job_events SET parse_stats = ? WHERE event_id = ?",
+                (json.dumps(stats, sort_keys=True), event.event_id),
+            )
+            return "consumed", stats
+
+    def register_job_exit_pending(self, event: JobExitEvent) -> bool:
+        """登记未消费事件占位行(status='pending',AC06 明确登记)。
+
+        已存在任意状态行时不动(返回 False);登记成功返回 True。
+        busy/已关闭如实上抛,由调用方记入报告。
+        """
+        with self._transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO job_events(
+                    event_id, job_id, run_id, reason, status, exit_code,
+                    duration_ms, ended_at, command, output_refs,
+                    parse_tool, parse_stats, consumed_at, audit_seq
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
+                """,
+                (
+                    event.event_id,
+                    event.job_id,
+                    event.run_id,
+                    event.reason,
+                    event.exit_code,
+                    event.duration_ms,
+                    event.ended_at,
+                    event.command,
+                    self._job_event_refs(event),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def mark_job_event_audited(self, event_id: str, audit_seq: int) -> None:
+        """审计落链后回写 ``job_events.audit_seq``(独立小事务,决策 3c)。
+
+        回写失败(崩溃/已关)时 audit_seq 保持 NULL——恢复重放补一条
+        同 event_id 的可辨识重复审计(规格 §7 允许,不谎称恰好一次)。
+        """
+        self._conn.execute(
+            "UPDATE job_events SET audit_seq = ? WHERE event_id = ?",
+            (audit_seq, event_id),
+        )
+        self._conn.commit()
+
+    def job_event(self, event_id: str) -> dict[str, Any] | None:
+        """按 event_id 查消费记录(只读;报告/调试/测试对账用)。"""
+        row = self._conn.execute(
+            "SELECT * FROM job_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     # ---------- upsert(解析器与工具共用) ----------
 
     def upsert_host(self, ip: str, hostname: str | None = None) -> int:
@@ -158,7 +381,7 @@ class Index:
             """,
             (ip, hostname, now, now),
         )
-        self._conn.commit()
+        self._maybe_commit()
         row = self._conn.execute(
             "SELECT id FROM hosts WHERE ip = ?", (ip,)
         ).fetchone()
@@ -193,7 +416,7 @@ class Index:
             """,
             (host_id, port, proto, service, product, version),
         )
-        self._conn.commit()
+        self._maybe_commit()
         row = self._conn.execute(
             "SELECT id FROM ports WHERE host_id = ? AND port = ? AND proto = ?",
             (host_id, port, proto),
@@ -221,7 +444,7 @@ class Index:
             """,
             (host_id, username, secret, source, int(sensitive), _utc_now_iso()),
         )
-        self._conn.commit()
+        self._maybe_commit()
         row = self._conn.execute(
             "SELECT id FROM creds WHERE host_id = ? AND username = ? AND secret = ?",
             (host_id, username, secret),
@@ -250,7 +473,7 @@ class Index:
             """,
             (host_id, kind, title, evidence_path, confidence, _utc_now_iso()),
         )
-        self._conn.commit()
+        self._maybe_commit()
         row = self._conn.execute(
             "SELECT id FROM vulns WHERE host_id = ? AND kind = ? AND title = ?",
             (host_id, kind, title),
@@ -277,7 +500,7 @@ class Index:
             """,
             (path, kind, note, size_bytes, _utc_now_iso()),
         )
-        self._conn.commit()
+        self._maybe_commit()
         row = self._conn.execute(
             "SELECT id FROM loot WHERE path = ?", (path,)
         ).fetchone()
@@ -289,7 +512,7 @@ class Index:
             "INSERT INTO notes(ts, text) VALUES (?, ?)",
             (ts or _utc_now_iso(), text),
         )
-        self._conn.commit()
+        self._maybe_commit()
         return int(cursor.lastrowid)
 
     # ---------- 关系查询 ----------

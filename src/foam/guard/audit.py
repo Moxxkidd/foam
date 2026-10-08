@@ -50,6 +50,8 @@ KIND_LLM_EXCHANGE_META = "llm_exchange_meta"
 KIND_SCOPE_CONFIRMED = "scope_confirmed"
 KIND_SCOPE_UPDATED = "scope_updated"
 KIND_REFUSAL_DETECTED = "refusal_detected"
+# R06 注册:后台 job 终态事件消费(event_id 全程对账,允许可辨识重复投递)。
+KIND_JOB_EXIT = "job_exit"
 
 KNOWN_KINDS = frozenset(
     {
@@ -63,6 +65,7 @@ KNOWN_KINDS = frozenset(
         KIND_SCOPE_CONFIRMED,
         KIND_SCOPE_UPDATED,
         KIND_REFUSAL_DETECTED,
+        KIND_JOB_EXIT,
     }
 )
 
