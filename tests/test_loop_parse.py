@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections import deque
@@ -286,17 +287,29 @@ BG_NMAP_CMD = "nmap -sV 192.0.2.10 192.0.2.11"
 
 
 class DelayedBackend(FakeBackend):
-    """第二轮响应前 sleep,给后台 job 留自然完成的窗口(确定性竞态注入)。"""
+    """第二轮响应前等待,给后台 job 留完成窗口。
 
-    def __init__(self, script=(), delay=0.6):
+    默认事件驱动:等 bash 侧全部已注册 job 到终态(确定性,替代固定
+    sleep——2026-10-08 全量偶发 AssertionError 后根除时序敏感);
+    ``wait_jobs=False`` 时退回固定 ``delay`` 秒(R06-C 注入「收割期间才
+    到终态」的临界竞态,不能等 job 完成)。
+    """
+
+    def __init__(self, script=(), delay=0.6, bash=None, wait_jobs=True):
         super().__init__(script)
         self._delay = delay
+        self._bash = bash
+        self._wait_jobs = wait_jobs
         self._round = 0
 
     async def _stream(self):
         self._round += 1
-        if self._round > 1 and self._delay:
-            await asyncio.sleep(self._delay)
+        if self._round > 1:
+            if self._wait_jobs and self._bash is not None:
+                for job in list(self._bash._jobs.values()):
+                    await asyncio.wait_for(job.done.wait(), timeout=10)
+            elif self._delay:
+                await asyncio.sleep(self._delay)
         async for event in super()._stream():
             yield event
 
@@ -320,9 +333,17 @@ def nmap_shim(tmp_path: Path, monkeypatch, *, sleep_seconds: float = 0.0) -> Pat
 
 
 def make_live_env(
-    tmp_path: Path, *, with_index: bool = True, backend_delay: float = 0.6
+    tmp_path: Path,
+    *,
+    with_index: bool = True,
+    backend_delay: float = 0.6,
+    wait_jobs: bool = True,
 ) -> SimpleNamespace:
-    """真实 BashTool 的 loop 环境:run_command 走真进程(后台事件路径)。"""
+    """真实 BashTool 的 loop 环境:run_command 走真进程(后台事件路径)。
+
+    wait_jobs=True(默认):backend 第二轮前等全部 job 到终态(自然完成
+    路径);False:固定 backend_delay 后 FINISH(收割期临界竞态用)。
+    """
     scope = parse_scope(SCOPE_TEXT)
     audit = AuditLog(tmp_path / "audit.jsonl")
     audit.append(KIND_SCOPE_LOADED, scope_payload(scope, "test.scope"))
@@ -341,6 +362,8 @@ def make_live_env(
             FINISH,
         ],
         delay=backend_delay,
+        bash=bash,
+        wait_jobs=wait_jobs,
     )
     registry = ToolRegistry()
     registry.register_module(TOOL_SCHEMAS, bash.dispatch)
@@ -542,7 +565,7 @@ async def test_shutdown_drains_completions(tmp_path, monkeypatch):
     run_finished 落链前该事件已消费或明确登记 pending(本例:已消费)。"""
     # shim 睡 0.8s 才输出,backend 0.3s 后 FINISH:job 在收割期间到终态
     nmap_shim(tmp_path, monkeypatch, sleep_seconds=0.8)
-    live = make_live_env(tmp_path / "live", backend_delay=0.3)
+    live = make_live_env(tmp_path / "live", backend_delay=0.3, wait_jobs=False)
     result = await live.loop.run("后台侦察 192.0.2.0/24")
     assert result.status == "finished"
 
@@ -661,4 +684,43 @@ async def test_close_run_drain_fallback_from_runtime_loop(tmp_path, monkeypatch)
     assert report["errors"] == []
     row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
     assert row is not None and row["status"] == "consumed"
+    live.index.close()
+
+
+async def test_background_parse_failure_keeps_artifacts(tmp_path, monkeypatch):
+    """R06-AC05:后台路径解析失败走 parse_fallback(记原因),原始产物不动
+    (output_refs 哈希与落盘复算一致),事件照常消费、facts 为空。"""
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "nmap"
+    shim.write_text("#!/bin/sh\nprintf 'TOTAL GARBAGE {{{ 不是任何工具输出\\n'\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    live = make_live_env(tmp_path / "live")
+    result = await live.loop.run("后台侦察 192.0.2.0/24")
+    assert result.status == "finished"  # 解析失败不影响主环
+    await _wait_job_exit_tasks(live.loop)
+
+    records = audit_records(live)
+    fallback = [r for r in records if r["kind"] == "parse_fallback"]
+    assert len(fallback) == 1
+    assert fallback[0]["payload"]["tool"] == "nmap"
+    assert fallback[0]["payload"]["reason"] == "no_match"
+
+    row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
+    assert row["status"] == "consumed"  # 事件照常消费
+    stats = json.loads(row["parse_stats"])
+    assert stats["hosts"] == 0 and stats["ports"] == 0  # facts 空
+    assert live.index.counts()["hosts"] == 0
+
+    # 原始产物不动:登记引用与落盘复算一致
+    refs = json.loads(row["output_refs"])
+    on_disk = Path(refs["output_path"]).read_bytes()
+    assert hashlib.sha256(on_disk).hexdigest() == refs["sha256"]
+    assert on_disk.startswith(b"TOTAL GARBAGE {{{ ")
+    assert on_disk.decode("utf-8").endswith("不是任何工具输出\n")
+    job_exits = [r for r in records if r["kind"] == "job_exit"]
+    assert len(job_exits) == 1
+    assert verify(live.audit_path)
     live.index.close()

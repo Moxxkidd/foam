@@ -716,3 +716,25 @@ WP-13(整合)依赖全部
   SSH 推送（R05 §7 注记）；恢复 HTTPS 需凭据加 workflow scope。
 - 下一步：发布门槛剩余项由用户裁定后按授权执行；或按
   [R 索引](items/README.md) 推进下一版本条目。
+
+
+## 当前状态（2026-10-08：R06 关闭）
+
+- [R06](items/R06.md) 完成并合入 main（v0.1.3 条目 1/4）：后台 job 完成
+  事件与幂等消费。三分片：R06-A（bash 产 `JobExitEvent`，`on_job_exit`
+  回调在 finalize 后、done 前恰触发一次）、R06-B（schema v2 增
+  `job_events` 持久消费表；`Index.consume_job_exit` 单事务登记+facts；
+  loop 接线消费：解析→事务→审计 `job_exit`→回写 audit_seq；run_started
+  携 run_id）、R06-C（`_finish` 收割后 drain 排空，超时事件登记
+  status='pending'；`close_run` 增 drain 参数并从 runtime.loop 兜底，
+  CLI/TUI 调用点未改）。逐条验收证据见 R06.md §5，红基线/分片/全量实录
+  见 §6。
+- 关键边界：exec_result_meta 的 running 即时记录不变，终态只出 job_exit
+  （不双写）；幂等靠 event_id 主键+audit_seq 崩溃窗口，重放补审计可辨识
+  （replayed=true），不谎称恰好一次；索引 busy 如实失败不静默丢；模型
+  感知仍走 list_jobs/read_output（不注入消息流/TUI 通知）；孤儿 job
+  崩溃重建归 resume/恢复条目。接口漂移与偏差已记录 R06.md §7/§8。
+- 测试基线：全仓 **703 passed + 2 skipped**（基线 686+2，本条目净增 17
+  例），ruff 全绿；schema v1↔v2 双向兼容有测试（旧程序读写新库不受影响）。
+- 下一步：按 [R 索引](items/README.md) 评审 [R07](items/R07.md)（PTY
+  操作审计与提示事件）。
