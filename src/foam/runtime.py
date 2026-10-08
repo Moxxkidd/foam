@@ -26,6 +26,7 @@ CLI/TUI 共享同一关闭服务 :func:`close_run`——修复前各入口各自
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,13 +53,22 @@ class RunRuntime:
 
 
 async def close_run(
-    runtime: RunRuntime, *, run_id: str = "", reason: str = ""
+    runtime: RunRuntime,
+    *,
+    run_id: str = "",
+    reason: str = "",
+    drain: Callable[[], Awaitable[Any]] | None = None,
 ) -> dict[str, Any]:
     """统一关闭入口;固定顺序(见模块 docstring),全程幂等且并发安全。
 
     ``run_id``/``reason`` 只进返回报告,供入口层(CLI stderr / TUI 通知)
     展示;本服务不写审计——终态记录由 loop 在收割后、本调用前落链(D6)。
     返回 ``{cleanup_status, remaining_resources, errors, run_id, reason}``。
+
+    R06:``drain`` 为可选的后台终态事件排空回调(loop.drain_job_exits),
+    在收割步骤后、state.close 前 await(异常记 errors,不跳后续);未显式
+    传入时从 ``runtime.loop`` 兜底获取(CLI/TUI 调用点不改,见 R06 §7)。
+    loop 的 ``_finish`` 已排空时此处为幂等空转。
 
     幂等(AC04):完成后二次调用短路返回首次结果对象。并发安全:首个调用
     把关闭体建成共享任务,并发调用方 shield 等待同一任务(TUI 的
@@ -69,13 +79,17 @@ async def close_run(
         return runtime.close_result
     if runtime._close_task is None:
         runtime._close_task = asyncio.ensure_future(
-            _close_run_impl(runtime, run_id=run_id, reason=reason)
+            _close_run_impl(runtime, run_id=run_id, reason=reason, drain=drain)
         )
     return await asyncio.shield(runtime._close_task)
 
 
 async def _close_run_impl(
-    runtime: RunRuntime, *, run_id: str, reason: str
+    runtime: RunRuntime,
+    *,
+    run_id: str,
+    reason: str,
+    drain: Callable[[], Awaitable[Any]] | None,
 ) -> dict[str, Any]:
     runtime.closed = True  # 关闭开始即置位(runtime_closed 读取面;单任务执行)
     remaining: list[dict[str, Any]] = []
@@ -93,6 +107,16 @@ async def _close_run_impl(
         if report:  # 旧式 None 返回(测试桩)按 ok 处理
             remaining.extend(report.get("remaining_resources", []))
             errors.extend(report.get("errors", []))
+
+    # 1.5 R06:排空后台终态事件消费(收割后、关索引前;drain 内已自清接线)
+    drain_fn = drain
+    if drain_fn is None and runtime.loop is not None:
+        drain_fn = getattr(runtime.loop, "drain_job_exits", None)
+    if drain_fn is not None:
+        try:
+            await drain_fn()
+        except Exception as exc:
+            errors.append(f"job_exit 排空异常: {exc!r}")
 
     # 2. 关闭索引/状态
     if runtime.state is not None:

@@ -301,19 +301,27 @@ class DelayedBackend(FakeBackend):
             yield event
 
 
-def nmap_shim(tmp_path: Path, monkeypatch) -> Path:
-    """在 tmp_path 造可执行 shim 脚本命名 nmap(cat 合成 fixture),注入 PATH 前缀。"""
+def nmap_shim(tmp_path: Path, monkeypatch, *, sleep_seconds: float = 0.0) -> Path:
+    """在 tmp_path 造可执行 shim 脚本命名 nmap(cat 合成 fixture),注入 PATH 前缀。
+
+    sleep_seconds > 0 时 shim 先睡再输出——注入「job 在收割期间才到终态」
+    的临界竞态(R06-C)。
+    """
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
     fixture = (FIXTURES / "nmap_table.txt").resolve()
     shim = shim_dir / "nmap"
-    shim.write_text(f"#!/bin/sh\ncat '{fixture}'\n", encoding="utf-8")
+    shim.write_text(
+        f"#!/bin/sh\nsleep {sleep_seconds}\ncat '{fixture}'\n", encoding="utf-8"
+    )
     shim.chmod(0o755)
     monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     return shim
 
 
-def make_live_env(tmp_path: Path, *, with_index: bool = True) -> SimpleNamespace:
+def make_live_env(
+    tmp_path: Path, *, with_index: bool = True, backend_delay: float = 0.6
+) -> SimpleNamespace:
     """真实 BashTool 的 loop 环境:run_command 走真进程(后台事件路径)。"""
     scope = parse_scope(SCOPE_TEXT)
     audit = AuditLog(tmp_path / "audit.jsonl")
@@ -331,7 +339,8 @@ def make_live_env(tmp_path: Path, *, with_index: bool = True) -> SimpleNamespace
                 Usage(1, 1),
             ],
             FINISH,
-        ]
+        ],
+        delay=backend_delay,
     )
     registry = ToolRegistry()
     registry.register_module(TOOL_SCHEMAS, bash.dispatch)
@@ -521,3 +530,135 @@ async def test_replay_after_index_reopen_not_double(tmp_path, monkeypatch):
     assert stats is None
     assert reopened.counts() == before  # 重开重放不重复插入事实
     reopened.close()
+
+
+# ---------------------------------------------------------------------------
+# R06-C:退出前排空(决策 6,规格 §4 R06-C / AC06)
+# ---------------------------------------------------------------------------
+
+
+async def test_shutdown_drains_completions(tmp_path, monkeypatch):
+    """R06-AC06:临界完成竞态——job 在 _finish 收割期间到达终态,
+    run_finished 落链前该事件已消费或明确登记 pending(本例:已消费)。"""
+    # shim 睡 0.8s 才输出,backend 0.3s 后 FINISH:job 在收割期间到终态
+    nmap_shim(tmp_path, monkeypatch, sleep_seconds=0.8)
+    live = make_live_env(tmp_path / "live", backend_delay=0.3)
+    result = await live.loop.run("后台侦察 192.0.2.0/24")
+    assert result.status == "finished"
+
+    records = audit_records(live)
+    job_exits = [r for r in records if r["kind"] == "job_exit"]
+    finished = [r for r in records if r["kind"] == "run_finished"]
+    assert len(job_exits) == 1
+    assert len(finished) == 1
+    # 审计顺序钉死:job_exit* < run_finished
+    assert job_exits[0]["seq"] < finished[0]["seq"]
+    row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
+    assert row["status"] == "consumed"  # 收割期终态被 drain 接住消费
+    assert row["reason"] in ("completed", "killed")
+    assert row["audit_seq"] == job_exits[0]["seq"]
+    drain = finished[0]["payload"]["job_exit_drain"]
+    assert drain["registered_pending"] == []
+    assert drain["errors"] == []
+    assert finished[0]["payload"]["run_id"] == live.loop._run_id
+    assert verify(live.audit_path)
+    live.index.close()
+
+
+async def test_drain_timeout_registers_pending(tmp_path, monkeypatch):
+    """R06-AC06:消费协程卡死超 drain 上界 → 事件以 status='pending' 明确
+    登记进 job_events,run_finished 载荷如实体现;不静默丢、不谎称已消费。"""
+    nmap_shim(tmp_path, monkeypatch)
+    live = make_live_env(tmp_path / "live")
+
+    async def stuck_consume(self, event):
+        await asyncio.sleep(30)  # 模拟消费协程卡死(极端注入)
+
+    monkeypatch.setattr(AgentLoop, "_consume_job_exit", stuck_consume)
+    monkeypatch.setattr("foam.agent.loop.DRAIN_JOB_EXITS_TIMEOUT_SECONDS", 0.2)
+
+    result = await live.loop.run("后台侦察 192.0.2.0/24")
+    assert result.status == "finished"  # drain 有界,不卡死收尾
+
+    row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
+    assert row["status"] == "pending"  # 明确登记,未消费
+    assert row["audit_seq"] is None
+    finished = [r for r in audit_records(live) if r["kind"] == "run_finished"][0]
+    drain = finished["payload"]["job_exit_drain"]
+    assert row["event_id"] in drain["registered_pending"]
+    assert not [r for r in audit_records(live) if r["kind"] == "job_exit"]
+    assert verify(live.audit_path)
+    assert live.loop._job_exit_tasks == set()  # 卡死任务已被 drain 收割
+    live.index.close()
+
+
+async def test_late_consume_after_index_closed_no_touch(tmp_path, monkeypatch):
+    """索引已关后迟到的消费调用捕获已关异常:不碰已关索引、不传播、
+    不重写审计(pending 登记责任在 drain,见上例)。"""
+    nmap_shim(tmp_path, monkeypatch)
+    live = make_live_env(tmp_path / "live")
+    await live.loop.run("后台侦察 192.0.2.0/24")
+    await _wait_job_exit_tasks(live.loop)
+    before = live.index.counts()
+    live.index.close()
+
+    # 迟到重放(恢复路径误调/竞态尾巴):静默放弃,不传播异常
+    await live.loop._consume_job_exit(_replay_event(live))
+
+    reopened = Index(tmp_path / "live" / "index.sqlite")
+    assert reopened.counts() == before  # 零写入
+    reopened.close()
+    job_exits = [r for r in audit_records(live) if r["kind"] == "job_exit"]
+    assert len(job_exits) == 1  # 审计不重复
+
+
+async def test_close_run_drain_catches_race_completion(tmp_path, monkeypatch):
+    """close_run(drain=...) 集成:loop 未跑到 _finish(如装配失败/run 未
+    启动)时,后台 job 的完成事件由 close_run 的 drain 接住——落库+落链。"""
+    from foam.runtime import RunRuntime, close_run
+
+    nmap_shim(tmp_path, monkeypatch)
+    live = make_live_env(tmp_path / "live")
+    bg = await live.bash.run_command(BG_NMAP_CMD, background=True)
+    assert bg["status"] == "running"
+
+    runtime = RunRuntime(bash=live.bash, audit=live.loop._audit, loop=live.loop)
+    report = await close_run(
+        runtime, run_id="test", reason="竞态集成", drain=live.loop.drain_job_exits
+    )
+    assert report["errors"] == []
+    assert report["cleanup_status"] == "ok"
+
+    row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
+    assert row is not None and row["status"] == "consumed"
+    assert row["audit_seq"] is not None
+    job_exits = [r for r in audit_records(live) if r["kind"] == "job_exit"]
+    assert len(job_exits) == 1
+    assert verify(live.audit_path)
+    live.index.close()
+
+
+async def test_close_run_drain_fallback_from_runtime_loop(tmp_path, monkeypatch):
+    """close_run 未显式传 drain(CLI/TUI 现状调用点不改)时,从
+    runtime.loop 兜底取 drain_job_exits——接口漂移的兼容面(§7 注记)。"""
+    from foam.runtime import RunRuntime, close_run
+
+    nmap_shim(tmp_path, monkeypatch)
+    live = make_live_env(tmp_path / "live")
+    await live.bash.run_command(BG_NMAP_CMD, background=True)
+
+    calls = []
+    original = live.loop.drain_job_exits
+
+    async def counting_drain():
+        calls.append(1)
+        return await original()
+
+    live.loop.drain_job_exits = counting_drain  # 实例级打桩观测兜底调用
+    runtime = RunRuntime(bash=live.bash, audit=live.loop._audit, loop=live.loop)
+    report = await close_run(runtime, run_id="test", reason="兜底")
+    assert calls == [1]  # 兜底取到 loop 的 drain 且恰调一次
+    assert report["errors"] == []
+    row = live.index._conn.execute("SELECT * FROM job_events").fetchone()
+    assert row is not None and row["status"] == "consumed"
+    live.index.close()

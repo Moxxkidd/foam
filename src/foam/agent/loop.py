@@ -108,6 +108,8 @@ MAX_CONSECUTIVE_MALFORMED = 3
 MAX_CONSECUTIVE_CLAIM_CORRECTIONS = 2
 #: 回灌给模型的坏 JSON 原文摘录上限。
 _RAW_ARGS_ECHO_LIMIT = 4_000
+#: R06-C:run 收尾排空后台终态消费任务的有界超时(与收割上界同量级)。
+DRAIN_JOB_EXITS_TIMEOUT_SECONDS = 5.0
 
 #: 本 WP 新增的审计事件类型(WP-02 的 KNOWN_KINDS 明示允许扩展)。
 KIND_RUN_STARTED = "run_started"
@@ -566,18 +568,21 @@ class AgentLoop:
         return await self._finish(result)
 
     async def _finish(self, result: RunResult) -> RunResult:
-        """统一终态面(R03 D6):停止派发 → 收割 → run_finished → 置状态。
+        """统一终态面(R03 D6):停止派发 → 收割 → 排空(R06) → run_finished → 置状态。
 
         任何终态路径(finished/error/max_rounds/killed/外部取消)都先收割本
         run 进程资源再落终态记录;收割报告进 run_finished 载荷(D2,kind
         不变)。收割经 shield 兜底:外部取消后再被取消(二次 kill/Ctrl-C)
         清理仍跑完。kill 路径的 kill_switch 记录由 _finalize_killed 先落
         (钉死顺序:kill_switch < run_finished),此处收割为幂等空转。
+        R06-C:收割后、run_finished 前排空后台终态事件消费——审计顺序
+        钉死 job_exit* < run_finished;未消费完的事件登记 pending(AC06)。
         """
         self._dispatch_stopped = True
         cleanup = self._cleanup_report
         if cleanup is None:
             cleanup = await self._reap_shielded()
+        drain_report = await self._drain_job_exits_shielded()  # R06-C 排空
         self._audit.append(
             KIND_RUN_FINISHED,
             {
@@ -591,6 +596,8 @@ class AgentLoop:
                 ).hexdigest(),
                 "final_text_chars": len(result.summary),
                 "cleanup": cleanup,
+                "run_id": self._run_id,  # R06 决策 5:纯追加字段
+                "job_exit_drain": drain_report,  # R06-C:AC06 登记证据
             },
         )
         self._set_status(result.status)
@@ -1138,6 +1145,56 @@ class AgentLoop:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 continue  # 再次取消不打断收割;继续等它完成
+        return task.result()
+
+    # ---------- R06-C:退出前排空(决策 6) ----------
+
+    async def drain_job_exits(self) -> dict[str, Any]:
+        """排空后台终态事件消费:run_finished 落链前由 ``_finish`` 调用;
+        ``runtime.close_run`` 兜底再调(幂等)。
+
+        语义:
+        - 清空 ``on_job_exit`` 接线:此后(索引将关)不再调度新消费任务;
+        - 有界等待消费任务集(``DRAIN_JOB_EXITS_TIMEOUT_SECONDS``);超时
+          未完成的任务取消并收割(不让卡死的消费协程拖住收尾);
+        - 仍未消费完的事件(busy/超时/审计失败尾巴)逐一登记
+          ``job_events`` status='pending' 行(AC06 明确登记,不静默丢);
+          登记失败(索引已关等)如实记 errors。
+
+        返回 ``{registered_pending, errors}`` 报告,进 run_finished 载荷;
+        二次调用幂等空转。
+        """
+        report: dict[str, Any] = {"registered_pending": [], "errors": []}
+        if self._bash.on_job_exit is not None:
+            self._bash.on_job_exit = None
+        tasks = [t for t in self._job_exit_tasks if not t.done()]
+        if tasks:
+            _done, pending = await asyncio.wait(
+                tasks, timeout=DRAIN_JOB_EXITS_TIMEOUT_SECONDS
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        for event_id, event in list(self._job_exit_pending.items()):
+            try:
+                if self._index is not None and self._index.register_job_exit_pending(
+                    event
+                ):
+                    report["registered_pending"].append(event_id)
+            except sqlite3.Error as exc:
+                report["errors"].append(f"pending 登记失败 {event_id}: {exc!r}")
+            self._job_exit_pending.pop(event_id, None)
+        return report
+
+    async def _drain_job_exits_shielded(self) -> dict[str, Any]:
+        """取消安全的排空(与 _reap_shielded 同语义):二次取消不打断排空。"""
+        task = asyncio.ensure_future(self.drain_job_exits())
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
         return task.result()
 
     async def _finalize_killed(self) -> RunResult:
