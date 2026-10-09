@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 from collections import deque
 from types import SimpleNamespace
@@ -44,6 +45,7 @@ from foam.guard.scope import parse_scope, scope_payload
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
 from foam.tools.session import SessionTool
+from foam.tui.bridge import tool_call_display
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
 
@@ -1609,4 +1611,168 @@ async def test_session_operation_audit_read_cancelled(tmp_path):
     # run 走向不受影响:统一终态面照常落 run_finished(cancelled)
     finished = [r for r in audit_records(env) if r["kind"] == "run_finished"]
     assert finished[-1]["payload"]["status"] == "cancelled"
+    assert verify(env.audit_path)
+
+
+# ---------------------------------------------------------------------------
+# R07-B:session_prompt 提示审计接线与敏感保护(AC02/AC04)
+# ---------------------------------------------------------------------------
+
+
+def session_prompt_payloads(env) -> list[dict]:
+    return [
+        r["payload"] for r in audit_records(env) if r["kind"] == "session_prompt"
+    ]
+
+
+def _extract_session_id(messages, call_id: str) -> str:
+    content = next(
+        m.content
+        for m in messages
+        if m.role == "tool" and m.tool_call_id == call_id
+    )
+    match = re.search(r'"session_id":\s*"(s-[0-9a-f]+)"', content)
+    assert match, f"工具结果里找不到 session_id: {content[:200]!r}"
+    return match.group(1)
+
+
+async def test_session_prompt_audit_wired(tmp_path):
+    """R07 AC02:提示检测时即落 session_prompt(不依赖 read);read 排空不重落。"""
+    holder: dict = {}
+
+    async def _round2(messages):
+        env = holder["env"]
+        sid = _extract_session_id(messages, "tc-1")
+        holder["sid"] = sid
+        # 等检测落链(append 即 flush,文件可读)——此刻尚未发起任何 read
+        for _ in range(200):
+            if session_prompt_payloads(env):
+                break
+            await asyncio.sleep(0.05)
+        return [ToolCall("tc-2", "session_read", {"session_id": sid}), Usage(1, 1)]
+
+    env = make_session_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-1",
+                    "session_open",
+                    {"command": "read -p 'Password: ' x; echo got:$x"},
+                ),
+                Usage(1, 1),
+            ],
+            _round2,
+            [TextDelta("收尾。"), Usage(1, 1)],
+        ],
+    )
+    holder["env"] = env
+    result = await env.loop.run("提示审计接线")
+    assert result.status == "finished"
+    prompts = session_prompt_payloads(env)
+    assert len(prompts) == 1  # 检测一次落一条;read 排空不重复落
+    p = prompts[0]
+    started = [r for r in audit_records(env) if r["kind"] == "run_started"]
+    assert p["run_id"] == started[-1]["payload"]["run_id"]
+    assert p["session_id"] == holder["sid"]
+    # 字段映射:事件 prompt_type→pattern_kind、offset→transcript_offset
+    assert p["pattern_kind"] == "password"
+    assert isinstance(p["transcript_offset"], int) and p["transcript_offset"] > 0
+    assert "Password" in p["prompt_text"]
+    assert p["hint"]
+    assert verify(env.audit_path)
+
+
+async def test_session_prompt_audit_text_truncated(tmp_path):
+    """prompt_text 截断保险:超 200 字节按 utf-8 字节截断(防异常膨胀)。"""
+    env = make_session_loop(tmp_path, [])  # 不跑 run;直接调装配好的回调
+    env.loop._audit_session_prompt(
+        "s-trunc07",
+        {
+            "prompt_type": "password",
+            "offset": 42,
+            "text": "密" * 300,  # 900 字节 utf-8
+            "hint": "h",
+        },
+    )
+    prompts = session_prompt_payloads(env)
+    assert len(prompts) == 1
+    p = prompts[0]
+    assert p["prompt_text"]
+    assert len(p["prompt_text"].encode("utf-8")) <= 200
+    assert p["pattern_kind"] == "password"
+    assert p["transcript_offset"] == 42
+    assert verify(env.audit_path)
+
+
+async def test_session_audit_no_password_plaintext(tmp_path):
+    """R07 AC04:合成口令走完整 open→(提示)→send→read→close 流程;
+    审计 jsonl 全文与 TUI 卡头渲染均不含口令明文。"""
+    password = "TESTONLY-pw-6f3a9c2e"
+    holder: dict = {}
+
+    async def _await_prompt_then_send(messages):
+        env = holder["env"]
+        sid = _extract_session_id(messages, "tc-1")
+        holder["sid"] = sid
+        for _ in range(200):
+            if session_prompt_payloads(env):
+                break
+            await asyncio.sleep(0.05)
+        return [
+            ToolCall("tc-2", "session_send", {"session_id": sid, "text": password}),
+            Usage(1, 1),
+        ]
+
+    async def _read_and_close(_messages):
+        sid = holder["sid"]
+        return [
+            ToolCall(
+                "tc-3",
+                "session_read",
+                {"session_id": sid, "wait_pattern": "login ok", "timeout_seconds": 5},
+            ),
+            ToolCall("tc-4", "session_close", {"session_id": sid}),
+            Usage(1, 1),
+        ]
+
+    env = make_session_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-1",
+                    "session_open",
+                    {"command": "read -p 'Password: ' x; echo login ok"},
+                ),
+                Usage(1, 1),
+            ],
+            _await_prompt_then_send,
+            _read_and_close,
+            [TextDelta("流程走完。"), Usage(1, 1)],
+        ],
+    )
+    holder["env"] = env
+    result = await env.loop.run("口令输入流程")
+    assert result.status == "finished"
+    # 审计全文扫描:口令明文不出现
+    audit_text = env.audit_path.read_text(encoding="utf-8")
+    assert password not in audit_text
+    sends = [
+        r["payload"]
+        for r in audit_records(env)
+        if r["kind"] == "session_op" and r["payload"]["op"] == "session_send"
+    ]
+    assert len(sends) == 1
+    assert sends[0]["outcome"] == "ok"
+    assert sends[0]["bytes"] == len(password.encode("utf-8"))  # 只记字节数
+    assert any(r["kind"] == "session_prompt" for r in audit_records(env))
+    # TUI 卡头屏蔽:text 替换为 ***(N字节),其他参数照常
+    display = tool_call_display(
+        "session_send", {"session_id": holder["sid"], "text": password}
+    )
+    assert password not in display
+    masked = f"***（{len(password.encode('utf-8'))}字节）"
+    assert masked in display
+    assert holder["sid"] in display
     assert verify(env.audit_path)

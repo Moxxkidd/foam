@@ -55,6 +55,9 @@ KIND_JOB_EXIT = "job_exit"
 # R07 注册:PTY 会话五工具(open/send/read/close/list)逐条操作审计
 # (成功/失败/取消;调用与结果同条成对;R07-B 另有提示检测事件)。
 KIND_SESSION_OP = "session_op"
+# R07-B 注册:提示检测事件(检测时落链,不依赖 read;同 offset 去重由
+# session 层 last_event_offset 保证)。
+KIND_SESSION_PROMPT = "session_prompt"
 
 KNOWN_KINDS = frozenset(
     {
@@ -70,6 +73,7 @@ KNOWN_KINDS = frozenset(
         KIND_REFUSAL_DETECTED,
         KIND_JOB_EXIT,
         KIND_SESSION_OP,
+        KIND_SESSION_PROMPT,
     }
 )
 

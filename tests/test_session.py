@@ -623,3 +623,92 @@ def test_kill_process_group_kills_live_leader_group(monkeypatch):
 
     _kill_process_group(_Proc())
     assert calls == [(555, signal.SIGKILL)]
+
+
+# ---------------------------------------------------------------------------
+# R07-B:提示事件回调(on_prompt)与敏感保护(转录 0600)
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for(cond, *, wait_seconds=10.0, interval=0.05):
+    """轮询等待条件成真(读循环事件异步到达);超时返回 False。"""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+async def test_prompt_offset_dedup(tmp_path):
+    """R07 AC02/AC03:同 offset 不重报;新 offset 相同提示产独立事件。
+
+    检测时即触发(不依赖 session_read);read 排空事件不重复触发。
+    """
+    tool = SessionTool(tmp_path / "sess")
+    fired: list[tuple[str, dict]] = []
+    tool.on_prompt = lambda sid, event: fired.append((sid, event))
+    try:
+        s = await tool.session_open(
+            "read -p 'password: ' a; read -p 'password: ' b; echo done:$a,$b"
+        )
+        sid = s["session_id"]
+        # 检测时即触发:尚未发起任何 read,回调已到达
+        assert await _wait_for(lambda: len(fired) >= 1)
+        assert fired[0][0] == sid
+        assert fired[0][1]["prompt_type"] == "password"
+        assert fired[0][1]["type"] == "waiting_for_input"
+        offset1 = fired[0][1]["offset"]
+        # read 排空 LLM 面事件;同 offset(bytes_total 不变)不重报(AC02)
+        r = await tool.session_read(sid)
+        assert any(e["prompt_type"] == "password" for e in r["events"])
+        r2 = await tool.session_read(sid)
+        assert r2["events"] == []
+        await asyncio.sleep(0.3)
+        assert len(fired) == 1
+        # 新 offset 上的相同提示产独立事件,不丢(AC03)
+        await tool.session_send(sid, "TESTONLY-a")
+        assert await _wait_for(lambda: len(fired) >= 2)
+        assert fired[1][1]["prompt_type"] == "password"
+        assert fired[1][1]["offset"] > offset1
+        # 流程仍可走完(回调不影响会话行为)
+        await tool.session_send(sid, "TESTONLY-b")
+        r3 = await tool.session_read(
+            sid, wait_pattern=r"done:TESTONLY-a,TESTONLY-b", timeout_seconds=5
+        )
+        assert r3["matched"] is True
+    finally:
+        await tool.aclose()
+
+
+async def test_on_prompt_callback_exception_safe(tool):
+    """R07:回调异常被捕获——读循环不死,LLM 面事件照常投递。"""
+    calls = []
+
+    def _boom(_sid, _event):
+        calls.append(1)
+        raise RuntimeError("TESTONLY 回调爆炸")
+
+    tool.on_prompt = _boom
+    s = await tool.session_open("read -p 'password: ' x; echo got:$x")
+    sid = s["session_id"]
+    assert await _wait_for(lambda: len(calls) >= 1)
+    r = await tool.session_read(sid)
+    assert any(e["prompt_type"] == "password" for e in r["events"])
+    # 读循环未死:后续交互正常
+    await tool.session_send(sid, "x1")
+    r2 = await tool.session_read(sid, wait_pattern="got:x1", timeout_seconds=5)
+    assert r2["matched"] is True
+    await tool.session_close(sid)
+
+
+async def test_transcript_file_mode_600(tool):
+    """R07 AC04:会话转录是敏感产物(可能含口令回显),权限钉 0600。"""
+    s = await tool.session_open("cat")
+    path = s["output_path"]
+    mode = os.stat(path).st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+    done = await tool.session_close(s["session_id"])
+    assert done["status"] == "closed"
+    # 关闭定稿后权限保持
+    assert (os.stat(path).st_mode & 0o777) == 0o600

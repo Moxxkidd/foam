@@ -20,6 +20,7 @@ schema 形状与 WP-01 同构(provider 中立 {name, description, parameters}
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import fcntl
 import os
@@ -30,6 +31,7 @@ import struct
 import termios
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -371,6 +373,10 @@ class SessionTool:
         # 短路配对:开了没人收的口子必须堵上);_close_result 缓存首次清理报告。
         self._closed = False
         self._close_result: dict[str, Any] | None = None
+        # R07:可选提示事件回调(签名 (session_id, event);loop 装配接线用于
+        # session_prompt 审计——参照 bash 层 on_job_exit 先例。None = 纯工具
+        # 使用,行为完全不变;回调异常被捕获,绝不破坏读循环。
+        self.on_prompt: Callable[[str, dict[str, Any]], None] | None = None
 
     # ---------- WP-04 唯一入口 ----------
 
@@ -438,6 +444,10 @@ class SessionTool:
             self.output_dir, session_id,
             ring_buffer_bytes=self._ring_bytes, split=False,
         )
+        # R07(AC04):转录是敏感产物(可能含口令回显),权限钉 0600——
+        # OutputRecorder 构造即建文件(output.py:84),此处直接 chmod,
+        # 不随 umask 漂移。
+        os.chmod(recorder.combined_path, 0o600)
         session = _Session(
             session_id=session_id,
             command=command,
@@ -745,15 +755,19 @@ class SessionTool:
             return
         session.last_event_offset = session.recorder.bytes_total
         matched = pattern.regex.search(text)
-        session.events.append(
-            {
-                "type": "waiting_for_input",
-                "prompt_type": pattern.prompt_type,
-                "text": matched.group(0).strip() if matched else "",
-                "hint": pattern.hint,
-                "offset": session.recorder.bytes_total,
-            }
-        )
+        event: dict[str, Any] = {
+            "type": "waiting_for_input",
+            "prompt_type": pattern.prompt_type,
+            "text": matched.group(0).strip() if matched else "",
+            "hint": pattern.hint,
+            "offset": session.recorder.bytes_total,
+        }
+        session.events.append(event)
+        # R07:检测时同步触发审计回调(生成一次触发一次;read 排空不重复)。
+        # 回调是观测面:异常吞掉,绝不破坏读循环。
+        if self.on_prompt is not None:
+            with contextlib.suppress(Exception):
+                self.on_prompt(session.session_id, dict(event))
 
     @staticmethod
     def _result(session: _Session) -> dict[str, Any]:

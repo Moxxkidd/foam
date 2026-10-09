@@ -131,6 +131,8 @@ def tool_call_display(name: str, arguments: dict[str, Any]) -> str:
     """工具卡的一行展示:run_command 显示命令本体,其余工具显示紧凑参数。
 
     全文不进卡片头部(防长命令撑破排版);完整内容在展开体/落盘文件里。
+    R07(AC04):session_send 的 text 可能是口令等敏感输入,卡头只露字节数
+    (`***（N字节）`),不进明文;其他参数照常。
     """
     if name == "run_command":
         command = str(arguments.get("command", "")).strip()
@@ -138,6 +140,11 @@ def tool_call_display(name: str, arguments: dict[str, Any]) -> str:
         if len(command) > len(first_line):
             first_line += " …"
         return first_line
+    if name == "session_send":
+        arguments = dict(arguments)
+        text = arguments.get("text")
+        if isinstance(text, str):
+            arguments["text"] = f"***（{len(text.encode('utf-8'))}字节）"
     args = json.dumps(arguments, ensure_ascii=False)
     if len(args) > 96:
         args = args[:96] + "…"

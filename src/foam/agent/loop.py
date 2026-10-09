@@ -73,6 +73,7 @@ from foam.guard.audit import (
     KIND_LLM_EXCHANGE_META,
     KIND_OPERATOR_INTERJECT,
     KIND_SESSION_OP,
+    KIND_SESSION_PROMPT,
     AuditLog,
     llm_meta,
 )
@@ -117,6 +118,10 @@ DRAIN_JOB_EXITS_TIMEOUT_SECONDS = 5.0
 SESSION_TOOL_NAMES = frozenset(
     {"session_open", "session_send", "session_read", "session_close", "session_list"}
 )
+
+#: R07-B:session_prompt 审计里 prompt_text 的截断上限(字节,utf-8)。
+#: 提示原文理论上很短(正则锚尾匹配),此为防异常膨胀保险。
+PROMPT_TEXT_AUDIT_BYTES = 200
 
 #: 本 WP 新增的审计事件类型(WP-02 的 KNOWN_KINDS 明示允许扩展)。
 KIND_RUN_STARTED = "run_started"
@@ -437,6 +442,10 @@ class AgentLoop:
         self._registry = registry
         self._observer = observer or LoopObserver()
         self._session = session
+        # R07-B:会话提示检测落链(audit 为构造必传,恒在场;session 缺省=
+        # 纯 bash 环境,不接线)。session.py 不 import audit,保持 WP-05 分层。
+        if self._session is not None:
+            self._session.on_prompt = self._audit_session_prompt
         self._engagement = engagement
         self._index = index
         self._operator = operator
@@ -966,6 +975,30 @@ class AgentLoop:
         elif outcome == "error":
             payload["error"] = result.get("error")
         self._audit.append(KIND_SESSION_OP, payload)
+
+    def _audit_session_prompt(self, session_id: str, event: dict[str, Any]) -> None:
+        """session.on_prompt 回调:提示检测时即落 session_prompt 链(不依赖
+        LLM 发起 read);同 offset 去重由 session 层 last_event_offset 保证,
+        read 排空不重落——一条记录 = 一次提示生成。
+
+        字段名映射:事件 prompt_type→pattern_kind、offset→transcript_offset
+        (LLM 面向事件格式不动,审计侧用规格字段名,R07.md §7 接口漂移)。
+        prompt_text 是输出侧提示(如 "Password:"),非输入,可记;截断保险
+        见 PROMPT_TEXT_AUDIT_BYTES。
+        """
+        text = str(event.get("text") or "")
+        clipped = text.encode("utf-8")[:PROMPT_TEXT_AUDIT_BYTES]
+        self._audit.append(
+            KIND_SESSION_PROMPT,
+            {
+                "run_id": self._run_id,
+                "session_id": session_id,
+                "pattern_kind": event.get("prompt_type"),
+                "transcript_offset": event.get("offset"),
+                "prompt_text": clipped.decode("utf-8", errors="ignore"),
+                "hint": event.get("hint"),
+            },
+        )
 
     # ---------- 解析层钩子(WP-11 接线;增强而非门槛) ----------
 
