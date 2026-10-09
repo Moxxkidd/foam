@@ -750,3 +750,25 @@ WP-13(整合)依赖全部
   预算未覆盖收割+drain 延长链、收割上界耗尽后逃逸 job 事件蒸发、兜底
   事件 reason="running"、busy 同步等待冻结事件循环四项只记录不修
   （见 R06.md §7/§8，归测试基建/恢复条目）。净增测试 5 例。
+
+
+## 当前状态（2026-10-09：R07 关闭）
+
+- [R07](items/R07.md) 完成并合入 main（v0.1.3 条目 2/4）：PTY 操作审计与
+  提示事件。三分片：R07-A（loop `_execute_tool` 增会话分支，`session_op`
+  五操作成功/失败/取消逐条落链、调用/结果同条成对；spawn raise 落 error
+  后仍终结 run 的既有行为不变）、R07-B（session.py 增 `on_prompt` 回调，
+  `_detect_prompt` 检测时触发；loop 接线落 `session_prompt`（不依赖 read，
+  同 offset 不重报/新 offset 独立事件）；send 审计只记字节数、TUI 卡头
+  `***（N字节）` 屏蔽、会话转录 chmod 0600）、R07-C（replay format_record
+  会话分支、audit_stats 会话计数与 op×outcome 分解、`session_coverage`
+  legacy/tracked、报告统计节展示）。逐条验收证据见 R07.md §5，红基线/
+  分片/全量实录见 §6。
+- 关键边界：session_open 不过 scope 护栏的缝隙不改（审计可见性 ≠ PTY
+  授权检查已解决）；LLM 面事件字段名（prompt_type/offset）不动，审计侧用
+  规格名 pattern_kind/transcript_offset；无 loop 的纯工具使用行为完全不变；
+  旧链不改不补写。接口漂移与剩余风险见 R07.md §7/§8。
+- 测试基线：全仓 **728 passed + 2 skipped**（基线 708+2，本条目净增 20
+  例；2 skip 为 ssh/msfconsole 环境门控，语义不变），ruff 全绿。
+- 下一步：按 [R 索引](items/README.md) 评审 [R08](items/R08.md)（非解析器
+  成果登记与证据模型）。
