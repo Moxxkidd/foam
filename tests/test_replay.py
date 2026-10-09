@@ -27,6 +27,8 @@ from foam.guard.audit import (
     KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
     KIND_SCOPE_UPDATED,
+    KIND_SESSION_OP,
+    KIND_SESSION_PROMPT,
     AuditLog,
     llm_meta,
     verify,
@@ -38,9 +40,11 @@ from foam.replay import (
     build_report,
     build_resume_briefing,
     find_chain_break,
+    format_timeline,
     read_records,
     recover_objective,
     recover_scope_record,
+    session_coverage,
     summarize_recent_rounds,
 )
 from foam.state.files import Engagement
@@ -723,3 +727,148 @@ def test_report_empty_page_with_unexhausted_total_raises(tmp_path, monkeypatch):
     with pytest.raises(ReportGenerationError, match="空页"):
         build_report(root)
     assert calls == 1  # 首页即空且 total 未耗尽 → 立即报错,循环不挂
+
+
+# ---------------------------------------------------------------------------
+# R07-C:回放兼容——session_coverage(legacy/tracked)、时间线与统计
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_session_coverage(tmp_path):
+    """R07-AC05:旧链(无 session_* kind)回放不炸、标 legacy 而非「0 会话」。"""
+    root = make_engagement(tmp_path)
+    records = read_records(root / "audit.jsonl")
+    assert verify(root / "audit.jsonl")
+    assert session_coverage(records) == "legacy"
+    stats = audit_stats(records)
+    assert stats["session_ops"] == 0
+    assert stats["session_prompts"] == 0
+    assert not any(key.startswith("session_op:") for key in stats)
+    lines = format_timeline(records)  # 旧链回放不炸
+    assert len(lines) == len(records)
+    report = build_report(root)
+    assert "会话审计:legacy(无会话审计记录)" in report
+    assert "审计链:完整(8 条记录" in report  # 旧断言面不变
+
+
+def test_session_chain_replay_and_stats(tmp_path):
+    """R07:含 session_op/session_prompt 的链——时间线可读、统计逐条对应
+    (一条=一次操作)、coverage=tracked、报告展示计数与分解。"""
+    root = make_engagement(tmp_path)
+    audit = AuditLog(root / "audit.jsonl")  # 在真链上续写
+    base = {
+        "run_id": "r07test00001",
+        "session_id": "s-0123456789",
+        "ended_at": "2026-10-09T00:00:01+00:00",
+    }
+    audit.append(
+        KIND_SESSION_OP,
+        {
+            **base,
+            "op_id": "op0000000000a1",
+            "call_id": "tc-1",
+            "op": "session_open",
+            "outcome": "ok",
+            "duration_ms": 152,
+            "command": "cat",
+        },
+    )
+    audit.append(
+        KIND_SESSION_PROMPT,
+        {
+            "run_id": "r07test00001",
+            "session_id": "s-0123456789",
+            "pattern_kind": "password",
+            "transcript_offset": 128,
+            "prompt_text": "Password:",
+            "hint": "TESTONLY 合成提示",
+        },
+    )
+    audit.append(
+        KIND_SESSION_OP,
+        {
+            **base,
+            "op_id": "op0000000000a2",
+            "call_id": "tc-2",
+            "op": "session_send",
+            "outcome": "ok",
+            "duration_ms": 1,
+            "bytes": 20,  # AC04:只记字节数
+        },
+    )
+    audit.append(
+        KIND_SESSION_OP,
+        {
+            **base,
+            "op_id": "op0000000000a3",
+            "call_id": "tc-3",
+            "op": "session_read",
+            "outcome": "ok",
+            "duration_ms": 3,
+            "new_bytes": 64,
+            "cursor": 64,
+            "has_more": False,
+            "matched": None,
+            "timed_out": False,
+            "events_drained": 1,
+        },
+    )
+    audit.append(
+        KIND_SESSION_OP,
+        {
+            **base,
+            "op_id": "op0000000000a4",
+            "call_id": "tc-4",
+            "op": "session_read",
+            "outcome": "cancelled",
+            "duration_ms": 8000,
+        },
+    )
+    audit.append(
+        KIND_SESSION_OP,
+        {
+            "op_id": "op0000000000a5",
+            "run_id": "r07test00001",
+            "call_id": "tc-5",
+            "op": "session_close",
+            "session_id": "s-ffffffff99",
+            "outcome": "error",
+            "duration_ms": 0,
+            "ended_at": "2026-10-09T00:00:09+00:00",
+            "error": "未知 session_id: 's-ffffffff99'",
+        },
+    )
+    audit.close()
+    assert verify(root / "audit.jsonl")
+
+    records = read_records(root / "audit.jsonl")
+    assert session_coverage(records) == "tracked"
+    stats = audit_stats(records)
+    assert stats["session_ops"] == 5  # 一条记录 = 一次操作
+    assert stats["session_prompts"] == 1
+    assert stats["session_op:session_open:ok"] == 1
+    assert stats["session_op:session_send:ok"] == 1
+    assert stats["session_op:session_read:ok"] == 1
+    assert stats["session_op:session_read:cancelled"] == 1
+    assert stats["session_op:session_close:error"] == 1
+
+    lines = format_timeline(records)
+    op_lines = [line for line in lines if "会话操作" in line]
+    assert len(op_lines) == 5
+    assert any(
+        "session_open" in line and "s-0123456789" in line and "ok" in line
+        for line in op_lines
+    )
+    cancelled = [line for line in op_lines if "cancelled" in line]
+    assert len(cancelled) == 1 and "session_read" in cancelled[0]
+    errored = [line for line in op_lines if "error" in line]
+    assert len(errored) == 1 and "未知 session_id" in errored[0]
+    prompt_lines = [line for line in lines if "会话提示" in line]
+    assert len(prompt_lines) == 1
+    assert "password" in prompt_lines[0] and "@offset 128" in prompt_lines[0]
+
+    report = build_report(root)
+    assert "会话审计:tracked" in report
+    assert "会话操作 5 次" in report
+    assert "提示 1 次" in report
+    assert "session_read cancelled 1" in report  # 分解行逐条对应

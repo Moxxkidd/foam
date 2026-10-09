@@ -39,6 +39,8 @@ from foam.guard.audit import (
     KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
     KIND_SCOPE_UPDATED,
+    KIND_SESSION_OP,
+    KIND_SESSION_PROMPT,
     ZERO_HASH,
     compute_hash,
     explain,
@@ -262,6 +264,23 @@ def format_record(record: dict[str, Any]) -> str:
             f"{payload.get('estimated_tokens_after')} tokens(预算 "
             f"{payload.get('budget')})"
         )
+    if kind == KIND_SESSION_OP:
+        # R07:一条 = 一次调用(成功/失败/取消);session_id 可为 None(open 失败/列表)
+        sid = payload.get("session_id") or "-"
+        line = (
+            f"会话操作:{payload.get('op')} {sid} → "
+            f"{payload.get('outcome')}({payload.get('duration_ms')}ms)"
+        )
+        if payload.get("error"):
+            line += f",error={_clip(str(payload['error']))}"
+        return head + line
+    if kind == KIND_SESSION_PROMPT:
+        return head + (
+            f"会话提示:{payload.get('pattern_kind')} "
+            f"@offset {payload.get('transcript_offset')}"
+            f"(会话 {payload.get('session_id')}):"
+            f"{_clip(str(payload.get('prompt_text') or ''), 60)}"
+        )
     # 未知 kind(KNOWN_KINDS 允许后续 WP 扩展):通用摘要,不炸。
     summary = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return head + f"{kind}:{_clip(summary)}"
@@ -320,7 +339,12 @@ def recover_scope_record(records: list[dict[str, Any]]) -> dict[str, Any] | None
 
 def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
     """run 次数 / LLM 轮数 / 命令数 / 拒绝数 / 插话数 / kill 数 / 拒答数
-    (报告与简报共用;拒答为 WP-14 纯观测计数,供授权段措辞迭代供数)。"""
+    (报告与简报共用;拒答为 WP-14 纯观测计数,供授权段措辞迭代供数)。
+
+    R07 增量:``session_ops``(会话操作总数,一条记录 = 一次调用,成功/失败/
+    取消都计)、``session_prompts``(提示检测数),并按
+    ``session_op:{op}:{outcome}`` 扁平键给出分解(仅出现过的组合在场)。
+    """
     stats = {
         "runs": 0,
         "rounds": 0,
@@ -329,6 +353,8 @@ def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
         "interjects": 0,
         "kills": 0,
         "refusals": 0,
+        "session_ops": 0,
+        "session_prompts": 0,
     }
     for record in records:
         kind = record.get("kind")
@@ -346,7 +372,23 @@ def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
             stats["kills"] += 1
         elif kind == KIND_REFUSAL_DETECTED:
             stats["refusals"] += 1
+        elif kind == KIND_SESSION_OP:
+            stats["session_ops"] += 1
+            payload = record.get("payload") or {}
+            key = f"session_op:{payload.get('op')}:{payload.get('outcome')}"
+            stats[key] = stats.get(key, 0) + 1
+        elif kind == KIND_SESSION_PROMPT:
+            stats["session_prompts"] += 1
     return stats
+
+
+def session_coverage(records: list[dict[str, Any]]) -> str:
+    """会话审计覆盖判定(R07):链中无 session_op 记录 → "legacy"(旧链,
+    不谎称「0 会话」);有 → "tracked"。只读判定,不改历史链。"""
+    for record in records:
+        if record.get("kind") == KIND_SESSION_OP:
+            return "tracked"
+    return "legacy"
 
 
 def summarize_recent_rounds(records: list[dict[str, Any]], n: int) -> list[str]:
@@ -584,6 +626,21 @@ def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
         f"{stats['interjects']} 条 / kill {stats['kills']} 次"
         f" / 拒答 {stats['refusals']} 次"
     )
+    # R07:会话审计覆盖——旧链标 legacy(不谎称「0 会话」),新链给计数与分解
+    if session_coverage(records) == "legacy":
+        lines.append("- 会话审计:legacy(无会话审计记录)")
+    else:
+        lines.append(
+            f"- 会话审计:tracked(会话操作 {stats['session_ops']} 次 / "
+            f"提示 {stats['session_prompts']} 次)"
+        )
+        breakdown = []
+        for key, n in sorted(stats.items()):
+            if key.startswith("session_op:"):
+                _, op, outcome = key.split(":", 2)
+                breakdown.append(f"{op} {outcome} {n}")
+        if breakdown:
+            lines.append("- 会话操作分解:" + " / ".join(breakdown))
     if not index_missing:
         # R04(D3):统计与正文同源——来自分页结果里的真实 total,不再用
         # 被 500 上限截断的 len(rows)。
