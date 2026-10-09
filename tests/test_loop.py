@@ -42,6 +42,8 @@ from foam.agent.prompts import build_system_prompt
 from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
 from foam.guard.scope import parse_scope, scope_payload
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
+from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
+from foam.tools.session import SessionTool
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
 
@@ -1266,3 +1268,345 @@ async def test_close_run_tolerates_missing_handles():
     result = await close_run(RunRuntime(), run_id="t", reason="装配失败")
     assert result["cleanup_status"] == "ok"
     assert result["remaining_resources"] == []
+
+
+# ---------------------------------------------------------------------------
+# R07-A:session_op 审计——五操作 成功/失败/取消 逐条落链(调用/结果同条成对)
+# ---------------------------------------------------------------------------
+
+
+def make_session_loop(
+    tmp_path, script, *, session=None, loop_kw=None
+) -> SimpleNamespace:
+    """R07:带真实 SessionTool 的 loop 环境(注册会话五工具并传入 loop)。"""
+    if session is None:
+        session = SessionTool(tmp_path / "sess")
+
+    def _register(registry: ToolRegistry) -> None:
+        registry.register_module(SESSION_TOOL_SCHEMAS, session.dispatch)
+
+    env = make_loop(
+        tmp_path,
+        script,
+        register=_register,
+        loop_kw={"session": session, **(loop_kw or {})},
+    )
+    env.session = session
+    return env
+
+
+def session_op_payloads(env) -> list[dict]:
+    return [r["payload"] for r in audit_records(env) if r["kind"] == "session_op"]
+
+
+def assert_session_op_common(payload: dict, env, *, call_id: str, op: str) -> None:
+    """每条 session_op 的公共字段:op_id/run_id/call_id/op/duration/ended_at。"""
+    assert payload["op_id"] and len(payload["op_id"]) == 12
+    started = [r for r in audit_records(env) if r["kind"] == "run_started"]
+    assert payload["run_id"] == started[-1]["payload"]["run_id"]
+    assert payload["call_id"] == call_id
+    assert payload["op"] == op
+    assert isinstance(payload["duration_ms"], int) and payload["duration_ms"] >= 0
+    assert payload["ended_at"]  # 结束时间戳在场(ISO 字符串)
+
+
+async def test_session_operation_audit_open_ok(tmp_path):
+    env = make_session_loop(
+        tmp_path,
+        [
+            [ToolCall("tc-1", "session_open", {"command": "cat"}), Usage(1, 1)],
+            [TextDelta("会话已开,收尾。"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("开 cat 会话")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1  # 每个调用一条记录,调用/结果同条成对
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_open")
+    assert p["outcome"] == "ok"
+    assert p["session_id"].startswith("s-")  # open 的 session_id 从成功结果取
+    assert p["command"] == "cat"  # 与 exec_request 明文同暴露级
+    assert verify(env.audit_path)
+    # run 收尾已统一收割(R03):会话层已 aclose,会话状态 closed
+    sessions = (await env.session.session_list())["sessions"]
+    assert sessions[0]["status"] == "closed"
+
+
+async def test_session_operation_audit_send_ok(tmp_path):
+    session = SessionTool(tmp_path / "sess")
+    opened = await session.session_open("cat")
+    sid = opened["session_id"]
+    env = make_session_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-1",
+                    "session_send",
+                    {"session_id": sid, "text": "hello-r07"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("已写入。"), Usage(1, 1)],
+        ],
+        session=session,
+    )
+    result = await env.loop.run("写入会话")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_send")
+    assert p["outcome"] == "ok"
+    assert p["session_id"] == sid  # send/read/close 的 session_id 从参数取
+    # AC04:只记字节数——无 text 原文、无任何 hash 字段
+    assert p["bytes"] == len(b"hello-r07")
+    assert "text" not in p
+    assert "hello-r07" not in json.dumps(p, ensure_ascii=False)
+    assert verify(env.audit_path)
+
+
+async def test_session_operation_audit_read_ok(tmp_path):
+    session = SessionTool(tmp_path / "sess")
+    opened = await session.session_open("cat")
+    sid = opened["session_id"]
+    await session.session_send(sid, "echo-r07")
+    env = make_session_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-1",
+                    "session_read",
+                    {
+                        "session_id": sid,
+                        "wait_pattern": "echo-r07",
+                        "timeout_seconds": 5,
+                    },
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("读到了。"), Usage(1, 1)],
+        ],
+        session=session,
+    )
+    result = await env.loop.run("读会话输出")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_read")
+    assert p["outcome"] == "ok"
+    assert p["session_id"] == sid
+    assert p["new_bytes"] > 0
+    assert isinstance(p["cursor"], int)
+    assert isinstance(p["has_more"], bool)
+    assert p["matched"] is True
+    assert p["timed_out"] is False
+    assert p["events_drained"] == 0
+    assert verify(env.audit_path)
+
+
+async def test_session_operation_audit_close_ok(tmp_path):
+    session = SessionTool(tmp_path / "sess")
+    opened = await session.session_open("cat")
+    sid = opened["session_id"]
+    env = make_session_loop(
+        tmp_path,
+        [
+            [ToolCall("tc-1", "session_close", {"session_id": sid}), Usage(1, 1)],
+            [TextDelta("已关闭。"), Usage(1, 1)],
+        ],
+        session=session,
+    )
+    result = await env.loop.run("关闭会话")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_close")
+    assert p["outcome"] == "ok"
+    assert p["session_id"] == sid
+    assert p["status"] == "closed"  # close 记最终状态
+    assert verify(env.audit_path)
+
+
+async def test_session_operation_audit_list_ok(tmp_path):
+    session = SessionTool(tmp_path / "sess")
+    await session.session_open("cat")
+    env = make_session_loop(
+        tmp_path,
+        [
+            [ToolCall("tc-1", "session_list", {}), Usage(1, 1)],
+            [TextDelta("列完了。"), Usage(1, 1)],
+        ],
+        session=session,
+    )
+    result = await env.loop.run("列出会话")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_list")
+    assert p["outcome"] == "ok"
+    assert p["session_id"] is None  # 列表无单会话归属
+    assert p["count"] >= 1  # 预开的 cat 在列
+    assert verify(env.audit_path)
+
+
+@pytest.mark.parametrize(
+    ("op", "args"),
+    [
+        ("session_send", {"session_id": "s-missing07", "text": "x"}),
+        ("session_read", {"session_id": "s-missing07"}),
+        ("session_close", {"session_id": "s-missing07"}),
+    ],
+)
+async def test_session_operation_audit_unknown_session(tmp_path, op, args):
+    """未知 session_id:error dict → outcome=error,错误消息在场,run 不受影响。"""
+    env = make_session_loop(
+        tmp_path,
+        [
+            [ToolCall("tc-1", op, args), Usage(1, 1)],
+            [TextDelta("收到错误。"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("操作未知会话")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op=op)
+    assert p["outcome"] == "error"
+    assert p["session_id"] == "s-missing07"
+    assert "未知 session_id" in p["error"]
+    assert verify(env.audit_path)
+
+
+async def test_session_operation_audit_read_bad_regex(tmp_path):
+    session = SessionTool(tmp_path / "sess")
+    opened = await session.session_open("cat")
+    sid = opened["session_id"]
+    env = make_session_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-1",
+                    "session_read",
+                    {"session_id": sid, "wait_pattern": "([invalid"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("正则错了。"), Usage(1, 1)],
+        ],
+        session=session,
+    )
+    result = await env.loop.run("非法正则读")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_read")
+    assert p["outcome"] == "error"
+    assert p["session_id"] == sid
+    assert "非法正则" in p["error"]
+    assert verify(env.audit_path)
+
+
+async def test_session_operation_audit_open_after_aclose(tmp_path):
+    """aclose 后 open 返回 error dict(R03 拒绝):outcome=error,session_id 为 None。"""
+    env = make_session_loop(
+        tmp_path,
+        [
+            [ToolCall("tc-1", "session_open", {"command": "cat"}), Usage(1, 1)],
+            [TextDelta("被拒了。"), Usage(1, 1)],
+        ],
+    )
+    await env.session.aclose()
+    result = await env.loop.run("已关闭层开会话")
+    assert result.status == "finished"
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_open")
+    assert p["outcome"] == "error"
+    assert p["session_id"] is None
+    assert p["command"] == "cat"  # 尝试的命令仍记(与 exec_request 同暴露级)
+    assert "已关闭" in p["error"]
+    assert verify(env.audit_path)
+
+
+async def test_session_operation_audit_spawn_raise(tmp_path, monkeypatch):
+    """spawn 失败 raise(五操作唯一例外):outcome=error 落链,异常仍终结 run。"""
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("TESTONLY 注入 spawn 失败")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _boom)
+    env = make_session_loop(
+        tmp_path,
+        [[ToolCall("tc-1", "session_open", {"command": "cat"}), Usage(1, 1)]],
+    )
+    result = await env.loop.run("spawn 失败场景")
+    assert result.status == "error"  # 既有行为不变:raise 终结 run(R07 §7 边界)
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_open")
+    assert p["outcome"] == "error"
+    assert p["session_id"] is None
+    assert "OSError" in p["error"] and "TESTONLY 注入 spawn 失败" in p["error"]
+    assert verify(env.audit_path)
+
+
+async def test_session_operation_audit_read_cancelled(tmp_path):
+    """wait_pattern 挂起的 session_read 被外部 cancel:outcome=cancelled 落链,
+    CancelledError 原样上抛,run 走向不变(run_finished status=cancelled)。"""
+    session = SessionTool(tmp_path / "sess")
+    opened = await session.session_open("cat")
+    sid = opened["session_id"]
+    read_started = asyncio.Event()
+
+    class _ReadObserver(LoopObserver):
+        def on_tool_call(self, call):
+            if call.name == "session_read":
+                read_started.set()
+
+    env = make_session_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-1",
+                    "session_read",
+                    {
+                        "session_id": sid,
+                        "wait_pattern": "NEVER_MATCH_R07",
+                        "timeout_seconds": 30,
+                    },
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("不应走到这里。"), Usage(1, 1)],
+        ],
+        session=session,
+        loop_kw={"observer": _ReadObserver()},
+    )
+    task = asyncio.create_task(env.loop.run("挂起读然后取消"))
+    await asyncio.wait_for(read_started.wait(), timeout=2)
+    await asyncio.sleep(0.05)  # 让派发进入 read 等待
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    ops = session_op_payloads(env)
+    assert len(ops) == 1
+    p = ops[0]
+    assert_session_op_common(p, env, call_id="tc-1", op="session_read")
+    assert p["outcome"] == "cancelled"
+    assert p["session_id"] == sid
+    # run 走向不受影响:统一终态面照常落 run_finished(cancelled)
+    finished = [r for r in audit_records(env) if r["kind"] == "run_finished"]
+    assert finished[-1]["payload"]["status"] == "cancelled"
+    assert verify(env.audit_path)

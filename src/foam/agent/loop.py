@@ -38,6 +38,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
@@ -71,6 +72,7 @@ from foam.guard.audit import (
     KIND_KILL_SWITCH,
     KIND_LLM_EXCHANGE_META,
     KIND_OPERATOR_INTERJECT,
+    KIND_SESSION_OP,
     AuditLog,
     llm_meta,
 )
@@ -110,6 +112,11 @@ MAX_CONSECUTIVE_CLAIM_CORRECTIONS = 2
 _RAW_ARGS_ECHO_LIMIT = 4_000
 #: R06-C:run 收尾排空后台终态消费任务的有界超时(与收割上界同量级)。
 DRAIN_JOB_EXITS_TIMEOUT_SECONDS = 5.0
+
+#: R07:session_op 审计覆盖的会话工具名(WP-05 五工具)。
+SESSION_TOOL_NAMES = frozenset(
+    {"session_open", "session_send", "session_read", "session_close", "session_list"}
+)
 
 #: 本 WP 新增的审计事件类型(WP-02 的 KNOWN_KINDS 明示允许扩展)。
 KIND_RUN_STARTED = "run_started"
@@ -854,6 +861,9 @@ class AgentLoop:
                     "violations": list(decision.violations),
                     "reason": decision.reason,
                 }
+        if call.name in SESSION_TOOL_NAMES:
+            # R07:会话五工具逐条 session_op 审计(成功/失败/取消)
+            return await self._execute_session_tool(call)
         result = await self._registry.dispatch(call.name, call.arguments)
         if call.name == "run_command" and "error" not in result:
             result = dict(result)
@@ -874,6 +884,88 @@ class AgentLoop:
                 payload["parsed"] = parsed_meta
             self._audit.append(KIND_EXEC_RESULT_META, payload)
         return result
+
+    # ---------- R07:会话操作审计 ----------
+
+    async def _execute_session_tool(self, call: ToolCall) -> dict[str, Any]:
+        """session_* 派发 + session_op 落链:每个调用一条,调用/结果同条成对。
+
+        - 正常返回:error dict → outcome="error",否则 "ok";
+        - CancelledError:落 outcome="cancelled" 后原样重抛(append 为同步
+          调用,取消安全;run 的取消走向不变);
+        - 其他异常(session_open spawn 失败 raise):落 outcome="error"
+          (类名+消息)后原样重抛——不把异常当作没执行,也不改变 raise
+          终结 run 的既有行为(R07.md §7 边界)。
+        """
+        started = time.monotonic()
+        try:
+            result = await self._registry.dispatch(call.name, call.arguments)
+        except asyncio.CancelledError:
+            self._append_session_op(call, started, "cancelled")
+            raise
+        except Exception as exc:
+            self._append_session_op(
+                call, started, "error", error=f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        outcome = "error" if "error" in result else "ok"
+        self._append_session_op(call, started, outcome, result=result)
+        return result
+
+    def _append_session_op(
+        self,
+        call: ToolCall,
+        started_mono: float,
+        outcome: str,
+        *,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """组装并落一条 session_op:公共关联字段 + 按 op 分类的元信息。
+
+        AC04:session_send 只记 text 的 utf-8 编码字节数(不含自动补尾换行),
+        绝不记原文或原文的任何 hash;error 消息取自工具 error dict(本就面向
+        LLM,无敏感参数)。
+        """
+        op = call.name
+        args = call.arguments or {}
+        result = result or {}
+        payload: dict[str, Any] = {
+            "op_id": uuid.uuid4().hex[:12],
+            "run_id": self._run_id,
+            "call_id": call.id,
+            "op": op,
+            "outcome": outcome,
+            "duration_ms": int(round((time.monotonic() - started_mono) * 1000)),
+            "ended_at": datetime.now(UTC).isoformat(timespec="microseconds"),
+        }
+        if op == "session_open":
+            # command 与 exec_request 明文同暴露级;session_id 只从成功结果取
+            payload["command"] = args.get("command")
+            payload["session_id"] = result.get("session_id")
+        else:
+            payload["session_id"] = args.get("session_id")
+        if op == "session_send":
+            text = args.get("text")
+            payload["bytes"] = (
+                len(text.encode("utf-8", errors="replace"))
+                if isinstance(text, str)
+                else None
+            )
+        elif op == "session_read" and outcome == "ok":
+            for key in ("new_bytes", "cursor", "has_more", "matched", "timed_out"):
+                payload[key] = result.get(key)
+            events = result.get("events")
+            payload["events_drained"] = len(events) if isinstance(events, list) else 0
+        elif op == "session_close":
+            payload["status"] = result.get("status")
+        elif op == "session_list":
+            payload["count"] = result.get("count")
+        if error is not None:
+            payload["error"] = error
+        elif outcome == "error":
+            payload["error"] = result.get("error")
+        self._audit.append(KIND_SESSION_OP, payload)
 
     # ---------- 解析层钩子(WP-11 接线;增强而非门槛) ----------
 

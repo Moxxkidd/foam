@@ -52,6 +52,9 @@ KIND_SCOPE_UPDATED = "scope_updated"
 KIND_REFUSAL_DETECTED = "refusal_detected"
 # R06 注册:后台 job 终态事件消费(event_id 全程对账,允许可辨识重复投递)。
 KIND_JOB_EXIT = "job_exit"
+# R07 注册:PTY 会话五工具(open/send/read/close/list)逐条操作审计
+# (成功/失败/取消;调用与结果同条成对;R07-B 另有提示检测事件)。
+KIND_SESSION_OP = "session_op"
 
 KNOWN_KINDS = frozenset(
     {
@@ -66,6 +69,7 @@ KNOWN_KINDS = frozenset(
         KIND_SCOPE_UPDATED,
         KIND_REFUSAL_DETECTED,
         KIND_JOB_EXIT,
+        KIND_SESSION_OP,
     }
 )
 
