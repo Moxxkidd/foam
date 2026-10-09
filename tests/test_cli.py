@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
@@ -38,6 +39,7 @@ from foam.agent.backends.base import LLMBackend, TextDelta, ToolCall, Usage
 from foam.agent.loop import KIND_RUN_STARTED
 from foam.agent.prompts import render_scope_section
 from foam.agent.scope_compiler import scope_event_payload
+from foam.cli import _CliObserver
 from foam.cli import main as cli_main
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, AuditLog, verify
 from foam.guard.scope import load_scope, parse_scope
@@ -1363,3 +1365,30 @@ def test_report_export_file_mode_is_owner_only(tmp_path):
     assert cli_main(["report", str(workdir), "--out", str(out_path)]) == 0
     mode = stat.S_IMODE(out_path.stat().st_mode)
     assert mode == 0o600, f"报告含全值凭证,导出权限应为 0o600,实际 {mode:#o}"
+
+
+# ---------------------------------------------------------------------------
+# R07 评审收口(AC04):headless CLI 渲染面屏蔽 session_send 明文口令
+# ---------------------------------------------------------------------------
+
+
+def test_cli_observer_masks_session_send_text():
+    """_CliObserver.on_tool_call 对 session_send 的 text 只露字节数
+    (与 TUI 卡头/审计 bytes 同口径);其他工具参数照常渲染。"""
+    out = io.StringIO()
+    observer = _CliObserver(out=out)
+    password = "TESTONLY-cli-pw-4d2b"
+    observer.on_tool_call(
+        ToolCall(
+            "tc-1",
+            "session_send",
+            {"session_id": "s-abc1234567", "text": password},
+        )
+    )
+    rendered = out.getvalue()
+    assert password not in rendered  # 口令明文不上屏
+    assert "***（20字节）" in rendered  # 字节数标记(utf-8,与审计口径一致)
+    assert "s-abc1234567" in rendered  # 其他参数照常
+    # 对照:session_open 的 command 与 exec_request 明文同暴露级,不屏蔽
+    observer.on_tool_call(ToolCall("tc-2", "session_open", {"command": "cat"}))
+    assert '"command": "cat"' in out.getvalue()

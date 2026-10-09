@@ -712,3 +712,58 @@ async def test_transcript_file_mode_600(tool):
     assert done["status"] == "closed"
     # 关闭定稿后权限保持
     assert (os.stat(path).st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# R07 评审收口:session_open 的 chmod 失败路径(与 spawn/connect 失败同形态)
+# ---------------------------------------------------------------------------
+
+
+async def test_open_chmod_failure_cleans_up(tmp_path, monkeypatch):
+    """chmod 失败:清理已建资源(杀进程组+收割+关 transport/recorder 句柄)
+    后上抛——不留未注册孤儿,aclose 无残留,open 仍以 raise 形态失败。"""
+    from foam.tools import session as session_mod
+
+    procs: list = []
+    recorders: list = []
+    real_spawn = asyncio.create_subprocess_exec
+    real_recorder = session_mod.OutputRecorder
+
+    async def _spawn_spy(*args, **kwargs):
+        proc = await real_spawn(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    def _recorder_spy(*args, **kwargs):
+        recorder = real_recorder(*args, **kwargs)
+        recorders.append(recorder)
+        return recorder
+
+    def _chmod_boom(_path, _mode):
+        raise OSError("TESTONLY 注入 chmod 失败")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn_spy)
+    monkeypatch.setattr(session_mod, "OutputRecorder", _recorder_spy)
+    monkeypatch.setattr(os, "chmod", _chmod_boom)
+
+    tool = SessionTool(tmp_path / "sess")
+    try:
+        with pytest.raises(OSError, match="TESTONLY"):
+            await tool.session_open("sleep 30")
+        assert len(procs) == 1
+        proc = procs[0]
+        assert proc.returncode is not None  # 已杀并收割(kill 进程组 + wait)
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)  # 进程真死,非仅标记
+        assert recorders[0].finalized  # 转录文件句柄已关
+        assert tool._sessions == {}  # 未注册:open 失败即无会话产生
+        report = await tool.aclose()
+        assert report["cleanup_status"] == "ok"
+        assert report["remaining_resources"] == []
+    finally:
+        # 红基线/断言失败路径兜底:不留孤儿 sleep(评审要求实测无残留)
+        for proc in procs:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+        await tool.aclose()

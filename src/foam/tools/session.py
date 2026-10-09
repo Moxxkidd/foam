@@ -162,6 +162,23 @@ def detect_prompt(tail_text: str) -> PromptPattern | None:
     return None
 
 
+def mask_call_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """展示面敏感参数屏蔽(R07 AC04,评审收口抽到本层共享)。
+
+    ``session_send`` 的 ``text`` 可能是口令等敏感输入:TUI 卡头与 headless
+    CLI 渲染一律只露 utf-8 字节数(``***（N字节）``;``errors="replace"``,
+    与审计侧 bytes 口径一致,孤立代理不炸)。其他工具/参数原样返回(不拷贝);
+    session_send 返回屏蔽后的拷贝,不改入参。
+    """
+    if name != "session_send":
+        return arguments
+    masked = dict(arguments)
+    text = masked.get("text")
+    if isinstance(text, str):
+        masked["text"] = f"***（{len(text.encode('utf-8', errors='replace'))}字节）"
+    return masked
+
+
 # ---------------------------------------------------------------------------
 # 同步原子小助手(协程里只做调用,不在 async 函数体内直接阻塞;见陷阱 6)
 # ---------------------------------------------------------------------------
@@ -446,8 +463,19 @@ class SessionTool:
         )
         # R07(AC04):转录是敏感产物(可能含口令回显),权限钉 0600——
         # OutputRecorder 构造即建文件(output.py:84),此处直接 chmod,
-        # 不随 umask 漂移。
-        os.chmod(recorder.combined_path, 0o600)
+        # 不随 umask 漂移。评审收口:chmod 失败与 spawn/connect 失败同形态
+        # ——清理已建资源(杀进程组/收割/关 transport 与 recorder 句柄/删
+        # 空转录)后上抛:open 失败即无会话产生,不留未注册孤儿。
+        try:
+            os.chmod(recorder.combined_path, 0o600)
+        except Exception:
+            _kill_process_group(proc)
+            await proc.wait()
+            transport.close()
+            recorder.finalize()  # 幂等关闭文件句柄
+            with contextlib.suppress(OSError):
+                os.unlink(recorder.combined_path)
+            raise
         session = _Session(
             session_id=session_id,
             command=command,

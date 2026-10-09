@@ -2688,3 +2688,19 @@ async def test_close_run_leaves_unowned_processes_alive(tmp_path):
     finally:
         outsider.kill()
         await outsider.wait()
+
+
+def test_tool_call_display_session_send_mask_and_surrogate():
+    """R07(AC04 + 评审收口):session_send 卡头屏蔽 text(只露字节数);
+    孤立代理(合法 JSON \\ud800 经 json.loads 产出)经 replace 容错,不炸。"""
+    shown = tool_call_display(
+        "session_send", {"session_id": "s-abc1234567", "text": "TESTONLY-pw-xyz"}
+    )
+    assert "TESTONLY-pw-xyz" not in shown
+    assert "***（15字节）" in shown
+    assert "s-abc1234567" in shown
+    # 孤立代理:模型可控输入,渲染不得抛 UnicodeEncodeError
+    shown2 = tool_call_display(
+        "session_send", {"session_id": "s-x", "text": "a\ud800b"}
+    )
+    assert "***（" in shown2

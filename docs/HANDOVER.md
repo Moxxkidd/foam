@@ -772,3 +772,14 @@ WP-13(整合)依赖全部
   例；2 skip 为 ssh/msfconsole 环境门控，语义不变），ruff 全绿。
 - 下一步：按 [R 索引](items/README.md) 评审 [R08](items/R08.md)（非解析器
   成果登记与证据模型）。
+
+- 2026-10-09 对抗评审收口（跟进提交）：两路独立评审无阻断，提交范围/
+  测试数/CI/文档数字核实无误；修三处——headless CLI 渲染面 session_send
+  明文口令（AC04 缺口：`mask_call_arguments` 提至 tools/session.py，TUI
+  卡头与 CLI 共用同一屏蔽 helper，接口漂移理由见 R07.md §7）、session_open
+  chmod 失败资源泄漏（清理后上抛，与 spawn/connect 失败同形态，「open
+  失败即无会话产生」不变式）、bridge 屏蔽遇孤立代理炸 UnicodeEncodeError
+  （errors="replace" 容错对齐审计口径）；五项只记录不修（close 历史 error
+  混维度、prompt-only 链 coverage 边沿、先建后 chmod 0644 窗口、迟发
+  prompt 顺序注记、Nonems 装饰性渲染）见 R07.md §8 (g)–(k)。净增测试
+  3 例。

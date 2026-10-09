@@ -152,7 +152,7 @@ from foam.state.files import (
 from foam.tools.bash import TOOL_SCHEMAS as BASH_TOOL_SCHEMAS
 from foam.tools.bash import BashTool
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
-from foam.tools.session import SessionTool
+from foam.tools.session import SessionTool, mask_call_arguments
 from foam.tools.state import TOOL_SCHEMAS as STATE_TOOL_SCHEMAS
 from foam.tools.state import StateTool
 
@@ -189,7 +189,11 @@ class _CliObserver(LoopObserver):
         print(text, end="", file=self._out, flush=True)
 
     def on_tool_call(self, call: ToolCall) -> None:
-        args = json.dumps(call.arguments, ensure_ascii=False)
+        # R07(AC04):session_send 的 text 只露字节数(与 TUI 卡头同一 helper,
+        # 口令等敏感输入不上屏)
+        args = json.dumps(
+            mask_call_arguments(call.name, call.arguments), ensure_ascii=False
+        )
         if len(args) > 200:
             args = args[:200] + "…"
         self._line(f"\n[tool→] {call.name} {args}")
