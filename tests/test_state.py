@@ -6,12 +6,19 @@ engagement 目录一律建在 tmp_path,运行时产物不入库。
 
 R02(2026-10-06)追加:engagement.json 全量原子写、单写者锁(engagement.lock)、
 scope/objective 修订提交协议与崩溃恢复(AC06/AC08)、状态生命周期迁移。
+
+R08-A(2026-10-11)追加:schema v3 证据模型列迁移(v2 旧库升级/失败回滚
+重试/v2 旧程序反向兼容)、证据引用共享校验(符号链接越界/目录/身份替换)、
+索引库 0600 权限钉。版本钉更新:R06 三例的 meta 版本断言随 SCHEMA_VERSION
+v2→v3 演进(语义不变,目标版本 +1)。
 """
 
 import fcntl
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -1129,12 +1136,16 @@ def _meta_version(conn) -> str:
 
 
 def test_schema_v2_job_events_table_created(tmp_path):
-    """新库直接建 schema v2:meta=2 且 job_events 表可用。"""
+    """新库直接建最新 schema:meta=当前版本且 job_events 表可用。
+
+    R08 注记:版本钉随 SCHEMA_VERSION 演进(v2→v3 证据模型补列),
+    本例语义不变——新库一次成型、job_events 列面冻结。
+    """
     from foam.state.index import SCHEMA_VERSION
 
     with Index(tmp_path / "index.sqlite") as index:
-        assert SCHEMA_VERSION == 2
-        assert _meta_version(index._conn) == "2"
+        assert SCHEMA_VERSION == 3
+        assert _meta_version(index._conn) == "3"
         # job_events 已建表(列面冻结:event_id 主键 + audit_seq 可空)
         cols = {
             row[1] for row in index._conn.execute("PRAGMA table_info(job_events)")
@@ -1148,7 +1159,11 @@ def test_schema_v2_job_events_table_created(tmp_path):
 
 
 def test_schema_v1_db_upgraded_on_open(tmp_path):
-    """旧库(v1)打开自动建表升版本;既有数据不动,六表读写不受影响。"""
+    """旧库(v1)打开自动建表升版本;既有数据不动,六表读写不受影响。
+
+    R08 注记:v1 库直升 v3——v1 DDL 子集只建 meta/hosts,vulns/creds
+    由现行 _DDL 一次成型(带证据模型列),不触发补列迁移,故无备份文件。
+    """
     db = tmp_path / "legacy.sqlite"
     conn = sqlite3.connect(db)
     conn.executescript(_LEGACY_V1_DDL)
@@ -1162,7 +1177,7 @@ def test_schema_v1_db_upgraded_on_open(tmp_path):
     conn.close()
 
     with Index(db) as index:
-        assert _meta_version(index._conn) == "2"  # 版本已升
+        assert _meta_version(index._conn) == "3"  # 版本已升
         index._conn.execute("SELECT COUNT(*) FROM job_events").fetchone()  # 表已建
         rows = index.query("hosts")["rows"]  # 旧数据原样可读
         assert [r["ip"] for r in rows] == ["192.0.2.10"]
@@ -1173,7 +1188,11 @@ def test_schema_v1_db_upgraded_on_open(tmp_path):
 
 def test_v1_program_reads_v2_db_unaffected(tmp_path):
     """反向:v0.1.2 旧程序(模拟其 v1 DDL + meta 写入 + 六表读写)操作新库
-    不受影响——SQLite 忽略未知表,meta 不被回退,job_events 行不动。"""
+    不受影响——SQLite 忽略未知表与未知列,meta 不被回退,job_events 行不动。
+
+    R08 注记:「新库」现为 v3;v1 程序的显式列名 INSERT 对新列可空/有默认
+    的表同样安全(同机制在 test_v2_program_writes_v3_db_unaffected 钉死)。
+    """
     db = tmp_path / "index.sqlite"
     with Index(db) as index:
         index.upsert_host("192.0.2.10", "new-host")
@@ -1191,7 +1210,7 @@ def test_v1_program_reads_v2_db_unaffected(tmp_path):
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1')"
     )
     conn.commit()
-    assert _meta_version(conn) == "2"  # 不回退新版本号
+    assert _meta_version(conn) == "3"  # 不回退新版本号
     rows = conn.execute("SELECT ip, hostname FROM hosts").fetchall()
     assert [(r["ip"], r["hostname"]) for r in rows] == [("192.0.2.10", "new-host")]
     conn.execute(
@@ -1315,3 +1334,307 @@ def test_pending_placeholder_completed_by_consume(tmp_path):
     assert index.counts()["hosts"] == 1
     assert index.job_event(event.event_id)["audit_seq"] == 1
     index.close()
+
+
+# ================================================================
+# R08-A:schema v3(证据模型列)迁移、证据引用校验、库权限钉
+# ================================================================
+
+#: v2(schema v2,R06 时代)的 DDL 冻结副本:模拟旧库/旧程序的行为面。
+#: 手写冻结,不 import 现行 _DDL——否则本条目升级 _DDL 后测试失去
+#: 「旧格式」意义(与 :1109 _LEGACY_V1_DDL 同约定)。
+_LEGACY_V2_DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hosts (
+    id INTEGER PRIMARY KEY,
+    ip TEXT NOT NULL UNIQUE,
+    hostname TEXT,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ports (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    port INTEGER NOT NULL,
+    proto TEXT NOT NULL DEFAULT 'tcp',
+    service TEXT,
+    product TEXT,
+    version TEXT,
+    UNIQUE (host_id, port, proto)
+);
+CREATE TABLE IF NOT EXISTS creds (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    username TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    source TEXT,
+    sensitive INTEGER NOT NULL DEFAULT 1,
+    first_seen TEXT NOT NULL,
+    UNIQUE (host_id, username, secret)
+);
+CREATE TABLE IF NOT EXISTS vulns (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    evidence_path TEXT,
+    confidence TEXT,
+    first_seen TEXT NOT NULL,
+    UNIQUE (host_id, kind, title)
+);
+CREATE TABLE IF NOT EXISTS loot (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    kind TEXT,
+    note TEXT,
+    size_bytes INTEGER,
+    ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS job_events (
+    event_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    run_id TEXT,
+    reason TEXT,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    duration_ms INTEGER,
+    ended_at TEXT,
+    command TEXT,
+    output_refs TEXT,
+    parse_tool TEXT,
+    parse_stats TEXT,
+    consumed_at TEXT,
+    audit_seq INTEGER
+);
+"""
+
+
+def _make_v2_db(db_path: Path) -> None:
+    """造一个 schema v2 旧库:冻结 v2 DDL + 一行旧格式 vuln/cred 事实。"""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_LEGACY_V2_DDL)
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '2')")
+    conn.execute(
+        "INSERT INTO hosts(ip, hostname, first_seen, last_seen) "
+        "VALUES ('192.0.2.10', 'legacy-host', '2026-09-01T00:00:00+00:00', "
+        "'2026-09-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO vulns(host_id, kind, title, evidence_path, confidence, "
+        "first_seen) VALUES (1, 'config', '旧库匿名 FTP 可写', "
+        "'outputs/legacy.log', 'medium', '2026-09-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO creds(host_id, username, secret, source, sensitive, "
+        "first_seen) VALUES (1, 'admin', 'TESTONLY-legacy-secret', 'hydra', 1, "
+        "'2026-09-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_schema_v3_fresh_db(tmp_path):
+    """新库直接建 schema v3:vulns/creds 证据模型列齐,meta=3,无迁移备份。"""
+    from foam.state.index import SCHEMA_VERSION
+
+    with Index(tmp_path / "index.sqlite") as index:
+        assert SCHEMA_VERSION == 3
+        assert _meta_version(index._conn) == "3"
+        vuln_cols = {
+            row[1] for row in index._conn.execute("PRAGMA table_info(vulns)")
+        }
+        assert {
+            "source", "evidence_refs", "verification_status",
+            "observed_at", "reproduction",
+        } <= vuln_cols
+        cred_cols = {
+            row[1] for row in index._conn.execute("PRAGMA table_info(creds)")
+        }
+        assert {"evidence_refs", "verification_status", "observed_at"} <= cred_cols
+        # 既有读写不受影响
+        host_id = index.upsert_host("192.0.2.10")
+        assert index.upsert_port(host_id, 22, service="ssh")
+    # 新库一次成型,无迁移发生:不留备份文件
+    assert not (tmp_path / "index.sqlite.pre-v3.bak").exists()
+
+
+def test_schema_v2_db_upgraded_on_open(tmp_path):
+    """AC06:旧库(v2)打开自动补列升 v3;旧事实不丢、新列默认 unknown;
+    迁移前一次性备份 pre-v3.bak(可读、保持 v2、重开不覆盖)。"""
+    db = tmp_path / "index.sqlite"
+    _make_v2_db(db)
+
+    with Index(db) as index:
+        assert _meta_version(index._conn) == "3"  # 版本已升
+        row = index.query("vulns")["rows"][0]  # 旧事实原样可读
+        assert row["title"] == "旧库匿名 FTP 可写"
+        assert row["evidence_path"] == "outputs/legacy.log"
+        assert row["verification_status"] == "unknown"  # 旧记录无从判断
+        assert row["source"] is None and row["evidence_refs"] is None
+        assert row["observed_at"] is None and row["reproduction"] is None
+        crow = index.query("creds")["rows"][0]
+        assert crow["secret"] == "TESTONLY-legacy-secret"
+        assert crow["verification_status"] == "unknown"
+        assert crow["evidence_refs"] is None and crow["observed_at"] is None
+        index.add_vuln("192.0.2.10", "config", "升级后新发现")  # 写入正常
+        assert index.counts()["vulns"] == 2
+
+    backup = tmp_path / "index.sqlite.pre-v3.bak"
+    assert backup.is_file()
+    bak_bytes = backup.read_bytes()
+    conn = sqlite3.connect(backup)  # 备份可读,且保持迁移前(v2)状态
+    try:
+        assert _meta_version(conn) == "2"
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(vulns)")}
+        assert "verification_status" not in cols
+        assert conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    with Index(db):  # 再打开:备份不被覆盖(保留最初升级前状态)
+        pass
+    assert backup.read_bytes() == bak_bytes
+
+
+def test_schema_v3_migration_failure_rolls_back_and_recovers(tmp_path, monkeypatch):
+    """AC06:迁移中途失败(注入非法列)→ 单事务回滚,原库保持可读 v2,
+    备份已留;故障排除后重开自动重试成功,旧事实不丢。"""
+    import foam.state.index as index_module
+
+    db = tmp_path / "index.sqlite"
+    _make_v2_db(db)
+
+    bad_columns = {
+        table: list(cols)
+        for table, cols in index_module._MIGRATION_V3_COLUMNS.items()
+    }
+    # SQLite 拒绝无常量默认的 NOT NULL 新列(语法级拒绝,与表内容无关)
+    bad_columns["vulns"].append(("r08_bogus", "TEXT NOT NULL"))
+    monkeypatch.setattr(
+        index_module,
+        "_MIGRATION_V3_COLUMNS",
+        {table: tuple(cols) for table, cols in bad_columns.items()},
+    )
+    with pytest.raises(sqlite3.Error):
+        Index(db)
+
+    conn = sqlite3.connect(db)  # 原库仍是可读的 v2:旧事实不丢
+    try:
+        assert _meta_version(conn) == "2"
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(vulns)")}
+        assert "verification_status" not in cols  # 回滚:半个列都没留下
+        row = conn.execute("SELECT title, confidence FROM vulns").fetchone()
+        assert tuple(row) == ("旧库匿名 FTP 可写", "medium")
+    finally:
+        conn.close()
+    assert (tmp_path / "index.sqlite.pre-v3.bak").is_file()  # 备份在迁移前已留
+
+    monkeypatch.undo()  # 故障排除:重开自动重试
+    with Index(db) as index:
+        assert _meta_version(index._conn) == "3"
+        row = index.query("vulns")["rows"][0]
+        assert row["title"] == "旧库匿名 FTP 可写"
+        assert row["verification_status"] == "unknown"
+
+
+def test_v2_program_writes_v3_db_unaffected(tmp_path):
+    """反向:v2 旧程序(模拟其 v2 DDL + INSERT OR IGNORE meta + 显式旧列名
+    INSERT)写 v3 新库不受影响——新列可空/有默认;版本号不被回退。"""
+    db = tmp_path / "index.sqlite"
+    with Index(db) as index:
+        index.upsert_host("192.0.2.10", "new-host")
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_LEGACY_V2_DDL)  # IF NOT EXISTS 幂等,不动新 schema
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '2')"
+    )
+    conn.execute(  # v2 程序显式列名 INSERT:新列走 DDL 默认
+        "INSERT INTO vulns(host_id, kind, title, evidence_path, confidence, "
+        "first_seen) VALUES (1, 'cve', '旧程序登记 CVE-TESTONLY-0001', "
+        "'outputs/old.log', 'low', '2026-10-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    assert _meta_version(conn) == "3"  # 不回退新版本号
+    row = conn.execute("SELECT * FROM vulns").fetchone()
+    assert row["verification_status"] == "unknown"  # 旧程序记录:无从判断
+    assert row["source"] is None and row["evidence_refs"] is None
+    conn.close()
+
+    with Index(db) as index:  # 新程序再打开:写入都在,无二次迁移
+        assert index.counts()["vulns"] == 1
+        assert index.counts()["hosts"] == 1
+        assert not (tmp_path / "index.sqlite.pre-v3.bak").exists()
+
+
+async def test_evidence_ref_symlink_escape_rejected(state_tool, tmp_path):
+    """AC04:指向 engagement 外的符号链接拒绝(共享 helper 口径)。"""
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("TESTONLY 外部文件", encoding="utf-8")
+    link = state_tool._engagement.paths.loot / "escape-link"
+    link.symlink_to(outside)
+    res = await state_tool.dispatch("state_add_loot", {"path": "loot/escape-link"})
+    assert res["added"] is False and "不在 engagement 目录内" in res["error"]
+
+
+async def test_evidence_ref_internal_symlink_allowed(state_tool):
+    """指向 engagement 内的符号链接允许;入库为解析后的真实相对路径。"""
+    real = state_tool._engagement.paths.outputs / "real-evidence.log"
+    real.write_text("TESTONLY 证据", encoding="utf-8")
+    link = state_tool._engagement.paths.loot / "alias.log"
+    link.symlink_to(real)
+    res = await state_tool.dispatch("state_add_loot", {"path": "loot/alias.log"})
+    assert res["added"] is True
+    assert res["path"] == "outputs/real-evidence.log"
+    assert res["size_bytes"] == len("TESTONLY 证据".encode())
+
+
+async def test_evidence_ref_directory_rejected(state_tool):
+    """AC03 边界:目录不是有效证据文件,拒绝登记(不是「不存在」口径)。"""
+    res = await state_tool.dispatch("state_add_loot", {"path": "loot"})
+    assert res["added"] is False and "常规文件" in res["error"]
+
+
+async def test_evidence_ref_identity_swap_rejected(state_tool, monkeypatch):
+    """AC03 防替换:校验与打开之间文件身份被换(fstat 与 stat 的
+    (st_dev, st_ino) 不一致)→ 拒绝登记。注入 stat 失真模拟替换窗口。"""
+    target = state_tool._engagement.paths.loot / "swap.bin"
+    target.write_text("TESTONLY", encoding="utf-8")
+    resolved_target = target.resolve()
+    real_stat = os.stat
+
+    def lying_stat(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        if Path(path) == resolved_target:
+            fields = list(st)
+            fields[1] += 1  # st_ino 失真:打开的 inode ≠ 路径现在的 inode
+            return os.stat_result(fields)
+        return st
+
+    monkeypatch.setattr(os, "stat", lying_stat)
+    res = await state_tool.dispatch("state_add_loot", {"path": "loot/swap.bin"})
+    assert res["added"] is False and "替换" in res["error"]
+
+
+def test_index_db_permissions_owner_only(tmp_path):
+    """R08(规格 §1):索引库含完整凭证,钉 0600;既有 0644 库打开同样钉正。"""
+    db = tmp_path / "index.sqlite"
+    with Index(db):
+        pass
+    mode = stat.S_IMODE(db.stat().st_mode)
+    assert mode == 0o600, f"索引库应为 0o600,实际 {mode:#o}"
+
+    os.chmod(db, 0o644)  # 模拟历史库权限漂移
+    with Index(db):
+        pass
+    mode = stat.S_IMODE(db.stat().st_mode)
+    assert mode == 0o600, f"重开应钉正为 0o600,实际 {mode:#o}"

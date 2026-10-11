@@ -21,6 +21,9 @@ tools/state.py 的 LLM 工具都走这层统一的 upsert/查询接口。
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -31,10 +34,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from foam.tools.bash import JobExitEvent
 
+logger = logging.getLogger(__name__)
+
 #: v2(R06):追加 job_events 表(后台 job 终态事件的持久消费记录)。
-#: 纯追加 DDL,旧库打开自动建表升版本;v1 旧程序读写新库不受影响
-#: (SQLite 忽略未知表,meta 版本号只升不降)。
-SCHEMA_VERSION = 2
+#: v3(R08):vulns/creds 证据模型补列(来源/证据引用/验证状态/观测时间/
+#: 复现步骤)——新库走 _DDL 一次成型,旧库经 _MIGRATION_V3_COLUMNS 探测
+#: 缺列后 ALTER 补齐(迁移前备份 index.sqlite.pre-v3.bak,失败回滚可重试)。
+#: meta 版本号只升不降;旧程序显式列名 INSERT 对新库不受影响(新列可空
+#: 或有常量默认)。
+SCHEMA_VERSION = 3
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -66,6 +74,9 @@ CREATE TABLE IF NOT EXISTS creds (
     source TEXT,
     sensitive INTEGER NOT NULL DEFAULT 1,
     first_seen TEXT NOT NULL,
+    evidence_refs TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'unknown',
+    observed_at TEXT,
     UNIQUE (host_id, username, secret)
 );
 CREATE TABLE IF NOT EXISTS vulns (
@@ -76,6 +87,11 @@ CREATE TABLE IF NOT EXISTS vulns (
     evidence_path TEXT,
     confidence TEXT,
     first_seen TEXT NOT NULL,
+    source TEXT,
+    evidence_refs TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'unknown',
+    observed_at TEXT,
+    reproduction TEXT,
     UNIQUE (host_id, kind, title)
 );
 CREATE TABLE IF NOT EXISTS loot (
@@ -115,6 +131,27 @@ CREATE TABLE IF NOT EXISTS job_events (
 );
 """
 
+#: R08(schema v3):vulns/creds 证据模型补列。SQLite 限制:ALTER 新增
+#: NOT NULL 列必须有常量默认——旧行由此迁移为 'unknown'(旧记录无从
+#: 判断,不臆造,决策 2)。新库走 _DDL 一次成型,探测不到缺列不触发迁移。
+_MIGRATION_V3_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "vulns": (
+        ("source", "TEXT"),
+        ("evidence_refs", "TEXT"),
+        ("verification_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("observed_at", "TEXT"),
+        ("reproduction", "TEXT"),
+    ),
+    "creds": (
+        ("evidence_refs", "TEXT"),
+        ("verification_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("observed_at", "TEXT"),
+    ),
+}
+
+#: v3 迁移前的一次性备份文件名后缀(存在不覆盖,保留最初升级前状态)。
+PRE_V3_BACKUP_SUFFIX = ".pre-v3.bak"
+
 #: query() 通用接口允许的 kind 及各自可过滤字段(白名单)。
 QUERY_KINDS: dict[str, dict[str, Any]] = {
     "hosts": {"filters": {"ip", "hostname"}},
@@ -149,23 +186,91 @@ class Index:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.executescript(_DDL)
+            # R08(schema v3):缺列探测 → 迁移前一次性备份 → 单事务逐列
+            # ALTER(executescript 会隐式提交先行事务,不能把它包进去;
+            # ALTER 序列本身用 _transaction 包裹)。失败回滚保留可读旧库,
+            # 下次打开自动重试(AC06)。
+            missing = self._missing_v3_columns()
+            if missing:
+                self._backup_pre_v3()
+                with self._transaction():
+                    self._apply_v3_columns(missing)
             self._conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION)),
             )
-            # R06:schema v2 纯追加——旧库(v1)打开升版本;更高版本不回退
+            # 版本号只升不降(R06 沿用);UPDATE 在迁移提交之后——列已补齐、
+            # 版本未升的半成品状态(如 meta commit 被拒)重开自愈:
+            # 缺列探测为空则跳过迁移,版本号在这里补升。
             self._conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version' "
                 "AND CAST(value AS INTEGER) < ?",
                 (str(SCHEMA_VERSION), SCHEMA_VERSION),
             )
             self._conn.commit()
+            # R08(规格 §1):索引库含完整凭证,权限钉 0600(幂等,每次打开
+            # 都钉)。chmod 失败只记 warning 不阻断——纵深加固不是可用性
+            # 闸门:库是既有核心状态,阻断会锁死既有 engagement(与 R07
+            # 转录「失败即失败」的差异理由见 R08.md §7 决策 9)。
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError as exc:
+                logger.warning("索引库权限钉 0600 失败(不阻断打开):%s", exc)
         except BaseException:
             # R04:初始化被拒(如报告快照期间 DDL/元信息 commit 拿不到
             # EXCLUSIVE)时关闭连接——不留持 RESERVED 的僵尸连接阻塞后续
             # 写者。timeout 透传 sqlite3(默认 5.0 不变):busy 重试上界。
             self._conn.close()
             raise
+
+    # ---------- R08:schema v3 迁移(决策 3) ----------
+
+    def _missing_v3_columns(self) -> dict[str, list[tuple[str, str]]]:
+        """探测 v3 缺列(PRAGMA table_info);返回 {表: [(列名, 声明)]}。"""
+        missing: dict[str, list[tuple[str, str]]] = {}
+        for table, columns in _MIGRATION_V3_COLUMNS.items():
+            existing = {
+                row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            delta = [(name, decl) for name, decl in columns if name not in existing]
+            if delta:
+                missing[table] = delta
+        return missing
+
+    def _backup_pre_v3(self) -> Path:
+        """迁移前一次性原样备份(已存在不覆盖),并打开快速读校验。
+
+        备份不可读(坏备份等于没备份)如实抛错中止迁移——原始库此时尚未
+        被 ALTER 触碰,保持可读旧状态。
+        """
+        backup = self.db_path.with_name(self.db_path.name + PRE_V3_BACKUP_SUFFIX)
+        if backup.exists():
+            return backup
+        shutil.copyfile(self.db_path, backup)
+        try:
+            os.chmod(backup, 0o600)
+        except OSError as exc:
+            logger.warning("迁移备份权限钉 0600 失败(不阻断):%s", exc)
+        check = sqlite3.connect(backup)
+        try:
+            row = check.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if row is None:
+                raise sqlite3.Error(f"迁移备份 {backup} 缺少 schema_version")
+        finally:
+            check.close()
+        return backup
+
+    def _apply_v3_columns(self, missing: dict[str, list[tuple[str, str]]]) -> None:
+        """逐列 ALTER ADD COLUMN(调用方须已包 ``_transaction``)。"""
+        for table, columns in missing.items():
+            for name, decl in columns:
+                # noqa 说明:表名/列名/声明全部来自本模块常量
+                # _MIGRATION_V3_COLUMNS,无外部输入拼接。
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {decl}"  # noqa: S608
+                )
 
     def close(self) -> None:
         self._conn.close()

@@ -16,6 +16,9 @@ schema 形状与 WP-01 完全同构:``TOOL_SCHEMAS`` 为 provider 中立
 
 from __future__ import annotations
 
+import os
+import stat
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from foam.state.index import (
@@ -133,6 +136,40 @@ def mask_secret(secret: str) -> str:
     return f"{secret[:2]}{'*' * 8}{secret[-2:]}"
 
 
+def _resolve_contained_file(root: Path, ref: str) -> tuple[str, int]:
+    """校验 engagement 内文件引用(R08 决策 5,战利品/证据共用)。
+
+    检查链:``(root / ref).resolve()`` → 须在 root 内(拒 ``..`` 与指向
+    engagement 外的符号链接;指向内部的符号链接允许)→ ``os.open`` +
+    ``os.fstat`` 绑定实际打开的文件:必须常规文件(拒目录)、fstat 与
+    ``os.stat(resolved)`` 的 (st_dev, st_ino) 一致(防校验/使用间替换)、
+    大小取 fstat 值。返回 (解析后的相对路径, 大小),入库统一存相对路径。
+    无 openat2/RESOLVE_BENEATH 的残余微窗口如实记录在 R08.md §8。
+    """
+    resolved = (root / ref).resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"{ref!r} 不在 engagement 目录内")
+    try:
+        fd = os.open(resolved, os.O_RDONLY)
+    except FileNotFoundError:
+        raise ValueError(
+            f"文件不存在:{ref!r}(先经 run_command 写入,再登记)"
+        ) from None
+    except OSError as exc:
+        raise ValueError(f"文件不可打开:{ref!r}({exc})") from None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"{ref!r} 不是常规文件(目录等不可登记)")
+        current = os.stat(resolved)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError(f"{ref!r} 在校验与打开之间被替换,拒绝登记")
+        size = opened.st_size
+    finally:
+        os.close(fd)
+    return str(resolved.relative_to(root)), size
+
+
 def _mask_cred_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     masked = []
     for row in rows:
@@ -235,28 +272,17 @@ class StateTool:
         note: str | None = None,
     ) -> dict[str, Any]:
         root = self._engagement.paths.root.resolve()
-        target = (root / path).resolve()
-        if not target.is_relative_to(root):
-            return {
-                "error": (
-                    f"{path!r} 不在 engagement 目录内;战利品须先放进 engagement "
-                    f"(通常写入 loot/)再登记"
-                ),
-                "added": False,
-            }
-        if not target.is_file():
-            return {
-                "error": f"文件不存在:{path!r}(先经 run_command 写入,再登记)",
-                "added": False,
-            }
-        rel = target.relative_to(root)
-        loot_id = self._index.add_loot(
-            str(rel), kind=kind, note=note, size_bytes=target.stat().st_size
-        )
+        try:
+            # R08:迁移到共享 helper——os.open+fstat 绑定实际文件,
+            # 消除旧内联版「检查后 stat()」的 TOCTOU 窗口
+            rel, size = _resolve_contained_file(root, path)
+        except ValueError as exc:
+            return {"added": False, "error": str(exc)}
+        loot_id = self._index.add_loot(rel, kind=kind, note=note, size_bytes=size)
         return {
             "added": True,
             "kind": "loot",
             "id": loot_id,
-            "path": str(rel),
-            "size_bytes": target.stat().st_size,
+            "path": rel,
+            "size_bytes": size,
         }
