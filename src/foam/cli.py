@@ -372,6 +372,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="报告输出文件(默认打印到 stdout;凭证节为全值,注意去向)",
     )
+    report.add_argument(
+        "--redact",
+        action="store_true",
+        help="凭证节脱敏(分享视图,secret 全掩);默认全值(红线,注意去向)",
+    )
 
     tui = sub.add_parser(
         "tui",
@@ -1297,7 +1302,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
         print(f"[错误] engagement 目录不存在:{root}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        text = build_report(root)
+        text = build_report(root, redact=args.redact)
     except Exception as exc:
         # R04(D4):生成失败(分页空页/快照被破坏/读取故障等)→ rc 1,
         # 目标文件不动,不产出貌似完整的报告;此前异常未捕获直接抛栈。
@@ -1311,7 +1316,11 @@ def _cmd_report(args: argparse.Namespace) -> int:
             print(f"[错误] 报告写入失败: {exc}", file=sys.stderr)
             return EXIT_USAGE
         # D4:成功提示只在原子替换完成之后
-        print(f"[report] 已写入 {out_path}(含凭证全值,按红线处理)", flush=True)
+        if args.redact:
+            # R08(AC05):脱敏分享视图——提示口径与内容一致,不谎称含全值
+            print(f"[report] 已写入 {out_path}(凭证节已脱敏,可分享)", flush=True)
+        else:
+            print(f"[report] 已写入 {out_path}(含凭证全值,按红线处理)", flush=True)
     else:
         print(text)
     return EXIT_OK

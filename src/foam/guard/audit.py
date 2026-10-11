@@ -32,11 +32,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 ZERO_HASH = "0" * 64
+
+logger = logging.getLogger(__name__)
 
 # 已知事件类型;后续 WP 可扩展,append 不强制校验(避免跨 WP 耦合)。
 KIND_SCOPE_LOADED = "scope_loaded"
@@ -131,6 +135,13 @@ class AuditLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._seq, self._prev_hash = self._recover_tail()
         self._fh = open(self.path, "a", encoding="utf-8")  # noqa: SIM115
+        # R08(规格 §1):审计链含命令明文与目标信息,权限钉 0600(幂等,
+        # 每次打开都钉)。chmod 失败只记 warning 不阻断——纵深加固不是
+        # 可用性闸门(既有核心状态,阻断会锁死 engagement;R08.md §7 决策 9)。
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError as exc:
+            logger.warning("审计链权限钉 0600 失败(不阻断打开):%s", exc)
 
     def _recover_tail(self) -> tuple[int, str]:
         if not self.path.exists() or self.path.stat().st_size == 0:

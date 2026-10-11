@@ -5,6 +5,11 @@ EXPECTED_SYSTEM_PROMPT 并在开发日志留痕。WP-14d(总纲 2026-09-16 定�
 授权声明整段替换为拍板反拒答措辞,scope 现状字段(source/loaded_at/规则原文)
 让位 ENGAGEMENT.md 动态段(定案 D11)——本次快照更新属本片有意行为,与 file
 流无关,声明见 docs/dev-logs/WP-14d.md。
+
+R08(2026-10-11)快照更新(有意行为,见 R08.md §7 决策 6/8):「工具使用
+纪律」工作笔记 bullet 末尾改写——新增四个登记工具(state_add_host/port/
+vuln/cred)的一句话契约(自然键去重、证据先落盘、验证状态只能 unverified);
+同步新增 test_system_prompt_covers_registration_tools 语义断言。
 """
 
 from __future__ import annotations
@@ -88,7 +93,11 @@ _EXPECTED_HEAD = """# 角色
   nmap/sqlmap/gobuster/nikto/hydra/whatweb 的命令输出会被解析层自动
   入库:摘要直接出现在工具结果里,主机/端口/凭证/漏洞/loot 自动进
   索引(凭证完整值落盘,视图掩码);解析未命中走通用截断视图,不影响
-  命令执行。其他工具输出与杂项发现仍须手动写进本文件或 state_add_note。
+  命令执行。解析层不认的工具产出与手工发现,用 state_add_host /
+  state_add_port / state_add_vuln / state_add_cred 登记进索引(按自然键
+  去重,重复登记证据并集追加;证据文件须先落盘到 engagement 目录再引用;
+  验证状态只能标 unverified,「已验证」由独立验证流程判定);杂项发现
+  仍写进本文件或 state_add_note。
 - engagement 目录:/eng/demo ——工具原始输出在其 outputs/ 子目录。所有产物
   只写进 engagement 目录,不往别处写。
 
@@ -160,6 +169,21 @@ def test_system_prompt_contains_authorization_and_redlines():
     assert "state_query" in prompt and "state_add_loot" in prompt
     assert "secret 默认掩码" in prompt
     assert "SIGKILL" in prompt
+
+
+def test_system_prompt_covers_registration_tools():
+    """R08(决策 6):工具纪律含四个登记工具的一句话契约——按自然键去重、
+    证据须先落盘 engagement 内、验证状态只能 unverified(verified 归
+    独立验证流程)。"""
+    prompt = build_default()
+    for name in (
+        "state_add_host",
+        "state_add_port",
+        "state_add_vuln",
+        "state_add_cred",
+    ):
+        assert name in prompt
+    assert "unverified" in prompt
 
 
 def test_system_prompt_has_no_brand_name():

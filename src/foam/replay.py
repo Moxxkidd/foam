@@ -47,6 +47,7 @@ from foam.guard.audit import (
 )
 from foam.state.files import Engagement
 from foam.state.index import MAX_QUERY_LIMIT, Index
+from foam.tools.state import mask_secret
 
 #: 时间线里命令/文本的展示截断长度。
 _CLIP = 120
@@ -462,11 +463,35 @@ def _scope_lines_from_summary(payload: dict[str, Any]) -> list[str]:
     return lines
 
 
-def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
-    """从 engagement 目录生成中文 markdown 报告(只读;缺源降级标注)。
+def _decode_evidence_refs(raw: Any) -> list[str]:
+    """索引 evidence_refs 列(JSON 数组串)解码;空值归 [],坏值原样单条
+    保留(不丢不臆造,R08 决策 8)。"""
+    if not raw:
+        return []
+    try:
+        refs = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return [str(raw)]
+    if not isinstance(refs, list):
+        return [str(raw)]
+    return [str(ref) for ref in refs]
 
-    必备节:目标 / 范围 / 过程时间线 / 发现清单(含证据路径)/ 凭证(全值)/
-    loot 清单 / 操作员插话记录 / 统计 / 审计链完整性。
+
+def build_report(
+    root: str | Path, *, generated_at: str | None = None, redact: bool = False
+) -> str:
+    """从 engagement 目录生成中文 markdown 报告(缺源降级标注)。
+
+    必备节:目标 / 范围 / 过程时间线 / 发现清单(含证据引用)/ 凭证/ loot
+    清单 / 操作员插话记录 / 统计 / 审计链完整性。
+
+    ``redact=False``(默认):凭证节全值(WP-06 红线契约不变,节首标识
+    「按红线处理,勿外发」)。``redact=True``:脱敏分享视图(R08 决策 8)
+    ——凭证节标题/标识切换为分享口径,secret 经 mask_secret 全掩;其余
+    章节逐字节不变。
+
+    读侧语义:报告不写 engagement 内容文件;打开 v2 旧库时经 Index 触发
+    schema v3 迁移(含 pre-v3 备份落盘)属迁移机制的既定延续(R08.md §8)。
     """
     root = Path(root)
     generated_at = generated_at or datetime.now(UTC).isoformat(timespec="seconds")
@@ -559,14 +584,38 @@ def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
                 f"- **{row.get('title')}**({row.get('kind')},主机 {row.get('ip')},"
                 f"置信 {row.get('confidence') or '未标'})"
             )
-            lines.append(f"  - 证据:{row.get('evidence_path') or '(未登记证据路径)'}")
+            # R08(决策 8):证据模型展示;缺字段「未标/unknown」,不臆造
+            lines.append(
+                f"  - 来源:{row.get('source') or '未标'};"
+                f"验证状态:{row.get('verification_status') or 'unknown'};"
+                f"观测时间:{row.get('observed_at') or '未标'}"
+            )
+            refs = _decode_evidence_refs(row.get("evidence_refs"))
+            if refs:
+                lines.append("  - 证据:")
+                lines.extend(f"    - {ref}" for ref in refs)
+            else:
+                # 仅有 legacy evidence_path 的行保持旧单行格式
+                lines.append(
+                    f"  - 证据:{row.get('evidence_path') or '(未登记证据路径)'}"
+                )
+            if row.get("reproduction"):
+                lines.append(f"  - 复现:{row['reproduction']}")
     lines.append("")
 
-    lines += ["## 凭证(全值)", ""]
-    lines.append(
-        "> 本节为报告导出,secret 为完整值(WP-06 契约:仅 LLM 视图掩码);"
-        "按红线处理,勿外发。"
-    )
+    if redact:
+        lines += ["## 凭证(脱敏分享视图)", ""]
+        lines.append(
+            "> 本节为脱敏分享视图(R08):secret 经掩码处理(与 LLM 视图同一 "
+            "mask_secret 口径);完整值仅在 engagement 落盘索引库与默认(全值)"
+            "报告——需要全值时去掉 --redact 重新导出。"
+        )
+    else:
+        lines += ["## 凭证(全值)", ""]
+        lines.append(
+            "> 本节为报告导出,secret 为完整值(WP-06 契约:仅 LLM 视图掩码);"
+            "按红线处理,勿外发。"
+        )
     lines.append("")
     if index_missing:
         lines.append("(索引库缺失)")
@@ -574,9 +623,11 @@ def build_report(root: str | Path, *, generated_at: str | None = None) -> str:
         lines.append("(无凭证记录)")
     else:
         for row in index_rows["creds"]:
+            secret = row.get("secret")
+            shown = mask_secret(str(secret)) if redact else secret
             lines.append(
                 f"- 主机 {row.get('ip')} 用户 `{row.get('username')}` "
-                f"secret `{row.get('secret')}`(来源:{row.get('source') or '未标'},"
+                f"secret `{shown}`(来源:{row.get('source') or '未标'},"
                 f"sensitive={row.get('sensitive')})"
             )
     lines.append("")

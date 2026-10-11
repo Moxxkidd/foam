@@ -872,3 +872,69 @@ def test_session_chain_replay_and_stats(tmp_path):
     assert "会话操作 5 次" in report
     assert "提示 1 次" in report
     assert "session_read cancelled 1" in report  # 分解行逐条对应
+
+
+# ---------------------------------------------------------------------------
+# R08-C:报告证据模型展示与脱敏分享视图
+# ---------------------------------------------------------------------------
+
+
+def test_report_vuln_evidence_model_display(tmp_path):
+    """R08(决策 8):vulns 节增显示来源/验证状态/观测时间/证据 refs 逐条/
+    复现步骤;缺字段显示「未标/unknown」不臆造;仅有 legacy
+    evidence_path 的行保持旧「证据:」行格式。"""
+    root = make_engagement(tmp_path)
+    with Index(root / "index.sqlite") as index:
+        index.add_vuln(
+            "127.0.0.1",
+            "config",
+            "匿名 FTP 可写",
+            evidence_refs=["outputs/ftp-a.log", "outputs/ftp-b.log"],
+            source="manual",
+            confidence="high",
+            observed_at="2026-10-11T01:02:03+00:00",
+            reproduction="ftp 192.0.2.10 匿名登录",
+        )
+        # v2 旧程序形态:显式旧列名 INSERT,新列走 DDL 默认(unknown)
+        index._conn.execute(
+            "INSERT INTO vulns(host_id, kind, title, first_seen) "
+            "VALUES (1, 'cve', '旧程序裸行', '2026-09-01T00:00:00+00:00')"
+        )
+        index._conn.commit()
+
+    text = build_report(root)
+    # 证据模型行:逐条列出 refs,来源/验证状态/观测时间/复现齐全
+    assert "匿名 FTP 可写" in text
+    assert "来源:manual" in text
+    assert "验证状态:unverified" in text
+    assert "观测时间:2026-10-11T01:02:03+00:00" in text
+    assert "  - 证据:\n    - outputs/ftp-a.log\n    - outputs/ftp-b.log" in text
+    assert "复现:ftp 192.0.2.10 匿名登录" in text
+    # 旧程序裸行:DDL 默认 unknown/缺失不臆造
+    legacy = text.split("旧程序裸行", 1)[1].split("\n- ", 1)[0]
+    assert "来源:未标" in legacy and "验证状态:unknown" in legacy
+    assert "观测时间:未标" in legacy
+    assert "(未登记证据路径)" in legacy
+    # 既有 legacy 渲染保持(make_engagement 的 evidence_path 单行)
+    assert "  - 证据:outputs/scan1.log" in text
+
+
+def test_report_redacted_view_masks_creds_only(tmp_path):
+    """R08-C(AC05/决策 8):redact=True 脱敏分享视图——凭证节标题与节首
+    标识切换为分享口径、secret 全掩;其余章节与默认报告一致;默认全值
+    契约不变(另由 test_report_contains_all_required_sections 钉死)。"""
+    root = make_engagement(tmp_path)
+    text = build_report(root, redact=True)
+    assert "## 凭证(脱敏分享视图)" in text
+    assert "## 凭证(全值)" not in text
+    assert SECRET_VALUE not in text
+    assert MASKED_FORM in text
+    # 其余章节不受影响
+    assert "示例 CVE-2026-0001" in text
+    assert "loot/flag.txt" in text
+    assert "第一天笔记:80 端口重点看" in text
+
+    default = build_report(root)  # 默认路径:全值红线契约不变
+    assert "## 凭证(全值)" in default
+    assert SECRET_VALUE in default
+    assert MASKED_FORM not in default

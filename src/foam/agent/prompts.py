@@ -87,7 +87,11 @@ _SYSTEM_TEMPLATE = """\
   nmap/sqlmap/gobuster/nikto/hydra/whatweb 的命令输出会被解析层自动
   入库:摘要直接出现在工具结果里,主机/端口/凭证/漏洞/loot 自动进
   索引(凭证完整值落盘,视图掩码);解析未命中走通用截断视图,不影响
-  命令执行。其他工具输出与杂项发现仍须手动写进本文件或 state_add_note。
+  命令执行。解析层不认的工具产出与手工发现,用 state_add_host /
+  state_add_port / state_add_vuln / state_add_cred 登记进索引(按自然键
+  去重,重复登记证据并集追加;证据文件须先落盘到 engagement 目录再引用;
+  验证状态只能标 unverified,「已验证」由独立验证流程判定);杂项发现
+  仍写进本文件或 state_add_note。
 - engagement 目录:{workdir} ——工具原始输出在其 outputs/ 子目录。所有产物
   只写进 engagement 目录,不往别处写。
 

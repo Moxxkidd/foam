@@ -1392,3 +1392,38 @@ def test_cli_observer_masks_session_send_text():
     # 对照:session_open 的 command 与 exec_request 明文同暴露级,不屏蔽
     observer.on_tool_call(ToolCall("tc-2", "session_open", {"command": "cat"}))
     assert '"command": "cat"' in out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# R08-C:foam report --redact 脱敏分享视图(AC05 导出面)
+# ---------------------------------------------------------------------------
+
+
+def test_report_redact_flag_masks_secrets(tmp_path, capsys):
+    """R08-C(AC05):--redact 导出脱敏分享视图(凭证全掩、标题切换、导出
+    文件仍 0600);默认路径(不带 flag)全值契约不变。"""
+    from foam.state.index import Index
+    from foam.tools.state import mask_secret
+
+    engagement = Engagement.create(
+        tmp_path / "engagements", "脱敏视图测试", engagement_id="redact-eng"
+    )
+    with Index(engagement.paths.index_db) as index:
+        index.add_cred("192.0.2.10", "admin", "TESTONLY-RedactSecret")
+
+    out_path = tmp_path / "redacted.md"
+    rc = cli_main(
+        ["report", str(engagement.paths.root), "--redact", "--out", str(out_path)]
+    )
+    assert rc == 0
+    assert "已写入" in capsys.readouterr().out
+    text = out_path.read_text(encoding="utf-8")
+    assert "## 凭证(脱敏分享视图)" in text
+    assert "TESTONLY-RedactSecret" not in text  # 脱敏:原文不出现
+    assert mask_secret("TESTONLY-RedactSecret") in text
+    assert stat.S_IMODE(out_path.stat().st_mode) == 0o600  # 导出权限不变
+
+    out_full = tmp_path / "full.md"  # 默认路径:全值红线契约不变
+    rc = cli_main(["report", str(engagement.paths.root), "--out", str(out_full)])
+    assert rc == 0
+    assert "TESTONLY-RedactSecret" in out_full.read_text(encoding="utf-8")

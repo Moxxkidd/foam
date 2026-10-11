@@ -61,6 +61,8 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +70,8 @@ from typing import Any
 
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_UPDATED
 from foam.state.index import Index
+
+logger = logging.getLogger(__name__)
 
 #: 布局必需项(相对 engagement 根):"f" 文件 / "d" 目录。
 LAYOUT: dict[str, str] = {
@@ -314,6 +318,13 @@ class Engagement:
             }
 
         root.mkdir(parents=True, exist_ok=True)
+        # R08(规格 §1):engagement 目录集中存放敏感产物(凭证库/审计链/
+        # loot),权限钉 0700(幂等,create/复开都钉)。chmod 失败只记
+        # warning 不阻断——纵深加固不是可用性闸门(R08.md §7 决策 9)。
+        try:
+            os.chmod(root, 0o700)
+        except OSError as exc:
+            logger.warning("engagement 目录权限钉 0700 失败(不阻断):%s", exc)
         for name, kind in LAYOUT.items():
             target = root / name
             if kind == "d":
