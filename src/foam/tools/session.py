@@ -162,20 +162,32 @@ def detect_prompt(tail_text: str) -> PromptPattern | None:
     return None
 
 
+#: 展示面敏感参数屏蔽表(R07 AC04 起):工具名 → 只露字节数的参数名。
+#: R08 增补 state_add_cred.secret——登记凭证的调用参数为明文(设计如此,
+#: secret 须完整落库),渲染面与 session_send.text 同口径屏蔽(AC05)。
+_SENSITIVE_CALL_PARAMS: dict[str, tuple[str, ...]] = {
+    "session_send": ("text",),
+    "state_add_cred": ("secret",),
+}
+
+
 def mask_call_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """展示面敏感参数屏蔽(R07 AC04,评审收口抽到本层共享)。
 
-    ``session_send`` 的 ``text`` 可能是口令等敏感输入:TUI 卡头与 headless
-    CLI 渲染一律只露 utf-8 字节数(``***（N字节）``;``errors="replace"``,
-    与审计侧 bytes 口径一致,孤立代理不炸)。其他工具/参数原样返回(不拷贝);
-    session_send 返回屏蔽后的拷贝,不改入参。
+    ``_SENSITIVE_CALL_PARAMS`` 列出的参数(如 ``session_send`` 的 ``text``、
+    R08 增补的 ``state_add_cred`` 的 ``secret``)可能是口令等敏感输入:
+    TUI 卡头与 headless CLI 渲染一律只露 utf-8 字节数(``***（N字节）``;
+    ``errors="replace"``,与审计侧 bytes 口径一致,孤立代理不炸)。其他
+    工具/参数原样返回(不拷贝);命中工具返回屏蔽后的拷贝,不改入参。
     """
-    if name != "session_send":
+    params = _SENSITIVE_CALL_PARAMS.get(name)
+    if not params:
         return arguments
     masked = dict(arguments)
-    text = masked.get("text")
-    if isinstance(text, str):
-        masked["text"] = f"***（{len(text.encode('utf-8', errors='replace'))}字节）"
+    for param in params:
+        value = masked.get(param)
+        if isinstance(value, str):
+            masked[param] = f"***（{len(value.encode('utf-8', errors='replace'))}字节）"
     return masked
 
 

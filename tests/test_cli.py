@@ -1394,6 +1394,28 @@ def test_cli_observer_masks_session_send_text():
     assert '"command": "cat"' in out.getvalue()
 
 
+def test_cli_observer_masks_state_add_cred_secret():
+    """R08(AC05 评审收口):state_add_cred 是本条目新引入的明文 secret 调用
+    路径——卡头/CLI 渲染面与 session_send.text 同口径屏蔽,只露字节数。"""
+    out = io.StringIO()
+    observer = _CliObserver(out=out)
+    observer.on_tool_call(
+        ToolCall(
+            "tc-3",
+            "state_add_cred",
+            {
+                "host": "192.0.2.10",
+                "username": "admin",
+                "secret": "TESTONLY-addcred-pw",
+            },
+        )
+    )
+    rendered = out.getvalue()
+    assert "TESTONLY-addcred-pw" not in rendered  # 凭证明文不上屏
+    assert "***（19字节）" in rendered
+    assert "192.0.2.10" in rendered and "admin" in rendered  # 其他参数照常
+
+
 # ---------------------------------------------------------------------------
 # R08-C:foam report --redact 脱敏分享视图(AC05 导出面)
 # ---------------------------------------------------------------------------

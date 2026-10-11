@@ -186,7 +186,7 @@ def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-# ---------- R08:证据引用与验证状态的合并且子 ----------
+# ---------- R08:证据引用与验证状态的合并原子 ----------
 
 def _normalize_refs(evidence_refs: Any) -> list[str] | None:
     """规范化证据引用列表:非空字符串、保序去重;空输入归 None(存 NULL)。"""
