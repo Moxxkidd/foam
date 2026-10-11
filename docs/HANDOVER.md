@@ -783,3 +783,28 @@ WP-13(整合)依赖全部
   混维度、prompt-only 链 coverage 边沿、先建后 chmod 0644 窗口、迟发
   prompt 顺序注记、Nonems 装饰性渲染）见 R07.md §8 (g)–(k)。净增测试
   3 例。
+
+
+## 当前状态（2026-10-11：R08 关闭）
+
+- [R08](items/R08.md) 完成并合入 main（v0.1.3 条目 3/4）：非解析器成果
+  登记与证据模型。三分片：R08-A（schema v3——vulns/creds 补列 来源/
+  证据引用/验证状态/观测时间/复现步骤，PRAGMA 缺列探测 + ALTER 单事务
+  幂等迁移 + pre-v3.bak 一次性备份；证据引用共享 helper
+  `_resolve_contained_file`（os.open+fstat 身份绑定），state_add_loot
+  迁移复用消 TOCTOU；索引库钉 0600）、R08-B（state_add_host/port/vuln/
+  cred 四工具，record_id=表名/行 id，重复登记 deduplicated:true 且证据
+  refs 并集不丢；登记路径拒绝 verified；解析器 vuln/cred facts 接同一
+  模型）、R08-C（报告 vulns 节证据模型展示；build_report(redact=True)
+  脱敏分享视图 + `foam report --redact`；engagement 目录钉 0700、审计链
+  钉 0600）。逐条验收证据见 R08.md §5，红基线/分片/全量实录见 §6。
+- 关键边界：验证状态枚举冻结 unknown/unverified/verified——verified 无
+  生产路径，归 R09 verify 条目接入；证据校验 TOCTOU 残余微窗口为 POSIX
+  固有限制（R08.md §8 (a)）；存量 engagement 权限不批量加固，仅打开时
+  钉正；build_report 打开 v2 旧库触发迁移属既定延续。接口漂移（cli.py
+  --redact、files.py/audit.py 权限钉）理由见 R08.md §7。
+- 测试基线：全仓 **750 passed + 2 skipped**（基线 731+2，本条目净增 19
+  例；2 skip 为 ssh/msfconsole 环境门控，语义不变），ruff 全绿。
+- 下一步：按 [R 索引](items/README.md) 评审 [R09](items/R09.md)（verify、
+  证据 manifest 与结项页——接入 verification_status=verified 生产路径，
+  核销 v0.1.3 发布门槛第三条的 verify 维）。
