@@ -354,6 +354,12 @@ class Engagement:
         root = Path(root)
         if not root.is_dir():
             raise FileNotFoundError(f"engagement 目录不存在:{root}")
+        # R08 评审收口:open 与 create 对称钉 0700(resume 主路径全走 open,
+        # 只钉 create 名实不符);chmod 失败沿用决策 9——warning 不阻断。
+        try:
+            os.chmod(root, 0o700)
+        except OSError as exc:
+            logger.warning("engagement 目录权限钉 0700 失败(不阻断):%s", exc)
         return cls(root)
 
     @staticmethod

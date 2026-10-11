@@ -375,7 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--redact",
         action="store_true",
-        help="凭证节脱敏(分享视图,secret 全掩);默认全值(红线,注意去向)",
+        help="凭证节脱敏(secret 全掩;注意:其余章节未脱敏);默认全值(红线,注意去向)",
     )
 
     tui = sub.add_parser(
@@ -1317,8 +1317,13 @@ def _cmd_report(args: argparse.Namespace) -> int:
             return EXIT_USAGE
         # D4:成功提示只在原子替换完成之后
         if args.redact:
-            # R08(AC05):脱敏分享视图——提示口径与内容一致,不谎称含全值
-            print(f"[report] 已写入 {out_path}(凭证节已脱敏,可分享)", flush=True)
+            # R08(AC05):脱敏分享视图——提示口径与内容一致,不谎称含全值;
+            # 评审收口:明示其余章节未脱敏,不误导「整篇可安全外发」
+            print(
+                f"[report] 已写入 {out_path}(凭证节已脱敏;其余章节未脱敏,"
+                "外发前审阅全文)",
+                flush=True,
+            )
         else:
             print(f"[report] 已写入 {out_path}(含凭证全值,按红线处理)", flush=True)
     else:

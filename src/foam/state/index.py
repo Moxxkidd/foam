@@ -307,15 +307,17 @@ class Index:
         return missing
 
     def _backup_pre_v3(self) -> Path:
-        """迁移前一次性原样备份(已存在不覆盖),并打开快速读校验。
+        """迁移前一次性备份(已存在不覆盖),并打开快速读校验。
 
-        备份不可读(坏备份等于没备份)如实抛错中止迁移——原始库此时尚未
-        被 ALTER 触碰,保持可读旧状态。
+        校验失败(坏备份等于没备份)如实抛错中止迁移——原始库此时尚未
+        被 ALTER 触碰,保持可读旧状态。评审收口:既有备份不「存在即
+        信任」——早退路径同样过读校验(首次 copyfile 中途失败的截断
+        备份会被拒绝)并补钉 0600(copyfile 后 chmod 前崩溃留 0644 的
+        窗口,重开补正)。
         """
         backup = self.db_path.with_name(self.db_path.name + PRE_V3_BACKUP_SUFFIX)
-        if backup.exists():
-            return backup
-        shutil.copyfile(self.db_path, backup)
+        if not backup.exists():
+            shutil.copyfile(self.db_path, backup)
         try:
             os.chmod(backup, 0o600)
         except OSError as exc:

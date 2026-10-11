@@ -803,8 +803,19 @@ WP-13(整合)依赖全部
   固有限制（R08.md §8 (a)）；存量 engagement 权限不批量加固，仅打开时
   钉正；build_report 打开 v2 旧库触发迁移属既定延续。接口漂移（cli.py
   --redact、files.py/audit.py 权限钉）理由见 R08.md §7。
-- 测试基线：全仓 **751 passed + 2 skipped**（基线 731+2，本条目净增 20
+- 测试基线：全仓 **760 passed + 2 skipped**（基线 731+2，本条目净增 29
   例；2 skip 为 ssh/msfconsole 环境门控，语义不变），ruff 全绿。
 - 下一步：按 [R 索引](items/README.md) 评审 [R09](items/R09.md)（verify、
   证据 manifest 与结项页——接入 verification_status=verified 生产路径，
   核销 v0.1.3 发布门槛第三条的 verify 维）。
+
+- 2026-10-11 对抗评审收口（跟进提交）：两路独立评审无阻断；修六项——
+  迁移备份早退路径补读校验+0600 补钉（截断备份不再被信任）、证据引用
+  open 改 O_NONBLOCK（FIFO 无限阻塞回归，模型可自行 mkfifo）、符号链接
+  环/stat 竞态的非 ValueError 异常转 error dict（不逃逸终结 run）、
+  Engagement.open 对称钉 0700（resume 主路径名实对齐）、redact 视图与
+  CLI 提示补「其余章节未脱敏」口径、三钉点 chmod 失败 warning 不阻断
+  回归钉死。只记录不修四项（sqlmap-dump 界外绝对路径证据引用与 LLM
+  暴露面、hard link 逃逸边界与 TOCTOU mock 措辞校准、host 孤儿行/
+  evidence_path 兼容列漂移/sensitive 无条件覆盖/apply_facts 部分提交面）
+  见 R08.md §8 (h)–(j)。净增测试 9 例。

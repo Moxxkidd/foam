@@ -13,10 +13,13 @@ R08-A(2026-10-11)追加:schema v3 证据模型列迁移(v2 旧库升级/失败�
 v2→v3 演进(语义不变,目标版本 +1)。
 """
 
+import asyncio
 import fcntl
 import hashlib
 import json
+import logging
 import os
+import shutil
 import sqlite3
 import stat
 from pathlib import Path
@@ -1884,3 +1887,178 @@ async def test_credential_masking_and_permissions(state_tool):
     assert row["secret_masked"] is True
     assert row["source"] is None
     assert row["evidence_refs"] is None
+
+
+# ================================================================
+# R08 评审收口(2026-10-11,两路对抗评审,无阻断;应修项逐条先红后绿)
+# ================================================================
+
+def test_pre_v3_backup_truncated_aborts_migration(tmp_path):
+    """收口 1:既有备份不再「存在即信任」——截断备份(首次 copyfile 中途
+    失败形态)重开时经读校验如实拒绝迁移,原库保持可读 v2 不动;清掉
+    坏备份后重开自动重建并迁移成功。"""
+    db = tmp_path / "index.sqlite"
+    _make_v2_db(db)
+    backup = tmp_path / "index.sqlite.pre-v3.bak"
+    # 不足一个页(默认 4096)的截断:任何 schema/表读都 malformed,确定性失败
+    backup.write_bytes(db.read_bytes()[:512])
+    with pytest.raises(sqlite3.Error):
+        Index(db)
+
+    conn = sqlite3.connect(db)  # 迁移被中止:原库仍是可读 v2,旧事实不丢
+    try:
+        assert _meta_version(conn) == "2"
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(vulns)")}
+        assert "verification_status" not in cols
+        assert conn.execute("SELECT COUNT(*) FROM vulns").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    backup.unlink()  # 清掉坏备份:重开自动重建并迁移成功
+    with Index(db) as index:
+        assert _meta_version(index._conn) == "3"
+        assert index.query("vulns")["rows"][0]["title"] == "旧库匿名 FTP 可写"
+
+
+def test_pre_v3_backup_repinned_and_revalidated(tmp_path):
+    """收口 1 姊妹面:copyfile 完成后 chmod 前崩溃留 0644 备份(含完整
+    凭证的库副本)——重开补钉 0600;可读备份照常沿用、不覆盖。"""
+    db = tmp_path / "index.sqlite"
+    _make_v2_db(db)
+    backup = tmp_path / "index.sqlite.pre-v3.bak"
+    shutil.copyfile(db, backup)  # 有效备份,权限 0644(模拟崩溃窗口)
+    os.chmod(backup, 0o644)
+    bak_bytes = backup.read_bytes()
+    with Index(db) as index:
+        assert _meta_version(index._conn) == "3"
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600  # 早退路径补钉
+    assert backup.read_bytes() == bak_bytes  # 不覆盖既有备份
+
+
+async def test_evidence_ref_fifo_rejected_without_blocking(state_tool):
+    """收口 2:FIFO 非常规文件——os.open 须 O_NONBLOCK,校验立即拒绝,
+    不阻塞事件循环(评审实测 O_RDONLY 对 FIFO 无限阻塞,2s 不返回;
+    engagement 内 FIFO 模型可自行 mkfifo 造出)。"""
+    fifo = state_tool._engagement.paths.outputs / "pipe-evidence"
+    os.mkfifo(fifo)
+    res = await asyncio.wait_for(
+        state_tool.dispatch("state_add_loot", {"path": "outputs/pipe-evidence"}),
+        timeout=5,
+    )
+    assert res["added"] is False and "常规文件" in res["error"]
+    res = await asyncio.wait_for(
+        state_tool.dispatch(
+            "state_add_vuln",
+            {
+                "host": "192.0.2.10", "kind": "x", "title": "t",
+                "evidence_refs": ["outputs/pipe-evidence"],
+            },
+        ),
+        timeout=5,
+    )
+    assert "error" in res and "常规文件" in res["error"]
+    assert state_tool._index.counts()["vulns"] == 0
+
+
+async def test_evidence_ref_symlink_loop_returns_error(state_tool):
+    """收口 3:符号链接环触发 resolve() RuntimeError——helper 转
+    ValueError,保持「校验失败=error dict」契约,不逃逸成未处理异常。"""
+    loop_a = state_tool._engagement.paths.outputs / "loop-a"
+    loop_b = state_tool._engagement.paths.outputs / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    res = await state_tool.dispatch("state_add_loot", {"path": "outputs/loop-a"})
+    assert res["added"] is False and "无法解析" in res["error"]
+
+
+async def test_evidence_ref_stat_race_returns_error(state_tool, monkeypatch):
+    """收口 3 姊妹面:open 后 stat 竞态(文件消失)抛 FileNotFoundError——
+    同样转 ValueError 走 error dict 契约,指出替换/消失语义。"""
+    target = state_tool._engagement.paths.outputs / "race.bin"
+    target.write_text("TESTONLY", encoding="utf-8")
+    resolved_target = target.resolve()
+    real_stat = os.stat
+
+    def vanishing_stat(path, *args, **kwargs):
+        if Path(path) == resolved_target:
+            raise FileNotFoundError("TESTONLY 模拟校验/打开间消失")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", vanishing_stat)
+    res = await state_tool.dispatch("state_add_loot", {"path": "outputs/race.bin"})
+    assert res["added"] is False and "被替换" in res["error"]
+
+
+def test_open_repins_directory_permissions(tmp_path, scope_file):
+    """收口 4:Engagement.open 与 create 对称钉 0700(resume 主路径全走
+    open;此前只 create 钉,注释/文档名实不符)。"""
+    engagement = Engagement.create(
+        tmp_path / "engagements",
+        "权限对称",
+        scope_path=scope_file,
+        engagement_id="repin-eng",
+    )
+    root = engagement.paths.root
+    os.chmod(root, 0o755)  # noqa: S103  # 测试故意置漂移权限以验证 open 钉正
+    Engagement.open(root)
+    mode = stat.S_IMODE(root.stat().st_mode)
+    assert mode == 0o700, f"open 应钉正 0700,实际 {mode:#o}"
+
+
+def test_index_chmod_failure_warns_not_blocks(tmp_path, monkeypatch, caplog):
+    """收口 6(决策 9 钉住):索引库 chmod 失败只记 warning,不阻断打开。"""
+    db = tmp_path / "index.sqlite"
+    real_chmod = os.chmod
+
+    def boom_chmod(path, mode, *args, **kwargs):
+        if Path(path) == db:
+            raise OSError(1, "TESTONLY 模拟 chmod 失败")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", boom_chmod)
+    with caplog.at_level(logging.WARNING, logger="foam.state.index"):
+        with Index(db) as index:  # 不阻断:打开与读写照常
+            index.upsert_host("192.0.2.10")
+            assert index.counts()["hosts"] == 1
+    assert any("0600" in r.message for r in caplog.records)
+
+
+def test_audit_chmod_failure_warns_not_blocks(tmp_path, monkeypatch, caplog):
+    """收口 6(决策 9 钉住):审计链 chmod 失败只记 warning,不阻断打开。"""
+    path = tmp_path / "audit.jsonl"
+    real_chmod = os.chmod
+
+    def boom_chmod(p, mode, *args, **kwargs):
+        if Path(p) == path:
+            raise OSError(1, "TESTONLY 模拟 chmod 失败")
+        return real_chmod(p, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", boom_chmod)
+    with caplog.at_level(logging.WARNING, logger="foam.guard.audit"):
+        audit = AuditLog(path)
+        audit.append("TESTONLY_r08_chmod", {"note": "x"})  # 写入照常
+        audit.close()
+    assert any("0600" in r.message for r in caplog.records)
+    assert "TESTONLY_r08_chmod" in path.read_text(encoding="utf-8")
+
+
+def test_engagement_chmod_failure_warns_not_blocks(tmp_path, monkeypatch, caplog):
+    """收口 6(决策 9 钉住):engagement 目录 chmod 失败只记 warning,
+    不阻断 create/open。"""
+    root = tmp_path / "engagements" / "chmod-eng"
+    real_chmod = os.chmod
+
+    def boom_chmod(path, mode, *args, **kwargs):
+        if Path(path) == root:
+            raise OSError(1, "TESTONLY 模拟 chmod 失败")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", boom_chmod)
+    with caplog.at_level(logging.WARNING, logger="foam.state.files"):
+        engagement = Engagement.create(
+            tmp_path / "engagements", "chmod 测试", engagement_id="chmod-eng"
+        )
+        assert engagement.paths.root.is_dir()  # 不阻断:目录与布局照常
+        assert engagement.validate() == []
+        Engagement.open(root)  # open 路径同样不阻断
+    assert sum("0700" in r.message for r in caplog.records) == 2  # create+open

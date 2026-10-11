@@ -294,12 +294,22 @@ def _resolve_contained_file(root: Path, ref: str) -> tuple[str, int]:
     ``os.stat(resolved)`` 的 (st_dev, st_ino) 一致(防校验/使用间替换)、
     大小取 fstat 值。返回 (解析后的相对路径, 大小),入库统一存相对路径。
     无 openat2/RESOLVE_BENEATH 的残余微窗口如实记录在 R08.md §8。
+
+    评审收口(2026-10-11):
+    - open 带 ``O_NONBLOCK``——FIFO/设备文件对 O_RDONLY 无限阻塞(模型可
+      自行 mkfifo),NONBLOCK 下 fstat 仍正确判非 S_ISREG 拒绝;
+    - resolve() 的符号链接环(RuntimeError)、open 后 stat 竞态
+      (FileNotFoundError 等 OSError)一律转 ValueError——保持「校验失败
+      =error dict」契约,不让非 ValueError 异常逃逸 dispatch 终结 run。
     """
-    resolved = (root / ref).resolve()
+    try:
+        resolved = (root / ref).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{ref!r} 无法解析({exc})") from None
     if not resolved.is_relative_to(root):
         raise ValueError(f"{ref!r} 不在 engagement 目录内")
     try:
-        fd = os.open(resolved, os.O_RDONLY)
+        fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         raise ValueError(
             f"文件不存在:{ref!r}(先经 run_command 写入,再登记)"
@@ -309,8 +319,13 @@ def _resolve_contained_file(root: Path, ref: str) -> tuple[str, int]:
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
-            raise ValueError(f"{ref!r} 不是常规文件(目录等不可登记)")
-        current = os.stat(resolved)
+            raise ValueError(f"{ref!r} 不是常规文件(目录/FIFO 等不可登记)")
+        try:
+            current = os.stat(resolved)
+        except OSError as exc:
+            raise ValueError(
+                f"{ref!r} 在校验与打开之间消失或被替换({exc}),拒绝登记"
+            ) from None
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
             raise ValueError(f"{ref!r} 在校验与打开之间被替换,拒绝登记")
         size = opened.st_size

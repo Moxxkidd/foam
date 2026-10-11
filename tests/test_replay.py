@@ -929,6 +929,9 @@ def test_report_redacted_view_masks_creds_only(tmp_path):
     assert "## 凭证(全值)" not in text
     assert SECRET_VALUE not in text
     assert MASKED_FORM in text
+    # 评审收口 5:节首标识须含「其余章节未脱敏」口径,消除「整篇可安全
+    # 外发」的误读
+    assert "其余章节未脱敏" in text
     # 其余章节不受影响
     assert "示例 CVE-2026-0001" in text
     assert "loot/flag.txt" in text
