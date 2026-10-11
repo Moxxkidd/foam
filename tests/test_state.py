@@ -1968,7 +1968,11 @@ async def test_evidence_ref_symlink_loop_returns_error(state_tool):
     loop_a.symlink_to(loop_b)
     loop_b.symlink_to(loop_a)
     res = await state_tool.dispatch("state_add_loot", {"path": "outputs/loop-a"})
-    assert res["added"] is False and "无法解析" in res["error"]
+    assert res["added"] is False and "loop-a" in res["error"]  # 指出哪条
+    # 跨版本路径:3.12 resolve() 抛 RuntimeError 转「无法解析」;3.13 起
+    # pathlib resolve() 对链接环放行,os.open 遇 ELOOP 转「不可打开」——
+    # 两条路径都保持 error dict 契约(CI py3.13 双平台实证,2026-10-11)
+    assert "无法解析" in res["error"] or "不可打开" in res["error"]
 
 
 async def test_evidence_ref_stat_race_returns_error(state_tool, monkeypatch):

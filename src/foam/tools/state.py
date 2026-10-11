@@ -298,7 +298,8 @@ def _resolve_contained_file(root: Path, ref: str) -> tuple[str, int]:
     评审收口(2026-10-11):
     - open 带 ``O_NONBLOCK``——FIFO/设备文件对 O_RDONLY 无限阻塞(模型可
       自行 mkfifo),NONBLOCK 下 fstat 仍正确判非 S_ISREG 拒绝;
-    - resolve() 的符号链接环(RuntimeError)、open 后 stat 竞态
+    - resolve() 的符号链接环(3.12 RuntimeError;3.13 起 pathlib 放行、
+      os.open 遇 ELOOP OSError——两条路径都覆盖)、open 后 stat 竞态
       (FileNotFoundError 等 OSError)一律转 ValueError——保持「校验失败
       =error dict」契约,不让非 ValueError 异常逃逸 dispatch 终结 run。
     """
