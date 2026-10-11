@@ -123,6 +123,155 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    # ---------------- R08-B:非解析器成果登记(决策 6) ----------------
+    {
+        "name": "state_add_host",
+        "description": (
+            "登记一台主机到状态索引(解析层不认的工具产出、手工确认的资产等)。"
+            "按 ip 去重:重复登记返回同一 record_id 并附 deduplicated=true,"
+            "hostname 以最新观测为准。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip": {"type": "string", "description": "主机 IP(去重键)。"},
+                "hostname": {
+                    "type": "string",
+                    "description": "主机名(可缺省,不臆造)。",
+                },
+            },
+            "required": ["ip"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "state_add_port",
+        "description": (
+            "登记一个开放端口到状态索引。按 (host, port, proto) 去重:"
+            "重复登记返回同一 record_id,非空新值充实 service/product/version。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "主机 IP(host 不存在时自动建档)。",
+                },
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "proto": {
+                    "type": "string",
+                    "default": "tcp",
+                    "description": "协议,默认 tcp。",
+                },
+                "service": {"type": "string", "description": "服务名,如 http。"},
+                "product": {"type": "string", "description": "产品名。"},
+                "version": {"type": "string", "description": "版本串。"},
+            },
+            "required": ["host", "port"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "state_add_vuln",
+        "description": (
+            "登记一条漏洞/发现到状态索引(解析层不认的工具产出、手工验证发现)。"
+            "按 (host, kind, title) 去重:重复登记返回同一 record_id,证据引用"
+            "并集追加不丢。evidence_refs 为证据文件路径列表——须为 engagement "
+            "目录内已存在的常规文件(先经 run_command 落盘),逐条校验,任一无效"
+            "整体拒绝。verification_status 只能 unknown/unverified(默认 "
+            "unverified):「已验证」由独立验证流程判定,本工具不接受 verified,"
+            "模型自述不升级。来源自动记为 manual;confidence 可缺省,不臆造。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "主机 IP(host 不存在时自动建档)。",
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "发现类别,如 sqli / xss / config / cve。",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "一句话标题(去重键之一,保持精确稳定)。",
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "证据文件路径列表(相对 engagement 根,如 "
+                        "outputs/abc123.log);逐条校验存在性与界内性。"
+                    ),
+                },
+                "confidence": {
+                    "type": "string",
+                    "description": "置信度,如 low / medium / high;可缺省。",
+                },
+                "verification_status": {
+                    "type": "string",
+                    "enum": ["unknown", "unverified"],
+                    "description": "验证状态;默认 unverified。不接受 verified。",
+                },
+                "observed_at": {
+                    "type": "string",
+                    "description": "观测时间 ISO 串;默认当前 UTC。",
+                },
+                "reproduction": {
+                    "type": "string",
+                    "description": "复现步骤(可缺省,不臆造)。",
+                },
+            },
+            "required": ["host", "kind", "title"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "state_add_cred",
+        "description": (
+            "登记一组凭证到状态索引(完整 secret 落盘——产品红线:仅 LLM 视图"
+            "掩码,索引进盘与报告导出为全值;本工具返回只含掩码形态)。按 "
+            "(host, username, secret) 去重:重复登记返回同一 record_id,证据"
+            "引用并集追加不丢。evidence_refs 校验语义与 state_add_vuln 相同;"
+            "verification_status 不接受 verified(默认 unverified)。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "主机 IP(host 不存在时自动建档)。",
+                },
+                "username": {"type": "string", "description": "用户名。"},
+                "secret": {
+                    "type": "string",
+                    "description": "口令/哈希/令牌原文(完整落盘,视图掩码)。",
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "来源证据文件路径列表(相对 engagement 根)。",
+                },
+                "sensitive": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否敏感(默认 true)。",
+                },
+                "verification_status": {
+                    "type": "string",
+                    "enum": ["unknown", "unverified"],
+                    "description": "验证状态;默认 unverified。不接受 verified。",
+                },
+                "observed_at": {
+                    "type": "string",
+                    "description": "观测时间 ISO 串;默认当前 UTC。",
+                },
+            },
+            "required": ["host", "username", "secret"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -210,6 +359,10 @@ class StateTool:
             "state_query": self.state_query,
             "state_add_note": self.state_add_note,
             "state_add_loot": self.state_add_loot,
+            "state_add_host": self.state_add_host,
+            "state_add_port": self.state_add_port,
+            "state_add_vuln": self.state_add_vuln,
+            "state_add_cred": self.state_add_cred,
         }
         handler = handlers[name]  # 未知工具名属编程错误,直接 KeyError
         try:
@@ -285,4 +438,164 @@ class StateTool:
             "id": loot_id,
             "path": rel,
             "size_bytes": size,
+        }
+
+    # ---------- R08-B:非解析器成果登记(决策 4/6) ----------
+
+    @staticmethod
+    def _check_verification_status(value: str | None) -> dict[str, Any] | None:
+        """登记工具的验证状态闸门:不接受 verified(决策 2,模型自述不升级)。"""
+        if value is None or value in ("unknown", "unverified"):
+            return None
+        return {
+            "error": (
+                f"verification_status 不接受 {value!r}:只能 unknown/unverified"
+                "(默认 unverified);「已验证」由独立验证流程判定,登记工具不升级"
+            ),
+            "added": False,
+        }
+
+    def _check_evidence_refs(
+        self, evidence_refs: Any
+    ) -> tuple[list[str] | None, dict[str, Any] | None]:
+        """逐条校验证据引用(任一失败整体拒绝并指出哪条,决策 5/AC03)。
+
+        返回 (规范化后的相对路径列表 | None, 错误 dict | None);入库统一
+        存解析后的相对路径。
+        """
+        if evidence_refs is None:
+            return None, None
+        if not isinstance(evidence_refs, (list, tuple)):
+            return None, {"error": "evidence_refs 须为路径数组", "added": False}
+        root = self._engagement.paths.root.resolve()
+        refs: list[str] = []
+        for ref in evidence_refs:
+            try:
+                rel, _size = _resolve_contained_file(root, str(ref))
+            except ValueError as exc:
+                return None, {
+                    "error": f"证据引用 {ref!r} 无效:{exc}(任一无效即整体拒绝)",
+                    "added": False,
+                }
+            if rel not in refs:
+                refs.append(rel)
+        return refs or None, None
+
+    def state_add_host(self, ip: str, hostname: str | None = None) -> dict[str, Any]:
+        ip = str(ip).strip()
+        if not ip:
+            return {"error": "ip 不能为空", "added": False}
+        existing = bool(self._index.query("hosts", {"ip": ip}, limit=1)["rows"])
+        host_id = self._index.upsert_host(ip, hostname or None)
+        return {
+            "added": True,
+            "record_id": f"hosts/{host_id}",
+            "deduplicated": existing,
+        }
+
+    def state_add_port(
+        self,
+        host: str,
+        port: int,
+        proto: str = "tcp",
+        service: str | None = None,
+        product: str | None = None,
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        port = int(port)
+        if not 1 <= port <= 65535:
+            return {"error": f"端口 {port} 超出 1-65535", "added": False}
+        proto = str(proto or "tcp")
+        host = str(host).strip()
+        if not host:
+            return {"error": "host 不能为空", "added": False}
+        existing = bool(
+            self._index.query(
+                "ports",
+                {"host_ip": host, "port": port, "proto": proto},
+                limit=1,
+            )["rows"]
+        )
+        port_id = self._index.upsert_port(
+            host, port, proto, service=service, product=product, version=version
+        )
+        return {
+            "added": True,
+            "record_id": f"ports/{port_id}",
+            "deduplicated": existing,
+        }
+
+    def state_add_vuln(
+        self,
+        host: str,
+        kind: str,
+        title: str,
+        evidence_refs: list[str] | None = None,
+        confidence: str | None = None,
+        verification_status: str | None = None,
+        observed_at: str | None = None,
+        reproduction: str | None = None,
+    ) -> dict[str, Any]:
+        kind, title = str(kind).strip(), str(title).strip()
+        host = str(host).strip()
+        if not host or not kind or not title:
+            return {"error": "host/kind/title 均不能为空", "added": False}
+        if err := self._check_verification_status(verification_status):
+            return err
+        refs, err = self._check_evidence_refs(evidence_refs)
+        if err:
+            return err
+        vuln_id, created = self._index.add_vuln(
+            host,
+            kind,
+            title,
+            source="manual",
+            evidence_refs=refs,
+            confidence=confidence,
+            verification_status=verification_status,
+            observed_at=observed_at,
+            reproduction=reproduction,
+        )
+        return {
+            "added": True,
+            "record_id": f"vulns/{vuln_id}",
+            "deduplicated": not created,
+        }
+
+    def state_add_cred(
+        self,
+        host: str,
+        username: str,
+        secret: str,
+        evidence_refs: list[str] | None = None,
+        sensitive: bool = True,
+        verification_status: str | None = None,
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        host, username = str(host).strip(), str(username).strip()
+        if not host or not username or not secret:
+            return {"error": "host/username/secret 均不能为空", "added": False}
+        if err := self._check_verification_status(verification_status):
+            return err
+        refs, err = self._check_evidence_refs(evidence_refs)
+        if err:
+            return err
+        cred_id, created = self._index.add_cred(
+            host,
+            username,
+            str(secret),
+            source="manual",
+            sensitive=bool(sensitive),
+            evidence_refs=refs,
+            verification_status=verification_status,
+            observed_at=observed_at,
+        )
+        return {
+            "added": True,
+            "record_id": f"creds/{cred_id}",
+            "deduplicated": not created,
+            "username": username,
+            # 红线:返回只给掩码形态,绝不含 secret 原文
+            "secret": mask_secret(str(secret)),
+            "secret_masked": True,
         }

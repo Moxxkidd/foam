@@ -9,6 +9,12 @@ tools/state.py 的 LLM 工具都走这层统一的 upsert/查询接口。
 - upsert 语义:hosts 按 ip、ports 按 (host_id, port, proto)、creds 按
   (host_id, username, secret)、vulns 按 (host_id, kind, title) 去重,
   重复上报更新易变字段(service/product/version、source、confidence 等)。
+- R08(schema v3):vulns/creds 增证据模型列(source/evidence_refs(JSON
+  数组)/verification_status/observed_at/reproduction);add_vuln/add_cred
+  改为单事务 read-modify-write(refs 并集追加不丢、verified 不被登记
+  路径降级),返回 ``(id, created)``;验证状态枚举冻结:
+  unknown(迁移默认)/unverified(登记默认)/verified(仅 R09 独立验证
+  流程可置,登记路径拒绝)。
 - creds.secret 在本层**完整落盘**(供 WP-10 报告);给 LLM 的脱敏在
   tools/state.py 工具层做,本层不涉及——attack_surface 汇总只返回
   username/source,不带 secret。
@@ -152,6 +158,12 @@ _MIGRATION_V3_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 #: v3 迁移前的一次性备份文件名后缀(存在不覆盖,保留最初升级前状态)。
 PRE_V3_BACKUP_SUFFIX = ".pre-v3.bak"
 
+#: R08 决策 2:验证状态枚举冻结。unknown=旧记录无从判断(迁移默认);
+#: unverified=已登记未独立验证(解析器/手工登记默认);verified=仅 R09
+#: 独立验证流程可置——登记路径(add_vuln/add_cred/state_add_*/apply_facts)
+#: 一律拒绝 verified,模型自述不升级。
+VERIFICATION_STATES = frozenset({"unknown", "unverified", "verified"})
+
 #: query() 通用接口允许的 kind 及各自可过滤字段(白名单)。
 QUERY_KINDS: dict[str, dict[str, Any]] = {
     "hosts": {"filters": {"ip", "hostname"}},
@@ -172,6 +184,63 @@ def _utc_now_iso() -> str:
 
 def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+# ---------- R08:证据引用与验证状态的合并且子 ----------
+
+def _normalize_refs(evidence_refs: Any) -> list[str] | None:
+    """规范化证据引用列表:非空字符串、保序去重;空输入归 None(存 NULL)。"""
+    if not evidence_refs:
+        return None
+    refs: list[str] = []
+    for ref in evidence_refs:
+        if not isinstance(ref, str) or not ref:
+            raise ValueError("evidence_refs 元素须为非空字符串")
+        if ref not in refs:
+            refs.append(ref)
+    return refs or None
+
+
+def _dump_refs(refs: list[str] | None) -> str | None:
+    return json.dumps(refs, ensure_ascii=False) if refs else None
+
+
+def _merge_refs(existing: str | None, new: list[str] | None) -> list[str] | None:
+    """既有 JSON 串与新列表的并集(既有顺序在前,追加不丢,决策 1)。"""
+    merged: list[str] = []
+    if existing:
+        try:
+            old_refs = json.loads(existing)
+        except (json.JSONDecodeError, TypeError):
+            old_refs = None
+        if isinstance(old_refs, list):
+            for ref in old_refs:
+                if isinstance(ref, str) and ref and ref not in merged:
+                    merged.append(ref)
+        else:
+            merged.append(existing)  # 非 JSON 旧值:原样保留不丢
+    for ref in new or []:
+        if ref not in merged:
+            merged.append(ref)
+    return merged or None
+
+
+def _check_verification_status(value: str | None) -> None:
+    """登记路径的验证状态闸门:枚举外与 verified 一律拒绝(决策 2)。"""
+    if value is None:
+        return
+    if value not in VERIFICATION_STATES - {"verified"}:
+        raise ValueError(
+            f"登记路径不接受 verification_status={value!r}:可选 unknown/"
+            "unverified;verified 仅独立验证流程(R09)可置,模型自述不升级"
+        )
+
+
+def _merge_verification_status(existing: str | None, new: str | None) -> str | None:
+    """冲突合并:verified 不被登记路径降级;无新值保留原值。"""
+    if existing == "verified":
+        return "verified"
+    return new if new is not None else existing
 
 
 class Index:
@@ -321,6 +390,17 @@ class Index:
         finally:
             self._tx_depth -= 1
             self._conn.isolation_level = prior
+
+    @contextmanager
+    def _write_tx(self) -> Iterator[None]:
+        """事务感知的读-改-写包裹(R08):已在显式事务内(consume_job_exit)
+        则并入外层事务(_transaction 不支持嵌套);否则开独立事务——
+        add_vuln/add_cred 的 refs 并集合并需要原子读-改-写。"""
+        if self._tx_depth > 0:
+            yield
+        else:
+            with self._transaction():
+                yield
 
     # ---------- R06:job 终态事件的幂等消费(决策 3/4) ----------
 
@@ -543,25 +623,63 @@ class Index:
         *,
         source: str | None = None,
         sensitive: bool = True,
-    ) -> int:
-        """按 (host, username, secret) 去重;重复上报更新 source/sensitive。"""
+        evidence_refs: list[str] | None = None,
+        verification_status: str | None = None,
+        observed_at: str | None = None,
+    ) -> tuple[int, bool]:
+        """按 (host, username, secret) 去重登记;返回 ``(cred_id, created)``。
+
+        R08(决策 1/2):重复登记合并——source 取非空新值、sensitive 无条件
+        覆盖(既有例外语义不变)、evidence_refs 并集追加不丢(单事务
+        read-modify-write)、verification_status 不可经本路径降级(已有
+        verified 保持);新行默认 verification_status='unverified'、
+        observed_at=当前 UTC。登记路径拒绝 verified(决策 2)。
+        """
+        _check_verification_status(verification_status)
         host_id = self._host_id(host)
-        self._conn.execute(
-            """
-            INSERT INTO creds(host_id, username, secret, source, sensitive, first_seen)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(host_id, username, secret) DO UPDATE SET
-                source = COALESCE(excluded.source, creds.source),
-                sensitive = excluded.sensitive
-            """,
-            (host_id, username, secret, source, int(sensitive), _utc_now_iso()),
-        )
-        self._maybe_commit()
-        row = self._conn.execute(
-            "SELECT id FROM creds WHERE host_id = ? AND username = ? AND secret = ?",
-            (host_id, username, secret),
-        ).fetchone()
-        return int(row["id"])
+        refs = _normalize_refs(evidence_refs)
+        with self._write_tx():
+            row = self._conn.execute(
+                "SELECT * FROM creds WHERE host_id = ? AND username = ? "
+                "AND secret = ?",
+                (host_id, username, secret),
+            ).fetchone()
+            if row is None:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO creds(host_id, username, secret, source,
+                                      sensitive, first_seen, evidence_refs,
+                                      verification_status, observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        host_id, username, secret, source, int(sensitive),
+                        _utc_now_iso(), _dump_refs(refs),
+                        verification_status or "unverified",
+                        observed_at or _utc_now_iso(),
+                    ),
+                )
+                return int(cursor.lastrowid), True
+            merged = _merge_refs(row["evidence_refs"], refs)
+            self._conn.execute(
+                """
+                UPDATE creds SET
+                    source = COALESCE(?, creds.source),
+                    sensitive = ?,
+                    evidence_refs = COALESCE(?, creds.evidence_refs),
+                    verification_status = ?,
+                    observed_at = COALESCE(?, creds.observed_at)
+                WHERE id = ?
+                """,
+                (
+                    source, int(sensitive), _dump_refs(merged),
+                    _merge_verification_status(
+                        row["verification_status"], verification_status
+                    ),
+                    observed_at, row["id"],
+                ),
+            )
+            return int(row["id"]), False
 
     def add_vuln(
         self,
@@ -571,26 +689,70 @@ class Index:
         *,
         evidence_path: str | None = None,
         confidence: str | None = None,
-    ) -> int:
-        """按 (host, kind, title) 去重;重复上报更新 evidence/confidence。"""
+        source: str | None = None,
+        evidence_refs: list[str] | None = None,
+        verification_status: str | None = None,
+        observed_at: str | None = None,
+        reproduction: str | None = None,
+    ) -> tuple[int, bool]:
+        """按 (host, kind, title) 去重登记;返回 ``(vuln_id, created)``。
+
+        R08(决策 1/2/6):evidence_refs 为新证据模型列(JSON 数组);给了
+        refs 而没给 legacy evidence_path 时回填首个 ref(报告旧渲染兼容)。
+        重复登记合并:refs 并集追加不丢(单事务 read-modify-write),
+        confidence/source/observed_at/reproduction 显式新值覆盖、None
+        保留;verification_status 不可经本路径降级。登记路径拒绝
+        verified(决策 2)。
+        """
+        _check_verification_status(verification_status)
         host_id = self._host_id(host)
-        self._conn.execute(
-            """
-            INSERT INTO vulns(host_id, kind, title, evidence_path,
-                              confidence, first_seen)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(host_id, kind, title) DO UPDATE SET
-                evidence_path = COALESCE(excluded.evidence_path, vulns.evidence_path),
-                confidence = COALESCE(excluded.confidence, vulns.confidence)
-            """,
-            (host_id, kind, title, evidence_path, confidence, _utc_now_iso()),
-        )
-        self._maybe_commit()
-        row = self._conn.execute(
-            "SELECT id FROM vulns WHERE host_id = ? AND kind = ? AND title = ?",
-            (host_id, kind, title),
-        ).fetchone()
-        return int(row["id"])
+        refs = _normalize_refs(evidence_refs)
+        if refs and evidence_path is None:
+            evidence_path = refs[0]  # legacy 列回填首个 ref(决策 6/7)
+        with self._write_tx():
+            row = self._conn.execute(
+                "SELECT * FROM vulns WHERE host_id = ? AND kind = ? AND title = ?",
+                (host_id, kind, title),
+            ).fetchone()
+            if row is None:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO vulns(host_id, kind, title, evidence_path,
+                                      confidence, first_seen, source,
+                                      evidence_refs, verification_status,
+                                      observed_at, reproduction)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        host_id, kind, title, evidence_path, confidence,
+                        _utc_now_iso(), source, _dump_refs(refs),
+                        verification_status or "unverified",
+                        observed_at or _utc_now_iso(), reproduction,
+                    ),
+                )
+                return int(cursor.lastrowid), True
+            merged = _merge_refs(row["evidence_refs"], refs)
+            self._conn.execute(
+                """
+                UPDATE vulns SET
+                    evidence_path = COALESCE(?, vulns.evidence_path),
+                    confidence = COALESCE(?, vulns.confidence),
+                    source = COALESCE(?, vulns.source),
+                    evidence_refs = COALESCE(?, vulns.evidence_refs),
+                    verification_status = ?,
+                    observed_at = COALESCE(?, vulns.observed_at),
+                    reproduction = COALESCE(?, vulns.reproduction)
+                WHERE id = ?
+                """,
+                (
+                    evidence_path, confidence, source, _dump_refs(merged),
+                    _merge_verification_status(
+                        row["verification_status"], verification_status
+                    ),
+                    observed_at, reproduction, row["id"],
+                ),
+            )
+            return int(row["id"]), False
 
     def add_loot(
         self,

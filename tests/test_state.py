@@ -386,10 +386,15 @@ def test_mask_secret_rules():
 # schema 与 WP-01 同构,可被 WP-04 直接注册
 
 def test_tool_schemas_shape():
+    # R08-B:新增四个登记工具(host/port/vuln/cred)
     assert {s["name"] for s in TOOL_SCHEMAS} == {
         "state_query",
         "state_add_note",
         "state_add_loot",
+        "state_add_host",
+        "state_add_port",
+        "state_add_vuln",
+        "state_add_cred",
     }
     for schema in TOOL_SCHEMAS:
         assert set(schema) == {"name", "description", "parameters"}
@@ -1638,3 +1643,244 @@ def test_index_db_permissions_owner_only(tmp_path):
         pass
     mode = stat.S_IMODE(db.stat().st_mode)
     assert mode == 0o600, f"重开应钉正为 0o600,实际 {mode:#o}"
+
+
+# ================================================================
+# R08-B:四个登记工具(state_add_host/port/vuln/cred)与稳定去重
+# ================================================================
+
+async def test_manual_finding_registration(state_tool):
+    """AC01:未注册解析器的工具产出(合成产物落盘)→ 四个登记工具 →
+    state_query 查证(creds 掩码)→ build_report 出现该发现(全值契约)。"""
+    from foam.replay import build_report
+
+    # 合成产物:模拟解析层不认的工具(如 wpscan)输出,先落盘再登记
+    artifact = state_tool._engagement.paths.outputs / "wpscan-manual.txt"
+    artifact.write_text("TESTONLY wpscan 输出:XML-RPC enabled", encoding="utf-8")
+
+    host = await state_tool.dispatch(
+        "state_add_host", {"ip": "192.0.2.10", "hostname": "web.example.com"}
+    )
+    assert host["added"] is True and host["record_id"].startswith("hosts/")
+    assert host["deduplicated"] is False
+    port = await state_tool.dispatch(
+        "state_add_port",
+        {"host": "192.0.2.10", "port": 80, "service": "http", "product": "Apache"},
+    )
+    assert port["added"] is True and port["record_id"].startswith("ports/")
+    vuln = await state_tool.dispatch(
+        "state_add_vuln",
+        {
+            "host": "192.0.2.10",
+            "kind": "config",
+            "title": "XML-RPC 接口暴露",
+            "evidence_refs": ["outputs/wpscan-manual.txt"],
+            "confidence": "medium",
+            "reproduction": "curl http://192.0.2.10/xmlrpc.php",
+        },
+    )
+    assert vuln["added"] is True and vuln["record_id"].startswith("vulns/")
+    cred = await state_tool.dispatch(
+        "state_add_cred",
+        {
+            "host": "192.0.2.10",
+            "username": "wp-admin",
+            "secret": TEST_SECRET,
+            "evidence_refs": ["outputs/wpscan-manual.txt"],
+        },
+    )
+    assert cred["added"] is True and cred["record_id"].startswith("creds/")
+    # 红线:工具返回不得含 secret 原文(掩码形态可给)
+    assert TEST_SECRET not in json.dumps(cred, ensure_ascii=False)
+    assert cred["secret"] == mask_secret(TEST_SECRET)
+
+    vulns = await state_tool.dispatch(
+        "state_query", {"kind": "vulns", "filters": {"host_ip": "192.0.2.10"}}
+    )
+    row = vulns["rows"][0]
+    assert row["title"] == "XML-RPC 接口暴露"
+    assert row["source"] == "manual"  # 手工登记来源
+    assert row["verification_status"] == "unverified"  # 默认:已登记未验证
+    assert row["observed_at"]  # 默认当前 UTC ISO
+    assert json.loads(row["evidence_refs"]) == ["outputs/wpscan-manual.txt"]
+    assert row["evidence_path"] == "outputs/wpscan-manual.txt"  # legacy 列回填
+    assert row["reproduction"] == "curl http://192.0.2.10/xmlrpc.php"
+    creds = await state_tool.dispatch("state_query", {"kind": "creds"})
+    wire = json.dumps(creds, ensure_ascii=False)
+    assert TEST_SECRET not in wire  # LLM 视图掩码红线
+    assert creds["rows"][0]["secret_masked"] is True
+
+    report = build_report(state_tool._engagement.paths.root)
+    assert "XML-RPC 接口暴露" in report  # 登记发现进报告
+    assert "outputs/wpscan-manual.txt" in report
+    assert TEST_SECRET in report  # 报告凭证全值契约不变
+
+
+async def test_registration_dedup_union_refs(state_tool):
+    """AC02:重复登记同一自然键 → 同一 record_id;证据 refs 并集追加不丢;
+    既有字段不被 None 覆盖;verified 不被登记路径降级。"""
+    outputs = state_tool._engagement.paths.outputs
+    (outputs / "scan-a.log").write_text("TESTONLY A", encoding="utf-8")
+    (outputs / "scan-b.log").write_text("TESTONLY B", encoding="utf-8")
+
+    first = await state_tool.dispatch(
+        "state_add_vuln",
+        {
+            "host": "192.0.2.10", "kind": "xss", "title": "反射型 XSS",
+            "evidence_refs": ["outputs/scan-a.log"], "confidence": "medium",
+        },
+    )
+    second = await state_tool.dispatch(
+        "state_add_vuln",
+        {
+            "host": "192.0.2.10", "kind": "xss", "title": "反射型 XSS",
+            "evidence_refs": ["outputs/scan-b.log", "outputs/scan-a.log"],
+        },
+    )
+    assert first["deduplicated"] is False
+    assert second["record_id"] == first["record_id"]  # 同一逻辑实体
+    assert second["deduplicated"] is True
+    rows = (await state_tool.dispatch("state_query", {"kind": "vulns"}))["rows"]
+    assert len(rows) == 1  # 稳定去重
+    assert json.loads(rows[0]["evidence_refs"]) == [
+        "outputs/scan-a.log",
+        "outputs/scan-b.log",
+    ]  # 并集追加不丢,既有顺序在前
+    assert rows[0]["confidence"] == "medium"  # 不被 None 覆盖
+
+    c1 = await state_tool.dispatch(
+        "state_add_cred",
+        {
+            "host": "192.0.2.10", "username": "admin", "secret": TEST_SECRET,
+            "evidence_refs": ["outputs/scan-a.log"],
+        },
+    )
+    c2 = await state_tool.dispatch(
+        "state_add_cred",
+        {
+            "host": "192.0.2.10", "username": "admin", "secret": TEST_SECRET,
+            "evidence_refs": ["outputs/scan-b.log"],
+        },
+    )
+    assert c2["record_id"] == c1["record_id"] and c2["deduplicated"] is True
+    crow = (await state_tool.dispatch("state_query", {"kind": "creds"}))["rows"][0]
+    assert json.loads(crow["evidence_refs"]) == [
+        "outputs/scan-a.log",
+        "outputs/scan-b.log",
+    ]
+
+    h1 = await state_tool.dispatch("state_add_host", {"ip": "192.0.2.11"})
+    h2 = await state_tool.dispatch(
+        "state_add_host", {"ip": "192.0.2.11", "hostname": "web.example.com"}
+    )
+    assert h2["record_id"] == h1["record_id"] and h2["deduplicated"] is True
+    p1 = await state_tool.dispatch(
+        "state_add_port", {"host": "192.0.2.11", "port": 80}
+    )
+    p2 = await state_tool.dispatch(
+        "state_add_port", {"host": "192.0.2.11", "port": 80, "service": "http"}
+    )
+    assert p2["record_id"] == p1["record_id"] and p2["deduplicated"] is True
+
+    # verified 不被降级:模拟 R09 独立验证流程直接把行置 verified
+    state_tool._index._conn.execute(
+        "UPDATE vulns SET verification_status = 'verified' WHERE kind = 'xss'"
+    )
+    state_tool._index._conn.commit()
+    third = await state_tool.dispatch(
+        "state_add_vuln",
+        {
+            "host": "192.0.2.10", "kind": "xss", "title": "反射型 XSS",
+            "verification_status": "unverified",
+        },
+    )
+    assert third["deduplicated"] is True
+    rows = (await state_tool.dispatch("state_query", {"kind": "vulns"}))["rows"]
+    assert rows[0]["verification_status"] == "verified"  # 登记路径不降级
+
+
+async def test_tools_reject_verified_status(state_tool):
+    """决策 2:登记工具不接受 verified——模型自述不升级;索引层纵深同样拒绝。"""
+    res = await state_tool.dispatch(
+        "state_add_vuln",
+        {
+            "host": "192.0.2.10", "kind": "x", "title": "t",
+            "verification_status": "verified",
+        },
+    )
+    assert "error" in res and "verified" in res["error"]
+    res = await state_tool.dispatch(
+        "state_add_cred",
+        {
+            "host": "192.0.2.10", "username": "u", "secret": TEST_SECRET,
+            "verification_status": "verified",
+        },
+    )
+    assert "error" in res
+    assert state_tool._index.counts()["vulns"] == 0  # 未写入
+    assert state_tool._index.counts()["creds"] == 0
+    # 索引层纵深防御:add_vuln/add_cred 直接传 verified 抛 ValueError
+    with pytest.raises(ValueError, match="verified"):
+        state_tool._index.add_vuln(
+            "192.0.2.10", "x", "t", verification_status="verified"
+        )
+    with pytest.raises(ValueError, match="verified"):
+        state_tool._index.add_cred(
+            "192.0.2.10", "u", "s", verification_status="verified"
+        )
+
+
+async def test_evidence_refs_any_invalid_rejects_whole(state_tool):
+    """AC03:evidence_refs 逐条校验,任一失败整体拒绝并在错误中指出哪条。"""
+    outputs = state_tool._engagement.paths.outputs
+    (outputs / "ok.log").write_text("TESTONLY", encoding="utf-8")
+    res = await state_tool.dispatch(
+        "state_add_vuln",
+        {
+            "host": "192.0.2.10", "kind": "x", "title": "t",
+            "evidence_refs": ["outputs/ok.log", "../escape.txt"],
+        },
+    )
+    assert "error" in res and "../escape.txt" in res["error"]  # 指出哪条
+    assert state_tool._index.counts()["vulns"] == 0  # 整体拒绝:无半截登记
+
+    res = await state_tool.dispatch(
+        "state_add_cred",
+        {
+            "host": "192.0.2.10", "username": "u", "secret": TEST_SECRET,
+            "evidence_refs": ["outputs/not-there.log"],
+        },
+    )
+    assert "error" in res and "不存在" in res["error"]
+    assert state_tool._index.counts()["creds"] == 0
+
+
+# ================================================================
+# R08-C:凭证掩码与权限钉(目录/库/审计链)
+# ================================================================
+
+async def test_credential_masking_and_permissions(state_tool):
+    """AC05 + 规格 §1:缺元数据 cred 行掩码不泄漏原文;engagement 目录 0700、
+    index.sqlite 0600、audit.jsonl 0600 权限钉(幂等,打开即钉)。"""
+    engagement = state_tool._engagement
+    mode = stat.S_IMODE(engagement.paths.root.stat().st_mode)
+    assert mode == 0o700, f"engagement 目录应 0o700,实际 {mode:#o}"
+    mode = stat.S_IMODE(engagement.paths.index_db.stat().st_mode)
+    assert mode == 0o600, f"索引库应 0o600,实际 {mode:#o}"
+    # AuditLog 打开后钉 0600(create 的空占位文件随 umask,打开才钉)
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    audit.close()
+    mode = stat.S_IMODE(engagement.paths.audit_jsonl.stat().st_mode)
+    assert mode == 0o600, f"审计链应 0o600,实际 {mode:#o}"
+
+    # 缺元数据(source/evidence_refs/observed_at 皆 NULL)的 cred 行:
+    # 掩码行为不变,元数据缺失不导致原文泄漏(AC05)
+    state_tool._index.add_cred("192.0.2.10", "legacy", TEST_SECRET)
+    response = await state_tool.dispatch("state_query", {"kind": "creds"})
+    wire = json.dumps(response, ensure_ascii=False)
+    assert TEST_SECRET not in wire
+    row = response["rows"][0]
+    assert row["secret"] == mask_secret(TEST_SECRET)
+    assert row["secret_masked"] is True
+    assert row["source"] is None
+    assert row["evidence_refs"] is None

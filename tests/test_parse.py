@@ -2,6 +2,12 @@
 
 fixture 全合成(RFC 5737 文档段 / example.com / TESTONLY 凭据),
 不含任何真实目标数据。快照逐字锁定 summary 文本与 facts 列表。
+
+R08-B(2026-10-11)快照更新(有意行为,见 R08.md §7 决策 7):sqlmap/nikto
+vuln facts 增 source=工具名 + evidence_refs=[output_path](legacy
+evidence_path 键保留);hydra cred 有 output_path 时增 evidence_refs;
+sqlmap-dump cred 增 evidence_refs=[CSV 本体](stdout 日志不含这些凭据,
+以证据真实性为准);新增 apply_facts 证据模型映射与 verified 拒绝测试。
 """
 
 import json
@@ -112,7 +118,10 @@ def test_sqlmap_snapshot():
     assert first["kind"] == "vuln" and first["vkind"] == "sqli"
     assert first["host"] == "www.example.com"
     assert first["confidence"] == "confirmed"
-    assert first["evidence_path"] == "outputs/abc123.log"
+    assert first["evidence_path"] == "outputs/abc123.log"  # legacy 兼容键保留
+    # R08 决策 7:解析器接同一证据模型——evidence_refs + source=工具名
+    assert first["evidence_refs"] == ["outputs/abc123.log"]
+    assert first["source"] == "sqlmap"
     assert "boolean-based blind" in first["title"]
 
 
@@ -164,6 +173,9 @@ def test_nikto_snapshot():
     assert len(vulns) == 6
     assert all(v["vkind"] == "nikto" for v in vulns)
     assert all(v["host"] == "192.0.2.10" for v in vulns)
+    # R08 决策 7:vuln facts 接证据模型(evidence_refs + source=工具名)
+    assert all(v["source"] == "nikto" for v in vulns)
+    assert all(v["evidence_refs"] == ["outputs/def456.log"] for v in vulns)
     titles = json.dumps([v["title"] for v in vulns], ensure_ascii=False)
     assert "/admin/" in titles and "OSVDB-3092" in titles
     # 统计行/头部行不得混入 findings
@@ -174,6 +186,7 @@ def test_hydra_snapshot():
     result = maybe_parse(
         "hydra -L users.txt -P passes.txt 192.0.2.10 ssh",
         fixture_text("hydra.txt"),
+        output_path="outputs/hydra-test.log",  # R08:cred 证据引用(有 output_path 时)
     )
     assert result is not None and result.tool == "hydra"
     # facts 带完整 secret(进索引落盘,WP-10 报告可见)
@@ -181,10 +194,12 @@ def test_hydra_snapshot():
         {
             "kind": "cred", "host": "192.0.2.10", "username": "admin",
             "secret": "TESTONLY-passw0rd", "source": "hydra",
+            "evidence_refs": ["outputs/hydra-test.log"],
         },
         {
             "kind": "cred", "host": "192.0.2.10", "username": "root",
             "secret": "TESTONLY-toor", "source": "hydra",
+            "evidence_refs": ["outputs/hydra-test.log"],
         },
     ]
     # 红线:summary 是 LLM 视图,完整 secret 不得出现,只有掩码形式
@@ -369,6 +384,50 @@ def test_apply_facts_skips_unknown_kind(tmp_path):
         assert index.counts()["hosts"] == 1
 
 
+def test_apply_facts_vuln_cred_evidence_model(tmp_path):
+    """R08 决策 7:vuln/cred facts 的新列(source/evidence_refs/
+    verification_status/observed_at)映射入库;facts 未带时默认
+    source='parse'、新行 verification_status='unverified';登记路径
+    不接受 verified(决策 2 纵深:落索引层拒绝,apply_facts 归 skipped)。"""
+    facts = [
+        {"kind": "vuln", "host": "192.0.2.10", "vkind": "config", "title": "缺省"},
+        {
+            "kind": "vuln", "host": "192.0.2.10", "vkind": "config",
+            "title": "全字段", "source": "custom-tool",
+            "evidence_refs": ["outputs/e.log"], "confidence": "high",
+            "verification_status": "unverified",
+            "observed_at": "2026-10-11T01:02:03+00:00",
+            "reproduction": "curl 复现",
+        },
+        {
+            "kind": "vuln", "host": "192.0.2.10", "vkind": "config",
+            "title": "自述已验证", "verification_status": "verified",
+        },
+        {
+            "kind": "cred", "host": "192.0.2.10", "username": "u",
+            "secret": "TESTONLY-x", "evidence_refs": ["outputs/e.log"],
+        },
+    ]
+    with Index(tmp_path / "index.sqlite") as index:
+        stats = apply_facts(index, facts)
+        assert stats["vulns"] == 2 and stats["creds"] == 1
+        assert stats["skipped"] == 1  # verified 被拒,归 skipped
+        rows = {r["title"]: r for r in index.query("vulns")["rows"]}
+        assert rows["缺省"]["source"] == "parse"
+        assert rows["缺省"]["verification_status"] == "unverified"
+        assert rows["缺省"]["observed_at"] is not None  # 默认当前 UTC
+        full = rows["全字段"]
+        assert full["source"] == "custom-tool"
+        assert json.loads(full["evidence_refs"]) == ["outputs/e.log"]
+        assert full["evidence_path"] == "outputs/e.log"  # legacy 列回填首个 ref
+        assert full["observed_at"] == "2026-10-11T01:02:03+00:00"  # 参数覆盖
+        assert full["reproduction"] == "curl 复现"
+        crow = index.query("creds")["rows"][0]
+        assert crow["source"] == "parse"
+        assert json.loads(crow["evidence_refs"]) == ["outputs/e.log"]
+        assert crow["verification_status"] == "unverified"
+
+
 async def test_hydra_cred_facts_into_index_and_masked_via_tool(tmp_path):
     """闭环:hydra facts 完整值进索引;WP-06 工具视图仍掩码。"""
     from foam.state.files import Engagement
@@ -396,7 +455,8 @@ async def test_hydra_cred_facts_into_index_and_masked_via_tool(tmp_path):
 
 
 def test_sqlmap_vuln_facts_into_index(tmp_path):
-    """vuln 分支集成:sqlmap facts 真进索引可反查(此前该分支零覆盖)。"""
+    """vuln 分支集成:sqlmap facts 真进索引可反查;R08 新列(来源/证据
+    引用/验证状态/观测时间)一并落库,legacy evidence_path 回填首个 ref。"""
     result = maybe_parse(
         "sqlmap -u http://www.example.com/?id=1 --batch",
         fixture_text("sqlmap_stdout.txt"),
@@ -410,6 +470,12 @@ def test_sqlmap_vuln_facts_into_index(tmp_path):
         assert all(r["kind"] == "sqli" for r in rows)
         assert all(r["confidence"] == "confirmed" for r in rows)
         assert {r["evidence_path"] for r in rows} == {"outputs/abc123.log"}
+        assert all(r["source"] == "sqlmap" for r in rows)
+        assert all(
+            json.loads(r["evidence_refs"]) == ["outputs/abc123.log"] for r in rows
+        )
+        assert all(r["verification_status"] == "unverified" for r in rows)
+        assert all(r["observed_at"] for r in rows)
 
 
 def test_sqlmap_loot_csv(tmp_path):
@@ -441,10 +507,14 @@ def test_sqlmap_loot_csv(tmp_path):
         {
             "kind": "cred", "host": "www.example.com", "username": "admin",
             "secret": "TESTONLY-hash5", "source": "sqlmap-dump",
+            # R08 偏差(§7 决策 7):dump 凭据的证据是 CSV 本体
+            # (stdout 日志不含这些凭据)
+            "evidence_refs": [str(csv_path)],
         },
         {
             "kind": "cred", "host": "www.example.com", "username": "guest",
             "secret": "TESTONLY-hash9", "source": "sqlmap-dump",
+            "evidence_refs": [str(csv_path)],
         },
     ]
     assert "dump 已登记 1 个 CSV(含 2 条凭据,完整值已入索引)" in result.summary

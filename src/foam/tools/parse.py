@@ -13,12 +13,21 @@ WP-06 索引)。fact 形状:
 
 - ``{"kind": "host", "ip", "hostname"?}``
 - ``{"kind": "port", "host", "port", "proto"?, "service"?, "product"?, "version"?}``
-- ``{"kind": "cred", "host", "username", "secret", "source"?}``
-- ``{"kind": "vuln", "host", "vkind", "title", "evidence_path"?, "confidence"?}``
+- ``{"kind": "cred", "host", "username", "secret", "source"?,
+  "evidence_refs"?, "verification_status"?, "observed_at"?}``
+- ``{"kind": "vuln", "host", "vkind", "title", "evidence_path"?, "confidence"?,
+  "source"?, "evidence_refs"?, "verification_status"?, "observed_at"?,
+  "reproduction"?}``
 - ``{"kind": "loot", "path", "lkind"?, "note"?, "size_bytes"?}``(sqlmap
   dump CSV 登记;``lkind`` 避开 ``kind`` 判别键)
 - 其余 kind(如 gobuster 的 ``endpoint``):apply_facts 跳过并计数,
   留给未来索引扩展。
+
+R08(决策 7):vuln/cred facts 接同一证据模型——解析器产出带
+source=工具名、有 output_path 时带 evidence_refs=[output_path]
+(sqlmap-dump cred 的证据是 dump CSV 本体);facts 未带时 apply_facts
+默认 source="parse",新行 verification_status 默认 "unverified";
+登记路径(含本模块)不接受 verified(决策 2,索引层拒绝归 skipped)。
 
 接线形状与 WP-01 同构:``PARSERS`` 注册表(后续 WP 加解析器 =
 ``PARSERS["tool"] = fn`` 或 ``@register("tool")``)+ :func:`maybe_parse`
@@ -197,6 +206,9 @@ def apply_facts(index: Index, facts: list[dict[str, Any]]) -> dict[str, int]:
                     fact["username"],
                     fact["secret"],
                     source=fact.get("source", "parse"),
+                    evidence_refs=fact.get("evidence_refs"),
+                    verification_status=fact.get("verification_status"),
+                    observed_at=fact.get("observed_at"),
                 )
                 stats["creds"] += 1
             elif kind == "vuln":
@@ -206,6 +218,11 @@ def apply_facts(index: Index, facts: list[dict[str, Any]]) -> dict[str, int]:
                     fact["title"],
                     evidence_path=fact.get("evidence_path"),
                     confidence=fact.get("confidence"),
+                    source=fact.get("source", "parse"),
+                    evidence_refs=fact.get("evidence_refs"),
+                    verification_status=fact.get("verification_status"),
+                    observed_at=fact.get("observed_at"),
+                    reproduction=fact.get("reproduction"),
                 )
                 stats["vulns"] += 1
             elif kind == "loot":
@@ -487,13 +504,15 @@ _SQLMAP_MAX_CREDS_PER_CSV = 50
 
 
 def _sqlmap_loot_facts(
-    output_text: str, host: str | None
+    output_text: str, host: str | None, output_path: str | None = None
 ) -> tuple[list[dict[str, Any]], int]:
     """best-effort 扫 sqlmap output 目录下的 dump CSV:逐份登记 loot fact,
     列名像口令/用户的行提 cred fact(完整 secret 进索引,与 hydra 同红线)。
 
     任何 IO/格式问题只丢 loot 部分,绝不影响 stdout 主解析(增强非门槛)。
-    返回 (facts, cred_count)。
+    返回 (facts, cred_count)。R08:dump 凭据的证据引用指向 CSV 本体
+    (stdout 日志不含这些凭据——以证据真实性为准,R08.md §7 决策 7 偏差),
+    有 output_path 时再追加 stdout 日志。
     """
     match = _SQLMAP_OUTPUT_DIR_RE.search(output_text)
     if not match:
@@ -557,6 +576,9 @@ def _sqlmap_loot_facts(
                         "username": username,
                         "secret": secret,
                         "source": "sqlmap-dump",
+                        # R08:证据是 CSV 本体;有 stdout 日志路径时追加
+                        "evidence_refs": [str(csv_path)]
+                        + ([output_path] if output_path else []),
                     }
                 )
                 per_csv += 1
@@ -595,23 +617,25 @@ def parse_sqlmap(
             title = title_match.group("title").strip()
             findings.append(f"{current_param}:{title}")
             if host:
-                facts.append(
-                    {
-                        "kind": "vuln",
-                        "host": host,
-                        "vkind": "sqli",
-                        "title": f"SQL 注入 {current_param}:{title}",
-                        "evidence_path": output_path,
-                        "confidence": "confirmed",
-                    }
-                )
+                vuln_fact: dict[str, Any] = {
+                    "kind": "vuln",
+                    "host": host,
+                    "vkind": "sqli",
+                    "title": f"SQL 注入 {current_param}:{title}",
+                    "evidence_path": output_path,  # legacy 兼容键(决策 7)
+                    "source": "sqlmap",
+                    "confidence": "confirmed",
+                }
+                if output_path:
+                    vuln_fact["evidence_refs"] = [output_path]
+                facts.append(vuln_fact)
     dbms = None
     for dbms_re in _SQLMAP_DBMS_RES:
         match = dbms_re.search(output_text)
         if match:
             dbms = match.group("dbms").strip()
             break
-    loot_facts, loot_cred_count = _sqlmap_loot_facts(output_text, host)
+    loot_facts, loot_cred_count = _sqlmap_loot_facts(output_text, host, output_path)
     facts.extend(loot_facts)
     loot_csv_count = sum(1 for f in loot_facts if f["kind"] == "loot")
     if not findings and not loot_facts:
@@ -752,16 +776,18 @@ def parse_nikto(
         )
     for finding in findings:
         if host:
-            facts.append(
-                {
-                    "kind": "vuln",
-                    "host": host,
-                    "vkind": "nikto",
-                    "title": finding,
-                    "evidence_path": output_path,
-                    "confidence": "medium",
-                }
-            )
+            vuln_fact: dict[str, Any] = {
+                "kind": "vuln",
+                "host": host,
+                "vkind": "nikto",
+                "title": finding,
+                "evidence_path": output_path,  # legacy 兼容键(决策 7)
+                "source": "nikto",
+                "confidence": "medium",
+            }
+            if output_path:
+                vuln_fact["evidence_refs"] = [output_path]
+            facts.append(vuln_fact)
     display = target_hostname or cli_host or target_ip or "目标见命令行"
     summary = f"nikto:{display}"
     if server:
@@ -786,7 +812,10 @@ _HYDRA_RE = re.compile(
 def parse_hydra(
     command: str, output_text: str, output_path: str | None = None
 ) -> ParsedOutput | None:
-    """hydra:有效凭据行进 cred facts(完整 secret 进索引);summary 掩码。"""
+    """hydra:有效凭据行进 cred facts(完整 secret 进索引);summary 掩码。
+
+    R08:有 output_path 时 cred facts 带 evidence_refs=[output_path]。
+    """
     facts: list[dict[str, Any]] = []
     masked_pairs: list[str] = []
     for line in output_text.splitlines():
@@ -794,15 +823,16 @@ def parse_hydra(
         if not match:
             continue
         password = match.group("password").strip()
-        facts.append(
-            {
-                "kind": "cred",
-                "host": match.group("host"),
-                "username": match.group("login"),
-                "secret": password,
-                "source": "hydra",
-            }
-        )
+        cred_fact: dict[str, Any] = {
+            "kind": "cred",
+            "host": match.group("host"),
+            "username": match.group("login"),
+            "secret": password,
+            "source": "hydra",
+        }
+        if output_path:
+            cred_fact["evidence_refs"] = [output_path]
+        facts.append(cred_fact)
         masked_pairs.append(f"{match.group('login')}/{mask_secret(password)}")
     if not facts:
         return None
