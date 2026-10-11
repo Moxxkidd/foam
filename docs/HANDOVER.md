@@ -803,7 +803,7 @@ WP-13(整合)依赖全部
   固有限制（R08.md §8 (a)）；存量 engagement 权限不批量加固，仅打开时
   钉正；build_report 打开 v2 旧库触发迁移属既定延续。接口漂移（cli.py
   --redact、files.py/audit.py 权限钉）理由见 R08.md §7。
-- 测试基线：全仓 **750 passed + 2 skipped**（基线 731+2，本条目净增 19
+- 测试基线：全仓 **751 passed + 2 skipped**（基线 731+2，本条目净增 20
   例；2 skip 为 ssh/msfconsole 环境门控，语义不变），ruff 全绿。
 - 下一步：按 [R 索引](items/README.md) 评审 [R09](items/R09.md)（verify、
   证据 manifest 与结项页——接入 verification_status=verified 生产路径，
