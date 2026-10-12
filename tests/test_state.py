@@ -1148,12 +1148,13 @@ def test_schema_v2_job_events_table_created(tmp_path):
 
     R08 注记:版本钉随 SCHEMA_VERSION 演进(v2→v3 证据模型补列),
     本例语义不变——新库一次成型、job_events 列面冻结。
+    R09 注记:版本钉 v3→v4(loot.sha256 登记时快照),语义仍不变。
     """
     from foam.state.index import SCHEMA_VERSION
 
     with Index(tmp_path / "index.sqlite") as index:
-        assert SCHEMA_VERSION == 3
-        assert _meta_version(index._conn) == "3"
+        assert SCHEMA_VERSION == 4
+        assert _meta_version(index._conn) == "4"
         # job_events 已建表(列面冻结:event_id 主键 + audit_seq 可空)
         cols = {
             row[1] for row in index._conn.execute("PRAGMA table_info(job_events)")
@@ -1185,7 +1186,7 @@ def test_schema_v1_db_upgraded_on_open(tmp_path):
     conn.close()
 
     with Index(db) as index:
-        assert _meta_version(index._conn) == "3"  # 版本已升
+        assert _meta_version(index._conn) == "4"  # 版本已升(R09:v1 直升 v4)
         index._conn.execute("SELECT COUNT(*) FROM job_events").fetchone()  # 表已建
         rows = index.query("hosts")["rows"]  # 旧数据原样可读
         assert [r["ip"] for r in rows] == ["192.0.2.10"]
@@ -1218,7 +1219,7 @@ def test_v1_program_reads_v2_db_unaffected(tmp_path):
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1')"
     )
     conn.commit()
-    assert _meta_version(conn) == "3"  # 不回退新版本号
+    assert _meta_version(conn) == "4"  # 不回退新版本号(R09:v4 同理)
     rows = conn.execute("SELECT ip, hostname FROM hosts").fetchall()
     assert [(r["ip"], r["hostname"]) for r in rows] == [("192.0.2.10", "new-host")]
     conn.execute(
@@ -1450,12 +1451,16 @@ def _make_v2_db(db_path: Path) -> None:
 
 
 def test_schema_v3_fresh_db(tmp_path):
-    """新库直接建 schema v3:vulns/creds 证据模型列齐,meta=3,无迁移备份。"""
+    """新库直接建最新 schema:vulns/creds 证据模型列齐、loot.sha256 在场,
+    meta=当前版本,无迁移备份。
+
+    R09 注记:版本钉 v3→v4(loot.sha256),本例语义不变——一次成型。
+    """
     from foam.state.index import SCHEMA_VERSION
 
     with Index(tmp_path / "index.sqlite") as index:
-        assert SCHEMA_VERSION == 3
-        assert _meta_version(index._conn) == "3"
+        assert SCHEMA_VERSION == 4
+        assert _meta_version(index._conn) == "4"
         vuln_cols = {
             row[1] for row in index._conn.execute("PRAGMA table_info(vulns)")
         }
@@ -1467,21 +1472,31 @@ def test_schema_v3_fresh_db(tmp_path):
             row[1] for row in index._conn.execute("PRAGMA table_info(creds)")
         }
         assert {"evidence_refs", "verification_status", "observed_at"} <= cred_cols
+        loot_cols = {
+            row[1] for row in index._conn.execute("PRAGMA table_info(loot)")
+        }
+        assert "sha256" in loot_cols  # R09-A:登记时快照列
         # 既有读写不受影响
         host_id = index.upsert_host("192.0.2.10")
         assert index.upsert_port(host_id, 22, service="ssh")
     # 新库一次成型,无迁移发生:不留备份文件
     assert not (tmp_path / "index.sqlite.pre-v3.bak").exists()
+    assert not (tmp_path / "index.sqlite.pre-v4.bak").exists()
 
 
 def test_schema_v2_db_upgraded_on_open(tmp_path):
-    """AC06:旧库(v2)打开自动补列升 v3;旧事实不丢、新列默认 unknown;
-    迁移前一次性备份 pre-v3.bak(可读、保持 v2、重开不覆盖)。"""
+    """AC06:旧库(v2)打开自动补列升级;旧事实不丢、新列默认 unknown;
+    迁移前一次性备份(可读、保持升级前状态、重开不覆盖)。
+
+    R09 注记:v2 库现直升 v4——v3 缺列与 loot.sha256 依次迁移,各留一份
+    一次性备份(pre-v3.bak = v2 原样;pre-v4.bak = v3 列已补、loot.sha256
+    未补的中间态),meta 只升不降一次到 4。
+    """
     db = tmp_path / "index.sqlite"
     _make_v2_db(db)
 
     with Index(db) as index:
-        assert _meta_version(index._conn) == "3"  # 版本已升
+        assert _meta_version(index._conn) == "4"  # 版本已升(R09:v2 直升 v4)
         row = index.query("vulns")["rows"][0]  # 旧事实原样可读
         assert row["title"] == "旧库匿名 FTP 可写"
         assert row["evidence_path"] == "outputs/legacy.log"
@@ -1492,6 +1507,10 @@ def test_schema_v2_db_upgraded_on_open(tmp_path):
         assert crow["secret"] == "TESTONLY-legacy-secret"
         assert crow["verification_status"] == "unknown"
         assert crow["evidence_refs"] is None and crow["observed_at"] is None
+        loot_cols = {
+            r[1] for r in index._conn.execute("PRAGMA table_info(loot)")
+        }
+        assert "sha256" in loot_cols  # R09-A:v4 列已补
         index.add_vuln("192.0.2.10", "config", "升级后新发现")  # 写入正常
         assert index.counts()["vulns"] == 2
 
@@ -1507,9 +1526,24 @@ def test_schema_v2_db_upgraded_on_open(tmp_path):
     finally:
         conn.close()
 
-    with Index(db):  # 再打开:备份不被覆盖(保留最初升级前状态)
+    # R09-A:v4 迁移的一次性备份 = v3 列已补、loot.sha256 未补的中间态
+    backup_v4 = tmp_path / "index.sqlite.pre-v4.bak"
+    assert backup_v4.is_file()
+    bak_v4_bytes = backup_v4.read_bytes()
+    conn = sqlite3.connect(backup_v4)
+    try:
+        assert _meta_version(conn) == "2"  # 备份时 meta 尚未升(版本 UPDATE 在后)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(vulns)")}
+        assert "verification_status" in cols  # v3 迁移已完成
+        loot_cols = {r[1] for r in conn.execute("PRAGMA table_info(loot)")}
+        assert "sha256" not in loot_cols  # v4 迁移前
+    finally:
+        conn.close()
+
+    with Index(db):  # 再打开:两份备份都不被覆盖(保留最初升级前状态)
         pass
     assert backup.read_bytes() == bak_bytes
+    assert backup_v4.read_bytes() == bak_v4_bytes
 
 
 def test_schema_v3_migration_failure_rolls_back_and_recovers(tmp_path, monkeypatch):
@@ -1547,7 +1581,7 @@ def test_schema_v3_migration_failure_rolls_back_and_recovers(tmp_path, monkeypat
 
     monkeypatch.undo()  # 故障排除:重开自动重试
     with Index(db) as index:
-        assert _meta_version(index._conn) == "3"
+        assert _meta_version(index._conn) == "4"  # R09:v2 直升 v4
         row = index.query("vulns")["rows"][0]
         assert row["title"] == "旧库匿名 FTP 可写"
         assert row["verification_status"] == "unknown"
@@ -1555,7 +1589,11 @@ def test_schema_v3_migration_failure_rolls_back_and_recovers(tmp_path, monkeypat
 
 def test_v2_program_writes_v3_db_unaffected(tmp_path):
     """反向:v2 旧程序(模拟其 v2 DDL + INSERT OR IGNORE meta + 显式旧列名
-    INSERT)写 v3 新库不受影响——新列可空/有默认;版本号不被回退。"""
+    INSERT)写新库不受影响——新列可空/有默认;版本号不被回退。
+
+    R09 注记:「新库」现为 v4(loot.sha256 可空,v2 显式列名 INSERT 同样
+    安全);版本钉 v3→v4,语义不变。
+    """
     db = tmp_path / "index.sqlite"
     with Index(db) as index:
         index.upsert_host("192.0.2.10", "new-host")
@@ -1572,7 +1610,7 @@ def test_v2_program_writes_v3_db_unaffected(tmp_path):
         "'outputs/old.log', 'low', '2026-10-01T00:00:00+00:00')"
     )
     conn.commit()
-    assert _meta_version(conn) == "3"  # 不回退新版本号
+    assert _meta_version(conn) == "4"  # 不回退新版本号(R09:v4 同理)
     row = conn.execute("SELECT * FROM vulns").fetchone()
     assert row["verification_status"] == "unknown"  # 旧程序记录:无从判断
     assert row["source"] is None and row["evidence_refs"] is None
@@ -1582,6 +1620,7 @@ def test_v2_program_writes_v3_db_unaffected(tmp_path):
         assert index.counts()["vulns"] == 1
         assert index.counts()["hosts"] == 1
         assert not (tmp_path / "index.sqlite.pre-v3.bak").exists()
+        assert not (tmp_path / "index.sqlite.pre-v4.bak").exists()
 
 
 async def test_evidence_ref_symlink_escape_rejected(state_tool, tmp_path):
@@ -1916,7 +1955,7 @@ def test_pre_v3_backup_truncated_aborts_migration(tmp_path):
 
     backup.unlink()  # 清掉坏备份:重开自动重建并迁移成功
     with Index(db) as index:
-        assert _meta_version(index._conn) == "3"
+        assert _meta_version(index._conn) == "4"  # R09:v2 直升 v4
         assert index.query("vulns")["rows"][0]["title"] == "旧库匿名 FTP 可写"
 
 
@@ -1930,7 +1969,7 @@ def test_pre_v3_backup_repinned_and_revalidated(tmp_path):
     os.chmod(backup, 0o644)
     bak_bytes = backup.read_bytes()
     with Index(db) as index:
-        assert _meta_version(index._conn) == "3"
+        assert _meta_version(index._conn) == "4"  # R09:v2 直升 v4
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600  # 早退路径补钉
     assert backup.read_bytes() == bak_bytes  # 不覆盖既有备份
 
@@ -2066,3 +2105,280 @@ def test_engagement_chmod_failure_warns_not_blocks(tmp_path, monkeypatch, caplog
         assert engagement.validate() == []
         Engagement.open(root)  # open 路径同样不阻断
     assert sum("0700" in r.message for r in caplog.records) == 2  # create+open
+
+
+# ================================================================
+# R09-A:schema v4(loot.sha256 登记时快照)迁移与登记语义
+# ================================================================
+
+#: v3(schema v3,R08 时代)的 DDL 冻结副本:模拟旧库/旧程序的行为面。
+#: 手写冻结,不 import 现行 _DDL(与 _LEGACY_V1_DDL/_LEGACY_V2_DDL 同约定)。
+_LEGACY_V3_DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hosts (
+    id INTEGER PRIMARY KEY,
+    ip TEXT NOT NULL UNIQUE,
+    hostname TEXT,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ports (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    port INTEGER NOT NULL,
+    proto TEXT NOT NULL DEFAULT 'tcp',
+    service TEXT,
+    product TEXT,
+    version TEXT,
+    UNIQUE (host_id, port, proto)
+);
+CREATE TABLE IF NOT EXISTS creds (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    username TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    source TEXT,
+    sensitive INTEGER NOT NULL DEFAULT 1,
+    first_seen TEXT NOT NULL,
+    evidence_refs TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'unknown',
+    observed_at TEXT,
+    UNIQUE (host_id, username, secret)
+);
+CREATE TABLE IF NOT EXISTS vulns (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    evidence_path TEXT,
+    confidence TEXT,
+    first_seen TEXT NOT NULL,
+    source TEXT,
+    evidence_refs TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'unknown',
+    observed_at TEXT,
+    reproduction TEXT,
+    UNIQUE (host_id, kind, title)
+);
+CREATE TABLE IF NOT EXISTS loot (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    kind TEXT,
+    note TEXT,
+    size_bytes INTEGER,
+    ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS job_events (
+    event_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    run_id TEXT,
+    reason TEXT,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    duration_ms INTEGER,
+    ended_at TEXT,
+    command TEXT,
+    output_refs TEXT,
+    parse_tool TEXT,
+    parse_stats TEXT,
+    consumed_at TEXT,
+    audit_seq INTEGER
+);
+"""
+
+
+def _make_v3_db(db_path: Path) -> None:
+    """造一个 schema v3 旧库:冻结 v3 DDL + 一行无 sha256 的 loot 旧行。"""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_LEGACY_V3_DDL)
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '3')")
+    conn.execute(
+        "INSERT INTO loot(path, kind, note, size_bytes, ts) "
+        "VALUES ('loot/legacy-dump.txt', 'dump', 'TESTONLY 旧登记', 7, "
+        "'2026-10-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_schema_v4_fresh_db(tmp_path):
+    """新库直接建 schema v4:loot 增 sha256 列,meta=4,无迁移备份。"""
+    from foam.state.index import SCHEMA_VERSION
+
+    with Index(tmp_path / "index.sqlite") as index:
+        assert SCHEMA_VERSION == 4
+        assert _meta_version(index._conn) == "4"
+        loot_cols = {
+            row[1] for row in index._conn.execute("PRAGMA table_info(loot)")
+        }
+        assert "sha256" in loot_cols
+        index.add_loot("loot/x.bin", kind="dump", size_bytes=1, sha256="ab" * 32)
+    assert not (tmp_path / "index.sqlite.pre-v3.bak").exists()
+    assert not (tmp_path / "index.sqlite.pre-v4.bak").exists()
+
+
+def test_schema_v3_db_upgraded_on_open(tmp_path):
+    """AC 迁移:v3 旧库打开自动补 loot.sha256 升 v4;旧行 sha256 为 NULL
+    (登记时无快照,无从判断,不臆造);迁移前一次性备份 pre-v4.bak(可读、
+    保持 v3、重开不覆盖)。"""
+    db = tmp_path / "index.sqlite"
+    _make_v3_db(db)
+
+    with Index(db) as index:
+        assert _meta_version(index._conn) == "4"  # 版本已升
+        row = index.query("loot")["rows"][0]  # 旧行原样可读,hash 为 NULL
+        assert row["path"] == "loot/legacy-dump.txt"
+        assert row["sha256"] is None
+        assert row["size_bytes"] == 7
+        index.add_loot("loot/new.bin", kind="key", size_bytes=2, sha256="cd" * 32)
+        assert index.counts()["loot"] == 2
+
+    backup = tmp_path / "index.sqlite.pre-v4.bak"
+    assert backup.is_file()
+    bak_bytes = backup.read_bytes()
+    conn = sqlite3.connect(backup)  # 备份可读,且保持迁移前(v3)状态
+    try:
+        assert _meta_version(conn) == "3"
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(loot)")}
+        assert "sha256" not in cols
+        assert conn.execute("SELECT COUNT(*) FROM loot").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    with Index(db):  # 再打开:备份不被覆盖(保留最初升级前状态)
+        pass
+    assert backup.read_bytes() == bak_bytes
+
+
+def test_schema_v4_migration_failure_rolls_back_and_recovers(tmp_path, monkeypatch):
+    """v4 迁移中途失败(注入非法列)→ 单事务回滚,原库保持可读 v3,
+    备份已留;故障排除后重开自动重试成功,旧行不丢。"""
+    import foam.state.index as index_module
+
+    db = tmp_path / "index.sqlite"
+    _make_v3_db(db)
+
+    bad_columns = {
+        table: list(cols)
+        for table, cols in index_module._MIGRATION_V4_COLUMNS.items()
+    }
+    # SQLite 拒绝无常量默认的 NOT NULL 新列(语法级拒绝,与表内容无关)
+    bad_columns["loot"].append(("r09_bogus", "TEXT NOT NULL"))
+    monkeypatch.setattr(
+        index_module,
+        "_MIGRATION_V4_COLUMNS",
+        {table: tuple(cols) for table, cols in bad_columns.items()},
+    )
+    with pytest.raises(sqlite3.Error):
+        Index(db)
+
+    conn = sqlite3.connect(db)  # 原库仍是可读的 v3:旧行不丢
+    try:
+        assert _meta_version(conn) == "3"
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(loot)")}
+        assert "sha256" not in cols  # 回滚:半个列都没留下
+        assert conn.execute("SELECT COUNT(*) FROM loot").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert (tmp_path / "index.sqlite.pre-v4.bak").is_file()  # 备份在迁移前已留
+
+    monkeypatch.undo()  # 故障排除:重开自动重试
+    with Index(db) as index:
+        assert _meta_version(index._conn) == "4"
+        row = index.query("loot")["rows"][0]
+        assert row["path"] == "loot/legacy-dump.txt"
+        assert row["sha256"] is None
+
+
+def test_v3_program_writes_v4_db_unaffected(tmp_path):
+    """反向:v3 旧程序(模拟其 v3 DDL + INSERT OR IGNORE meta + 显式旧列名
+    INSERT)写 v4 新库不受影响——loot.sha256 可空;版本号不被回退。"""
+    db = tmp_path / "index.sqlite"
+    with Index(db) as index:
+        index.add_loot("loot/new.bin", kind="dump", size_bytes=3, sha256="ef" * 32)
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_LEGACY_V3_DDL)  # IF NOT EXISTS 幂等,不动新 schema
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '3')"
+    )
+    conn.execute(  # v3 程序显式旧列名 INSERT:新列走 NULL
+        "INSERT INTO loot(path, kind, note, size_bytes, ts) "
+        "VALUES ('loot/old.bin', 'key', 'TESTONLY 旧程序登记', 5, "
+        "'2026-10-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    assert _meta_version(conn) == "4"  # 不回退新版本号
+    row = conn.execute("SELECT * FROM loot WHERE path = 'loot/old.bin'").fetchone()
+    assert row["sha256"] is None  # 旧程序登记:无快照
+    conn.close()
+
+    with Index(db) as index:  # 新程序再打开:两行都在,无二次迁移
+        assert index.counts()["loot"] == 2
+        assert not (tmp_path / "index.sqlite.pre-v4.bak").exists()
+
+
+async def test_add_loot_registers_first_hash_snapshot(state_tool):
+    """R09-A:state_add_loot 登记时快照——校验/哈希同一次打开,sha256 入库
+    并随工具返回;登记尺寸语义不变。"""
+    loot_file = state_tool._engagement.paths.loot / "snap.bin"
+    payload = b"TESTONLY loot payload v1"
+    loot_file.write_bytes(payload)
+    expected = hashlib.sha256(payload).hexdigest()
+    res = await state_tool.dispatch(
+        "state_add_loot", {"path": "loot/snap.bin", "kind": "dump", "note": "首版"}
+    )
+    assert res["added"] is True
+    assert res["sha256"] == expected
+    assert res["size_bytes"] == len(payload)
+    row = state_tool._index.query("loot")["rows"][0]
+    assert row["sha256"] == expected
+
+
+async def test_add_loot_reregister_keeps_first_snapshot(state_tool):
+    """R09-A 登记语义钉死:登记后文件增长再登记——登记时快照**不被覆盖**,
+    kind/note/size_bytes 既有更新语义不变(这正是快照价值的对照面)。"""
+    loot_file = state_tool._engagement.paths.loot / "grow.bin"
+    first = b"TESTONLY v1"
+    loot_file.write_bytes(first)
+    first_hash = hashlib.sha256(first).hexdigest()
+    res = await state_tool.dispatch("state_add_loot", {"path": "loot/grow.bin"})
+    assert res["sha256"] == first_hash
+
+    grown = first + " 追加的第二段".encode()
+    loot_file.write_bytes(grown)
+    res = await state_tool.dispatch(
+        "state_add_loot", {"path": "loot/grow.bin", "note": "更新备注"}
+    )
+    assert res["added"] is True
+    row = state_tool._index.query("loot")["rows"][0]
+    assert row["sha256"] == first_hash  # 首次登记快照不可覆盖
+    assert row["note"] == "更新备注"  # 既有更新语义不变
+    assert row["size_bytes"] == len(grown)
+
+
+def test_add_loot_legacy_null_row_upgrades_on_reregister(tmp_path):
+    """v3 旧行(sha256 NULL=无快照)重复登记时升级为有快照——NULL 不是
+    快照,填入首个真实登记 hash 不算覆盖;此后快照即冻结。"""
+    with Index(tmp_path / "index.sqlite") as index:
+        index._conn.execute(
+            "INSERT INTO loot(path, kind, note, size_bytes, ts) "
+            "VALUES ('loot/old.bin', 'dump', NULL, 3, '2026-10-01T00:00:00+00:00')"
+        )
+        index._conn.commit()
+        index.add_loot("loot/old.bin", size_bytes=3, sha256="aa" * 32)
+        row = index.query("loot")["rows"][0]
+        assert row["sha256"] == "aa" * 32  # NULL → 首个真实快照
+        index.add_loot("loot/old.bin", size_bytes=9, sha256="bb" * 32)
+        row = index.query("loot")["rows"][0]
+        assert row["sha256"] == "aa" * 32  # 已冻结,不覆盖
+        assert row["size_bytes"] == 9  # size 更新语义不变

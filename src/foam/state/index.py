@@ -46,9 +46,11 @@ logger = logging.getLogger(__name__)
 #: v3(R08):vulns/creds 证据模型补列(来源/证据引用/验证状态/观测时间/
 #: 复现步骤)——新库走 _DDL 一次成型,旧库经 _MIGRATION_V3_COLUMNS 探测
 #: 缺列后 ALTER 补齐(迁移前备份 index.sqlite.pre-v3.bak,失败回滚可重试)。
+#: v4(R09):loot 增 sha256 登记时快照列(可空,旧行 NULL=unknown)——
+#: 经 _MIGRATION_V4_COLUMNS 同机制迁移(备份 index.sqlite.pre-v4.bak)。
 #: meta 版本号只升不降;旧程序显式列名 INSERT 对新库不受影响(新列可空
 #: 或有常量默认)。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -106,7 +108,8 @@ CREATE TABLE IF NOT EXISTS loot (
     kind TEXT,
     note TEXT,
     size_bytes INTEGER,
-    ts TEXT NOT NULL
+    ts TEXT NOT NULL,
+    sha256 TEXT
 );
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY,
@@ -157,6 +160,15 @@ _MIGRATION_V3_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 
 #: v3 迁移前的一次性备份文件名后缀(存在不覆盖,保留最初升级前状态)。
 PRE_V3_BACKUP_SUFFIX = ".pre-v3.bak"
+
+#: R09(schema v4):loot 登记时快照补列(可空,旧行 NULL=登记时无快照,
+#: 不臆造)。新库走 _DDL 一次成型,旧库探测缺列后 ALTER 补齐。
+_MIGRATION_V4_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "loot": (("sha256", "TEXT"),),
+}
+
+#: v4 迁移前的一次性备份文件名后缀(同 v3 语义:存在不覆盖)。
+PRE_V4_BACKUP_SUFFIX = ".pre-v4.bak"
 
 #: R08 决策 2:验证状态枚举冻结。unknown=旧记录无从判断(迁移默认);
 #: unverified=已登记未独立验证(解析器/手工登记默认);verified=仅 R09
@@ -255,15 +267,20 @@ class Index:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.executescript(_DDL)
-            # R08(schema v3):缺列探测 → 迁移前一次性备份 → 单事务逐列
-            # ALTER(executescript 会隐式提交先行事务,不能把它包进去;
-            # ALTER 序列本身用 _transaction 包裹)。失败回滚保留可读旧库,
-            # 下次打开自动重试(AC06)。
-            missing = self._missing_v3_columns()
-            if missing:
-                self._backup_pre_v3()
-                with self._transaction():
-                    self._apply_v3_columns(missing)
+            # R08(schema v3)/R09(schema v4):缺列探测 → 迁移前一次性备份 →
+            # 单事务逐列 ALTER(executescript 会隐式提交先行事务,不能把它包
+            # 进去;ALTER 序列本身用 _transaction 包裹)。失败回滚保留可读
+            # 旧库,下次打开自动重试(AC06)。逐版本依序迁移:探测不到缺列
+            # 的版本静默跳过(不备份不动)。
+            for columns_map, backup_suffix in (
+                (_MIGRATION_V3_COLUMNS, PRE_V3_BACKUP_SUFFIX),
+                (_MIGRATION_V4_COLUMNS, PRE_V4_BACKUP_SUFFIX),
+            ):
+                missing = self._missing_columns(columns_map)
+                if missing:
+                    self._backup_pre_migration(backup_suffix)
+                    with self._transaction():
+                        self._apply_columns(missing)
             self._conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION)),
@@ -292,12 +309,14 @@ class Index:
             self._conn.close()
             raise
 
-    # ---------- R08:schema v3 迁移(决策 3) ----------
+    # ---------- R08/R09:schema 迁移(决策 3,v3/v4 同机制) ----------
 
-    def _missing_v3_columns(self) -> dict[str, list[tuple[str, str]]]:
-        """探测 v3 缺列(PRAGMA table_info);返回 {表: [(列名, 声明)]}。"""
+    def _missing_columns(
+        self, columns_map: dict[str, tuple[tuple[str, str], ...]]
+    ) -> dict[str, list[tuple[str, str]]]:
+        """探测缺列(PRAGMA table_info);返回 {表: [(列名, 声明)]}。"""
         missing: dict[str, list[tuple[str, str]]] = {}
-        for table, columns in _MIGRATION_V3_COLUMNS.items():
+        for table, columns in columns_map.items():
             existing = {
                 row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")
             }
@@ -306,7 +325,7 @@ class Index:
                 missing[table] = delta
         return missing
 
-    def _backup_pre_v3(self) -> Path:
+    def _backup_pre_migration(self, suffix: str) -> Path:
         """迁移前一次性备份(已存在不覆盖),并打开快速读校验。
 
         校验失败(坏备份等于没备份)如实抛错中止迁移——原始库此时尚未
@@ -315,7 +334,7 @@ class Index:
         备份会被拒绝)并补钉 0600(copyfile 后 chmod 前崩溃留 0644 的
         窗口,重开补正)。
         """
-        backup = self.db_path.with_name(self.db_path.name + PRE_V3_BACKUP_SUFFIX)
+        backup = self.db_path.with_name(self.db_path.name + suffix)
         if not backup.exists():
             shutil.copyfile(self.db_path, backup)
         try:
@@ -333,12 +352,12 @@ class Index:
             check.close()
         return backup
 
-    def _apply_v3_columns(self, missing: dict[str, list[tuple[str, str]]]) -> None:
+    def _apply_columns(self, missing: dict[str, list[tuple[str, str]]]) -> None:
         """逐列 ALTER ADD COLUMN(调用方须已包 ``_transaction``)。"""
         for table, columns in missing.items():
             for name, decl in columns:
                 # noqa 说明:表名/列名/声明全部来自本模块常量
-                # _MIGRATION_V3_COLUMNS,无外部输入拼接。
+                # _MIGRATION_V*_COLUMNS,无外部输入拼接。
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN {name} {decl}"  # noqa: S608
                 )
@@ -763,18 +782,27 @@ class Index:
         kind: str | None = None,
         note: str | None = None,
         size_bytes: int | None = None,
+        sha256: str | None = None,
     ) -> int:
-        """登记战利品文件(按 path 去重,重复登记更新 kind/note/size)。"""
+        """登记战利品文件(按 path 去重,重复登记更新 kind/note/size)。
+
+        R09(schema v4):``sha256`` 为登记时快照(与校验同一次打开算出,
+        见 tools/state.py ``_resolve_contained_file_hashed``)。**首次登记
+        快照不可覆盖**:重复登记时已有非空 sha256 保持不动(快照语义:
+        登记时点的事实);旧行 sha256 为 NULL(v3 前登记,无快照)时允许
+        填入首个真实快照——NULL 不是快照,不算覆盖。
+        """
         self._conn.execute(
             """
-            INSERT INTO loot(path, kind, note, size_bytes, ts)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO loot(path, kind, note, size_bytes, ts, sha256)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 kind = COALESCE(excluded.kind, loot.kind),
                 note = COALESCE(excluded.note, loot.note),
-                size_bytes = COALESCE(excluded.size_bytes, loot.size_bytes)
+                size_bytes = COALESCE(excluded.size_bytes, loot.size_bytes),
+                sha256 = COALESCE(loot.sha256, excluded.sha256)
             """,
-            (path, kind, note, size_bytes, _utc_now_iso()),
+            (path, kind, note, size_bytes, _utc_now_iso(), sha256),
         )
         self._maybe_commit()
         row = self._conn.execute(

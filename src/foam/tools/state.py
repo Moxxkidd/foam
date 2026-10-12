@@ -16,6 +16,7 @@ schema 形状与 WP-01 完全同构:``TOOL_SCHEMAS`` 为 provider 中立
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from pathlib import Path
@@ -101,7 +102,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "把 engagement 内的战利品文件登记进索引(dump、截图、key 文件等)。"
             "文件须已在 engagement 目录内(通常先经 run_command 写入 loot/);"
-            "登记后可被 state_query(kind=\"loot\") 检索,并进入报告。"
+            "登记时记内容 sha256 快照(登记后文件再变,核验时可检出分叉,"
+            "快照本身不被覆盖);登记后可被 state_query(kind=\"loot\") 检索,"
+            "并进入报告。"
         ),
         "parameters": {
             "type": "object",
@@ -285,14 +288,15 @@ def mask_secret(secret: str) -> str:
     return f"{secret[:2]}{'*' * 8}{secret[-2:]}"
 
 
-def _resolve_contained_file(root: Path, ref: str) -> tuple[str, int]:
-    """校验 engagement 内文件引用(R08 决策 5,战利品/证据共用)。
+def _open_contained_file(root: Path, ref: str) -> tuple[str, int, int]:
+    """校验并打开 engagement 内文件引用(R08 决策 5,战利品/证据共用)。
 
     检查链:``(root / ref).resolve()`` → 须在 root 内(拒 ``..`` 与指向
     engagement 外的符号链接;指向内部的符号链接允许)→ ``os.open`` +
     ``os.fstat`` 绑定实际打开的文件:必须常规文件(拒目录)、fstat 与
     ``os.stat(resolved)`` 的 (st_dev, st_ino) 一致(防校验/使用间替换)、
-    大小取 fstat 值。返回 (解析后的相对路径, 大小),入库统一存相对路径。
+    大小取 fstat 值。返回 (解析后的相对路径, 大小, **打开中的 fd**)——
+    fd 所有权移交调用方,用后必须 ``os.close``;入库统一存相对路径。
     无 openat2/RESOLVE_BENEATH 的残余微窗口如实记录在 R08.md §8。
 
     评审收口(2026-10-11):
@@ -330,9 +334,39 @@ def _resolve_contained_file(root: Path, ref: str) -> tuple[str, int]:
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
             raise ValueError(f"{ref!r} 在校验与打开之间被替换,拒绝登记")
         size = opened.st_size
+    except BaseException:
+        os.close(fd)
+        raise
+    return str(resolved.relative_to(root)), size, fd
+
+
+def _resolve_contained_file(root: Path, ref: str) -> tuple[str, int]:
+    """校验 engagement 内文件引用:返回 (解析后的相对路径, 大小)。
+
+    校验链与语义见 :func:`_open_contained_file`(本函数是其「不消费内容」
+    的封装:校验后立即关闭 fd)。
+    """
+    rel, size, fd = _open_contained_file(root, ref)
+    os.close(fd)
+    return rel, size
+
+
+def _resolve_contained_file_hashed(root: Path, ref: str) -> tuple[str, int, str]:
+    """R09:校验 + 同一次打开内流式 sha256(登记时快照)。
+
+    与校验同一次 ``os.open``/``fstat`` 身份绑定内读完文件流式算 hash——
+    快照与「登记的是哪个文件」严格同一打开,不二次读盘(无第二个
+    TOCTOU 窗口)。返回 (解析后的相对路径, 大小, sha256 hex)。
+    O_NONBLOCK 对常规文件读取无影响(POSIX:常规文件永远就绪)。
+    """
+    rel, size, fd = _open_contained_file(root, ref)
+    try:
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1 << 20):
+            digest.update(chunk)
     finally:
         os.close(fd)
-    return str(resolved.relative_to(root)), size
+    return rel, size, digest.hexdigest()
 
 
 def _mask_cred_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -442,18 +476,23 @@ class StateTool:
     ) -> dict[str, Any]:
         root = self._engagement.paths.root.resolve()
         try:
-            # R08:迁移到共享 helper——os.open+fstat 绑定实际文件,
-            # 消除旧内联版「检查后 stat()」的 TOCTOU 窗口
-            rel, size = _resolve_contained_file(root, path)
+            # R08:共享 helper——os.open+fstat 绑定实际文件,消除旧内联版
+            # 「检查后 stat()」的 TOCTOU 窗口;R09:带哈希变体在同一次打开
+            # 内流式算出登记时快照(登记 sha256 入库,快照不可覆盖语义见
+            # Index.add_loot)。
+            rel, size, sha256 = _resolve_contained_file_hashed(root, path)
         except ValueError as exc:
             return {"added": False, "error": str(exc)}
-        loot_id = self._index.add_loot(rel, kind=kind, note=note, size_bytes=size)
+        loot_id = self._index.add_loot(
+            rel, kind=kind, note=note, size_bytes=size, sha256=sha256
+        )
         return {
             "added": True,
             "kind": "loot",
             "id": loot_id,
             "path": rel,
             "size_bytes": size,
+            "sha256": sha256,
         }
 
     # ---------- R08-B:非解析器成果登记(决策 4/6) ----------

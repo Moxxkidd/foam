@@ -10,6 +10,7 @@
       loot/                # 战利品文件(dump、截图、key)
       notes/               # 自由笔记
       index.sqlite         # state/index.py 的索引库
+      evidence/            # R09:终态证据 manifest 与结项页(不在 LAYOUT,见 paths 注)
 
 outputs/ 契约(重要):outputs/ 就是 WP-01 输出层未来的 output_root——
 WP-01 的 BashTool(output_dir=...) 由调用方注入输出目录,本 WP 不改 WP-01
@@ -247,6 +248,17 @@ class EngagementPaths:
     def index_db(self) -> Path:
         return self.root / "index.sqlite"
 
+    @property
+    def evidence(self) -> Path:
+        """R09:证据 manifest 与结项页落盘目录(run 终态生成)。
+
+        不在 LAYOUT——``validate()`` 对 LAYOUT 逐项严格要求,而 resume 对
+        旧目录走 ``Engagement.open``(不建目录),列入会让 pre-R09 旧
+        engagement 的 resume 被「缺失目录」误拒(R09.md §7 偏差 1)。
+        建目录点:``create()`` 建一次;manifest 写入侧再 mkdir 兜底。
+        """
+        return self.root / "evidence"
+
 
 class Engagement:
     """一个 engagement 的目录与元数据。索引库另开 :class:`Index`。"""
@@ -332,6 +344,9 @@ class Engagement:
             elif name != "engagement.json":
                 # audit.jsonl 空占位;index.sqlite 由 Index 建
                 target.touch(exist_ok=True)
+        # R09:evidence/ 随创建建立(不在 LAYOUT——validate 逐项严格,
+        # 列入会破坏 pre-R09 旧目录的 resume;见 R09.md §7 偏差 1)
+        (root / "evidence").mkdir(exist_ok=True)
         # R02:首写同样原子——崩溃要么无文件要么完整文件,不留半截 JSON
         _atomic_write_text(
             root / "engagement.json",
