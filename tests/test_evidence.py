@@ -97,10 +97,15 @@ def run_cli_once(tmp_path: Path, backend: FakeBackend, *, objective: str = "侦�
 
 
 def _engagement_with_terminal_run(
-    tmp_path: Path, *, run_id: str = "run01a", status: str = "finished"
+    tmp_path: Path,
+    *,
+    run_id: str = "run01a",
+    status: str = "finished",
+    extra_before_finish: list[tuple[str, dict]] | None = None,
 ) -> Engagement:
     """合成终态 engagement:真实 scope 文件 + 链(scope_loaded → run_started
-    → exec_result_meta → run_finished)+ 一份真实 outputs 产物。"""
+    → exec_result_meta → [extra] → run_finished)+ 一份真实 outputs 产物。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 允许子目录形态(如 sub/)
     scope_file = tmp_path / "lab.scope"
     scope_file.write_text(SCOPE_TEXT, encoding="utf-8")
     engagement = Engagement.create(
@@ -139,6 +144,8 @@ def _engagement_with_terminal_run(
             "total_bytes": len(payload),
         },
     )
+    for kind, extra_payload in extra_before_finish or []:
+        audit.append(kind, extra_payload)
     audit.append(
         "run_finished",
         {
@@ -401,3 +408,504 @@ def test_write_manifest_none_without_terminal_run(tmp_path):
     assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
     engagement.close()
 
+
+
+# ---------------------------------------------------------------------------
+# R09-B:只读 verify(四维判定 / AC04 不改数据 / AC07 双渲染同源)
+# ---------------------------------------------------------------------------
+
+from foam.state.index import Index  # noqa: E402  # 装配用(非被测只读面)
+from foam.tools.bash import JobExitEvent  # noqa: E402  # 合成终态事件
+
+
+def _pass_fixture(tmp_path: Path) -> Engagement:
+    """全过形态:终态链(含 session_op,会话覆盖 tracked)+ manifest 已生成。"""
+    from foam.evidence import write_manifest
+
+    engagement = _engagement_with_terminal_run(
+        tmp_path,
+        run_id="pass01",
+        extra_before_finish=[
+            (
+                "session_op",
+                {
+                    "op_id": "op01",
+                    "run_id": "pass01",
+                    "call_id": "tc-s",
+                    "op": "session_list",
+                    "outcome": "ok",
+                    "duration_ms": 1,
+                    "ended_at": FIXED_NOW,
+                    "session_id": None,
+                    "count": 0,
+                },
+            )
+        ],
+    )
+    assert write_manifest(engagement.paths.root, generated_at=FIXED_NOW) is not None
+    return engagement
+
+
+def test_verify_healthy_engagement_pass(tmp_path):
+    """全过形态:四维全 pass,总判定 pass。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    result = verify_engagement(engagement.paths.root)
+    for name in ("chain", "files", "references", "coverage"):
+        dim = result.dimensions[name]
+        assert dim.status == "pass", f"{name}: {dim.status} {dim.summary}"
+    assert result.overall == "pass"
+    assert result.engagement_id == "ev-eng"
+    engagement.close()
+
+
+def _tree_snapshot(root: Path) -> dict:
+    """目录树快照:相对路径 → (内容 sha256, st_mode/mtime/ctime/size/ino)。
+
+    st_atime 故意不在对比面——内容核验必须读文件,读即可能更新 atime
+    (relatime),属核验语义固有(R09.md §7 决策 5 注记);其余元数据逐项钉死。
+    """
+    snap = {}
+    for path in sorted(root.rglob("*")):
+        rel = str(path.relative_to(root))
+        st = path.lstat()
+        entry = {
+            "mode": stat.S_IMODE(st.st_mode),
+            "mtime_ns": st.st_mtime_ns,
+            "ctime_ns": st.st_ctime_ns,
+            "size": st.st_size,
+            "ino": st.st_ino,
+        }
+        if path.is_file() and not path.is_symlink():
+            entry["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        snap[rel] = entry
+    return snap
+
+
+def test_verify_read_only(tmp_path):
+    """AC04:verify 不改被检查数据——完整 engagement 核验前后目录树
+    (文件清单 + 内容 hash + stat 元数据)零差异;无 journal/wal/bak/lock
+    新增,不补造 evidence。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    root = engagement.paths.root
+    engagement.close()
+    # 再配一份 loot 登记(登记时快照)与 evidence_refs,让 verify 真读真算
+    (root / "loot" / "dump.bin").write_bytes(b"TESTONLY loot v1")
+    with Index(root / "index.sqlite") as index:
+        index.add_loot(
+            "loot/dump.bin",
+            kind="dump",
+            size_bytes=16,
+            sha256=hashlib.sha256(b"TESTONLY loot v1").hexdigest(),
+        )
+        index.add_vuln(
+            "192.0.2.10", "config", "TESTONLY 发现",
+            evidence_refs=["outputs/job01.log"],
+        )
+
+    before = _tree_snapshot(root)
+    result = verify_engagement(root)
+    after = _tree_snapshot(root)
+
+    assert result.overall == "pass"  # 核验本身有效(不是空转)
+    assert before == after, (
+        "verify 改动了被检查目录:"
+        f"{[k for k in set(before) | set(after) if before.get(k) != after.get(k)]}"
+    )
+    names = set(before)
+    assert not any(
+        n.endswith(("-journal", "-wal", "-shm")) or ".bak" in n for n in names
+    )
+    assert "engagement.lock" not in names  # 未取锁、未建锁文件
+
+
+def test_verify_locates_deleted_file(tmp_path):
+    """AC01:删除已记录产物 → files fail 并定位;chain 不受影响(AC05 独立)。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    (engagement.paths.outputs / "job01.log").unlink()
+    result = verify_engagement(engagement.paths.root)
+    files = result.dimensions["files"]
+    assert files.status == "fail"
+    assert any(
+        f.status == "fail" and f.subject == "outputs/job01.log" and "已删除" in f.detail
+        for f in files.findings
+    )
+    assert result.dimensions["chain"].status == "pass"  # 维度独立
+    assert result.overall == "fail"
+    engagement.close()
+
+
+def test_verify_locates_tampered_file(tmp_path):
+    """AC01:篡改已记录产物(改字节)→ files fail 定位,登记/现值 hash 分列;
+    manifest 侧同样检出(manifest 时点快照对照)。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    target = engagement.paths.outputs / "job01.log"
+    target.write_bytes(b"TESTONLY tampered bytes\n")  # 改内容
+    result = verify_engagement(engagement.paths.root)
+    files = result.dimensions["files"]
+    assert files.status == "fail"
+    hits = [
+        f for f in files.findings
+        if f.status == "fail" and f.subject == "outputs/job01.log"
+        and "hash 不符" in f.detail
+    ]
+    assert hits, files.findings
+    assert "登记" in hits[0].detail and "现值" in hits[0].detail
+    assert result.overall == "fail"
+    engagement.close()
+
+
+def test_verify_escape_reference_located_not_judged(tmp_path):
+    """逃逸引用(绝对/界外路径)逐条定位标 unknown,不打开不跟随、不判罚
+    (解析器界外 provenance 属已知合法形态)。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    outside = tmp_path / "outside.csv"
+    outside.write_text("TESTONLY,csv", encoding="utf-8")
+    with Index(engagement.paths.index_db) as index:
+        # 索引层不校验路径形态(校验在工具层);解析器界外登记由此形态入库
+        index.add_vuln(
+            "192.0.2.10", "config", "界外证据",
+            evidence_refs=[str(outside)],
+        )
+    result = verify_engagement(engagement.paths.root)
+    refs = result.dimensions["references"]
+    assert refs.status == "unknown"
+    assert any(
+        f.status == "unknown" and str(outside) in f.subject and "不跟随" in f.detail
+        for f in refs.findings
+    )
+    assert result.dimensions["files"].status == "pass"  # 界外引用不进产物判罚
+    assert result.overall == "unknown"  # unknown 不升格为 fail
+    engagement.close()
+
+
+#: v2(schema v2)DDL 冻结副本(与 test_state._LEGACY_V2_DDL 同文本,
+#: 本文件自包含):verify 对 v2 旧库的 legacy/unknown 降级用。
+_LEGACY_V2_DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hosts (
+    id INTEGER PRIMARY KEY,
+    ip TEXT NOT NULL UNIQUE,
+    hostname TEXT,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS creds (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    username TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    source TEXT,
+    sensitive INTEGER NOT NULL DEFAULT 1,
+    first_seen TEXT NOT NULL,
+    UNIQUE (host_id, username, secret)
+);
+CREATE TABLE IF NOT EXISTS vulns (
+    id INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id),
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    evidence_path TEXT,
+    confidence TEXT,
+    first_seen TEXT NOT NULL,
+    UNIQUE (host_id, kind, title)
+);
+CREATE TABLE IF NOT EXISTS loot (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    kind TEXT,
+    note TEXT,
+    size_bytes INTEGER,
+    ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS job_events (
+    event_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    run_id TEXT,
+    reason TEXT,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    duration_ms INTEGER,
+    ended_at TEXT,
+    command TEXT,
+    output_refs TEXT,
+    parse_tool TEXT,
+    parse_stats TEXT,
+    consumed_at TEXT,
+    audit_seq INTEGER
+);
+"""
+
+
+def test_verify_legacy_v2_db_unknown_not_crash(tmp_path):
+    """AC03:v2 旧库(无 loot.sha256 / 无 evidence_refs 列)→ 对应来源维度
+    unknown 并标注 legacy;verify 不炸、不迁移、不写库(AC04 同覆盖)。"""
+    from foam.evidence import verify_engagement, write_manifest
+
+    engagement = _engagement_with_terminal_run(tmp_path, run_id="legacy02")
+    root = engagement.paths.root
+    # 把索引库替换成手写 v2 旧库(含一行旧 loot)
+    db = root / "index.sqlite"
+    db.unlink()
+    conn = sqlite3.connect(db)
+    conn.executescript(_LEGACY_V2_DDL)
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '2')")
+    conn.execute(
+        "INSERT INTO loot(path, kind, note, size_bytes, ts) "
+        "VALUES ('loot/old.bin', 'dump', NULL, 3, '2026-10-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    # 旧 loot 行指向的文件真实存在(否则构成「已删除」fail,不是本例焦点)
+    (root / "loot" / "old.bin").write_bytes(b"old")
+    write_manifest(root, generated_at=FIXED_NOW)  # manifest 在,聚焦库内降级
+    before = db.read_bytes()
+
+    result = verify_engagement(root)
+    assert result.dimensions["references"].status == "unknown"
+    assert "legacy" in result.dimensions["references"].summary
+    files = result.dimensions["files"]
+    assert files.status == "unknown"  # loot 无登记快照列
+    assert any("低于 v4" in f.detail for f in files.findings)
+    assert not any(f.status == "fail" for f in files.findings)
+    assert result.overall == "unknown"
+    assert db.read_bytes() == before  # 只读:库字节不变、未迁移
+    engagement.close()
+
+
+def test_verify_running_engagement_pending(tmp_path):
+    """AC02:运行中形态(run_started 无配对 run_finished + meta active)→
+    coverage/files pending,总判定 pending;不试取锁、不误判 fail。"""
+    from foam.evidence import verify_engagement
+
+    scope_file = tmp_path / "lab.scope"
+    scope_file.write_text(SCOPE_TEXT, encoding="utf-8")
+    engagement = Engagement.create(
+        tmp_path / "engagements",
+        "运行中",
+        scope_path=scope_file,
+        engagement_id="live-eng",
+    )
+    root = engagement.paths.root
+    out = engagement.paths.outputs / "live01.log"
+    payload = b"TESTONLY live output\n"
+    out.write_bytes(payload)
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    audit.append(
+        KIND_SCOPE_LOADED, scope_payload(parse_scope(SCOPE_TEXT), str(scope_file))
+    )
+    audit.append(
+        "run_started",
+        {
+            "objective": "运行中",
+            "provider": "fake",
+            "workdir": str(root),
+            "run_id": "live01",
+        },
+    )
+    audit.append(
+        "exec_result_meta",
+        {
+            "job_id": "live01",
+            "status": "completed",
+            "exit_code": 0,
+            "duration_ms": 5,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "output_path": str(out),
+            "total_bytes": len(payload),
+        },
+    )
+    audit.close()
+
+    result = verify_engagement(root)
+    assert result.dimensions["coverage"].status == "pending"
+    assert any(
+        f.status == "pending" and "无配对" in f.detail
+        for f in result.dimensions["coverage"].findings
+    )
+    files = result.dimensions["files"]
+    assert files.status == "pending"  # 未终态 run 的产物:证据未收敛
+    assert any(f.status == "pending" for f in files.findings)
+    assert result.dimensions["chain"].status == "pass"  # 链本身完整
+    assert result.overall == "pending"
+    engagement.close()
+
+
+def test_verify_pending_job_events_shown(tmp_path):
+    """job_events 的 drain 未消费占位行在 coverage 维显示 pending 并点名。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    root = engagement.paths.root
+    pending_log = root / "outputs" / "pend09.log"
+    pending_log.write_bytes(b"TESTONLY pending out\n")
+    event = JobExitEvent(
+        event_id="job_exit:pend09",
+        run_id="pass01",
+        job_id="pend09",
+        command="echo TESTONLY-pending",
+        reason="completed",
+        exit_code=0,
+        duration_ms=3,
+        ended_at=FIXED_NOW,
+        output_path=str(pending_log),
+        sha256=hashlib.sha256(b"TESTONLY pending out\n").hexdigest(),
+        stdout_path=None,
+        stdout_sha256=None,
+        stderr_path=None,
+        stderr_sha256=None,
+        total_bytes=21,
+        total_lines=1,
+    )
+    with Index(root / "index.sqlite") as index:
+        assert index.register_job_exit_pending(event) is True
+
+    result = verify_engagement(root)
+    coverage = result.dimensions["coverage"]
+    assert coverage.status == "pending"
+    assert any(
+        f.status == "pending" and "pend09" in f.detail
+        for f in coverage.findings
+    )
+    # pending 行的产物 hash 已终态:files 维仍按记录核验(一致,不拖累)
+    assert result.dimensions["files"].status == "pass"
+    assert result.overall == "pending"
+    engagement.close()
+
+
+def test_verify_missing_manifest_unknown(tmp_path):
+    """AC03:终态 run 无 manifest(旧 run 不补造)→ coverage unknown/legacy,
+    不谎称已核验。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _engagement_with_terminal_run(tmp_path, run_id="nomani01")
+    result = verify_engagement(engagement.paths.root)
+    coverage = result.dimensions["coverage"]
+    assert coverage.status == "unknown"
+    assert any("manifest" in f.subject for f in coverage.findings)
+    assert result.overall == "unknown"
+    engagement.close()
+
+
+def test_verify_chain_broken_dims_independent(tmp_path):
+    """AC05:链篡改 → chain fail 并定位断点;files 维照常独立判定(pass)。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    root = engagement.paths.root
+    audit_path = root / "audit.jsonl"
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    target = next(i for i, line in enumerate(lines) if '"run_started"' in line)
+    lines[target] = lines[target].replace("证据测试", "侦察他机")  # 等长篡改
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    from foam.guard.audit import verify as chain_verify
+
+    assert not chain_verify(audit_path)  # 先证「真篡改了」(陷阱 14)
+
+    result = verify_engagement(root)
+    chain = result.dimensions["chain"]
+    assert chain.status == "fail"
+    assert any("run_started" in f.detail or "hash" in f.detail for f in chain.findings)
+    assert result.dimensions["files"].status == "pass"  # 维度独立(AC05)
+    assert result.overall == "fail"
+    engagement.close()
+
+
+def test_verify_missing_index_degrades_unknown(tmp_path):
+    """索引库缺失:链上产物照样核验,库来源维度 unknown 降级,不炸。"""
+    from foam.evidence import verify_engagement, write_manifest
+
+    engagement = _engagement_with_terminal_run(tmp_path, run_id="noidx01")
+    write_manifest(engagement.paths.root, generated_at=FIXED_NOW)
+    (engagement.paths.root / "index.sqlite").unlink()
+
+    result = verify_engagement(engagement.paths.root)
+    assert result.dimensions["chain"].status == "pass"
+    assert result.dimensions["references"].status == "unknown"
+    assert "索引库" in result.dimensions["references"].summary
+    assert result.dimensions["coverage"].status == "unknown"
+    files = result.dimensions["files"]
+    # 链来源的产物仍核验一致(无 fail);loot 快照维度因库缺失不可知 →
+    # unknown(证据不足如实降级,不谎称「全核验通过」)
+    assert files.status == "unknown"
+    assert not any(f.status == "fail" for f in files.findings)
+    assert any("索引库" in f.detail for f in files.findings)
+    assert result.overall == "unknown"
+    engagement.close()
+
+
+def test_verify_json_human_same_source(tmp_path):
+    """AC07:同一 VerifyResult 的 JSON 与人读渲染关键字段逐一一致。"""
+    from foam.evidence import render_human, result_to_dict, verify_engagement
+
+    engagement = _pass_fixture(tmp_path)
+    # 制造 fail(files)+ unknown(界外引用)混合,覆盖多状态渲染
+    (engagement.paths.outputs / "job01.log").write_bytes(b"TESTONLY tampered\n")
+    outside = tmp_path / "outside.csv"
+    outside.write_text("TESTONLY,csv", encoding="utf-8")
+    with Index(engagement.paths.index_db) as index:
+        index.add_vuln(
+            "192.0.2.10", "config", "界外证据", evidence_refs=[str(outside)]
+        )
+    result = verify_engagement(engagement.paths.root)
+    data = result_to_dict(result)
+    human = render_human(result)
+
+    assert data["overall"] == result.overall == "fail"
+    for name in ("chain", "files", "references", "coverage"):
+        dim = result.dimensions[name]
+        assert data["dimensions"][name]["status"] == dim.status
+        assert f"[{name}] {dim.status}" in human
+        assert data["dimensions"][name]["summary"] == dim.summary
+        assert len(data["dimensions"][name]["findings"]) == len(dim.findings)
+        for finding in dim.findings:
+            assert finding.subject in human
+            assert finding.detail in human
+    assert data["external_anchor"] == "none"
+    assert "未外部锚定" in human and "未外部锚定" in data["external_anchor_note"]
+    engagement.close()
+
+
+def test_cli_verify_human_default_and_json(tmp_path, capsys):
+    """verify 子命令:默认人读上 stdout;--json 上 stdout 且可整段解析。"""
+    engagement = _pass_fixture(tmp_path)
+    rc = cli_main(["verify", str(engagement.paths.root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[chain] pass" in out
+    assert "[files] pass" in out
+    assert "总判定:pass" in out
+    assert "未外部锚定" in out
+
+    rc = cli_main(["verify", str(engagement.paths.root), "--json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)  # stdout 可整段解析为 JSON
+    assert data["overall"] == "pass"
+    assert data["dimensions"]["chain"]["status"] == "pass"
+    engagement.close()
+
+
+def test_cli_verify_json_unpolluted_by_dotenv(tmp_path, capsys, monkeypatch):
+    """[config] .env 注入注记对 verify 改道 stderr:--json stdout 保持纯 JSON。"""
+    engagement = _pass_fixture(tmp_path / "sub")
+    (tmp_path / ".env").write_text("FOAM_TESTONLY_INJ=1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    rc = cli_main(["verify", str(engagement.paths.root), "--json"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)  # 纯 JSON(无 [config] 行污染)
+    assert data["overall"] == "pass"
+    assert "[config]" in captured.err  # 注记改道 stderr
+    engagement.close()

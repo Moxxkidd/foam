@@ -130,6 +130,7 @@ from foam.config import (
     sanitize_url,
     validate_profile_name,
 )
+from foam.evidence import render_human, result_to_dict, verify_engagement
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_LOADED, AuditLog
 from foam.guard.scope import GuardDecision, Scope, parse_scope, scope_payload
 from foam.replay import (
@@ -169,6 +170,9 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_KILLED = 130
+#: R09(verify,决策 1 冻结):证据不足或运行未完成(无 fail 但存在
+#: unknown/pending)。fail → EXIT_ERROR;run/resume/replay/report 不变。
+EXIT_UNKNOWN = 3
 
 #: resume 注入简报的「最近 N 轮」默认值。
 DEFAULT_RECENT_ROUNDS = 5
@@ -376,6 +380,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--redact",
         action="store_true",
         help="凭证节脱敏(secret 全掩;注意:其余章节未脱敏);默认全值(红线,注意去向)",
+    )
+
+    verify = sub.add_parser(
+        "verify",
+        help="只读核验 engagement 证据完整性(审计链/产物 hash/证据引用/覆盖)",
+        description="只读核验(R09):chain/files/references/coverage 四维独立判定"
+        "(pass/fail/unknown/pending);不开写连接、不取锁、不创建文件、不执行"
+        "旧命令、不跟随目录外引用。退出码:0=全部通过且无未知项,1=已确认不"
+        "一致,2=输入/使用错误,3=证据不足或运行未完成。本地哈希链仅供篡改"
+        "检测,未外部锚定,不构成外部不可抵赖。",
+    )
+    verify.add_argument("engagement_dir", help="engagement 目录路径")
+    verify.add_argument(
+        "--json",
+        action="store_true",
+        help="机读 JSON 输出(stdout 仅承载 JSON;[config] 注记改道 stderr)",
     )
 
     tui = sub.add_parser(
@@ -1244,7 +1264,7 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
 
 
 # ---------------------------------------------------------------------------
-# replay / report / tui
+# replay / report / verify / tui
 # ---------------------------------------------------------------------------
 
 
@@ -1276,6 +1296,35 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     for line in format_timeline(records):
         print(line)
     return EXIT_OK
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """R09:只读核验 engagement 证据完整性(chain/files/references/coverage)。
+
+    退出码(决策 1 冻结):0=全部通过且无未知项;1=已确认不一致;
+    2=输入/使用错误(目录不存在/非 engagement);3=证据不足或运行未完成
+    (无 fail 但存在 unknown/pending)。人读默认 stdout,--json 上 stdout
+    (同一 VerifyResult 两种渲染,AC07);错误一律 stderr。
+    """
+    root = Path(args.engagement_dir)
+    if not root.is_dir():
+        print(f"[错误] engagement 目录不存在:{root}", file=sys.stderr)
+        return EXIT_USAGE
+    if not (root / "engagement.json").is_file() and not (
+        root / "audit.jsonl"
+    ).is_file():
+        print(
+            f"[错误] {root} 不是 engagement 目录"
+            "(缺 engagement.json 与 audit.jsonl)",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    result = verify_engagement(root)
+    if args.json:
+        print(json.dumps(result_to_dict(result), ensure_ascii=False, indent=2))
+    else:
+        print(render_human(result), end="")
+    return {"pass": EXIT_OK, "fail": EXIT_ERROR}.get(result.overall, EXIT_UNKNOWN)
 
 
 def _atomic_write_report(out_path: Path, text: str) -> None:
@@ -1378,12 +1427,15 @@ def main(
     args = parser.parse_args(argv)
     # P1-1:只读加载 ./.env(永不写它,红线)。只上屏键名,值绝不上屏;
     # 畸形行中文警告(带行号)走 stderr;文件不存在静默。
+    # R09(决策 7):verify 的 stdout 预留给核验结果(--json 时必须是纯
+    # JSON),[config] 注入注记对 verify 改道 stderr;其余命令形态不变。
     injected, dotenv_warnings = load_dotenv(Path.cwd() / ".env")
     for warning in dotenv_warnings:
         print(f"[config] .env {warning}", file=sys.stderr)
     if injected:
         print(
             f"[config] .env 注入 {len(injected)} 个变量:{', '.join(injected)}",
+            file=sys.stderr if args.command == "verify" else sys.stdout,
             flush=True,
         )
     factory = backend_factory or _build_backend
@@ -1398,6 +1450,8 @@ def main(
         return _cmd_replay(args)
     if args.command == "report":
         return _cmd_report(args)
+    if args.command == "verify":
+        return _cmd_verify(args)
     if args.command == "tui":
         return _cmd_tui(args)
     parser.print_help()

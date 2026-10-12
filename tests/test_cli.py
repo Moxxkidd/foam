@@ -427,6 +427,7 @@ def test_help_all_subcommands(capsys):
         ["resume", "--help"],
         ["replay", "--help"],
         ["report", "--help"],
+        ["verify", "--help"],  # R09-B:verify 子命令
         ["tui", "--help"],
     ):
         with pytest.raises(SystemExit) as excinfo:
@@ -1449,3 +1450,36 @@ def test_report_redact_flag_masks_secrets(tmp_path, capsys):
     rc = cli_main(["report", str(engagement.paths.root), "--out", str(out_full)])
     assert rc == 0
     assert "TESTONLY-RedactSecret" in out_full.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# R09-C:verify 退出码输入面 + evidence/ 布局兼容(偏差 1 钉死)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_usage_errors_rc2(tmp_path, capsys):
+    """verify 输入错误归 rc 2:目录不存在 / 目录非 engagement。"""
+    rc = cli_main(["verify", str(tmp_path / "nope")])
+    assert rc == 2
+    assert "不存在" in capsys.readouterr().err
+
+    plain = tmp_path / "plain"
+    plain.mkdir()  # 空目录:非 engagement(无 engagement.json/audit.jsonl)
+    rc = cli_main(["verify", str(plain)])
+    assert rc == 2
+    assert "不是 engagement 目录" in capsys.readouterr().err
+
+
+def test_resume_legacy_engagement_without_evidence_dir(tmp_path):
+    """R09 偏差 1 钉死:evidence/ 不入 LAYOUT——pre-R09 旧目录(无
+    evidence/)的 resume 不被 validate「缺失目录」误拒。"""
+    import shutil
+
+    rc, workdir = run_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0
+    shutil.rmtree(workdir / "evidence")  # 模拟 pre-R09 旧目录形态
+    rc = cli_main(
+        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+    )
+    assert rc == 0
+    assert verify(workdir / "audit.jsonl")

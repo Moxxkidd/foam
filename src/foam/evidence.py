@@ -22,6 +22,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ from urllib.parse import quote
 
 from foam.agent.loop import KIND_RUN_FINISHED, KIND_RUN_STARTED
 from foam.guard.audit import KIND_EXEC_RESULT_META, KIND_KILL_SWITCH
-from foam.replay import chain_errors, read_records
+from foam.replay import chain_errors, read_records, session_coverage
 from foam.state.files import EngagementPaths
 
 #: manifest JSON 的格式版本(结构演进时递增)。
@@ -63,8 +64,9 @@ def _sha256_file(path: Path) -> str:
 def _open_index_ro(db_path: Path) -> sqlite3.Connection | None:
     """``mode=ro`` URI 只读连接:无 journal、无迁移、无 chmod。
 
-    库缺失/无法只读打开(如热日志待回滚)返回 None——调用方按「该来源
-    不可用」降级(unknown),不炸。
+    库缺失/无法只读打开返回 None——调用方按「该来源不可用」降级
+    (unknown),不炸。连接后做一次 meta 探针读:崩溃残留热日志(-journal)
+    在只读模式下无法回滚,首个读才报错,探针把这种形态一并归入「不可用」。
     """
     if not db_path.is_file():
         return None
@@ -72,6 +74,7 @@ def _open_index_ro(db_path: Path) -> sqlite3.Connection | None:
         conn = sqlite3.connect(
             f"file:{quote(str(db_path))}?mode=ro", uri=True
         )
+        conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     except sqlite3.Error:
         return None
     conn.row_factory = sqlite3.Row
@@ -650,3 +653,629 @@ def write_manifest(
     _atomic_write_secret(md_path, render_summary_md(manifest))
     return json_path, md_path
 
+
+
+# ---------------------------------------------------------------------------
+# 只读核验(``foam verify``;R09-B)
+# ---------------------------------------------------------------------------
+
+#: 维度状态词表(决策 1):pass/fail/unknown/pending。
+STATUSES = frozenset({"pass", "fail", "unknown", "pending"})
+#: 维度名固定四键(AC05:各自独立判定)。
+DIMENSIONS = ("chain", "files", "references", "coverage")
+
+#: findings 人读渲染的状态符号。
+_STATUS_MARK = {"pass": "✓", "fail": "✗", "unknown": "?", "pending": "…"}
+
+
+@dataclass(frozen=True)
+class Finding:
+    """一条定位明细:状态 + 定位对象(路径/引用/记录)+ 说明。"""
+
+    status: str
+    subject: str
+    detail: str
+
+
+@dataclass
+class DimensionResult:
+    """一个维度的判定:总状态 + 一句话摘要 + 定位明细 + 机读附加数据。"""
+
+    status: str = "pass"
+    summary: str = ""
+    findings: list[Finding] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class VerifyResult:
+    """verify 的四维结果与总判定;人读渲染与 JSON 渲染共用同一对象(AC07)。"""
+
+    root: str
+    engagement_id: str | None
+    generated_at: str
+    dimensions: dict[str, DimensionResult]
+    overall: str  # pass/fail/unknown/pending(fail > pending > unknown > pass)
+
+
+def _worst(dimensions: dict[str, DimensionResult]) -> str:
+    """总判定:任一 fail → fail;否则任一 pending → pending;否则任一
+    unknown → unknown;全 pass 才 pass(决策 1:fail 优先于 unknown)。"""
+    statuses = {dim.status for dim in dimensions.values()}
+    for status in ("fail", "pending", "unknown"):
+        if status in statuses:
+            return status
+    return "pass"
+
+
+def _decode_refs(raw: Any) -> list[str]:
+    """evidence_refs 列(JSON 数组串)解码;空值归 [],坏值原样单条保留
+    (不丢不臆造——与 replay._decode_evidence_refs 同语义;两处各自实现,
+    口径变更须同步)。"""
+    if not raw:
+        return []
+    try:
+        refs = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return [str(raw)]
+    if not isinstance(refs, list):
+        return [str(raw)]
+    return [str(ref) for ref in refs]
+
+
+def _verify_chain(paths: EngagementPaths) -> tuple[DimensionResult, list[dict]]:
+    """chain 维:哈希链完整性 + 断点定位;返回 (维度结果, 记录列表)。"""
+    dim = DimensionResult()
+    if not paths.audit_jsonl.is_file():
+        dim.status = "fail"
+        dim.summary = "audit.jsonl 缺失"
+        dim.findings.append(
+            Finding("fail", "audit.jsonl", "审计链文件缺失(engagement 必有)")
+        )
+        return dim, []
+    problems = chain_errors(paths.audit_jsonl)
+    records, read_error = _read_records_tolerant(paths)
+    if problems:
+        dim.status = "fail"
+        dim.summary = f"审计链校验未通过({len(problems)} 处)"
+        for problem in problems:
+            dim.findings.append(Finding("fail", "audit.jsonl", problem))
+        return dim, records
+    dim.status = "pass"
+    head = records[-1] if records else {}
+    dim.summary = (
+        f"审计链完整({len(records)} 条记录,头 hash {_short(head.get('hash'))})"
+    )
+    dim.extra = {
+        "records": len(records),
+        "head_seq": head.get("seq"),
+        "head_hash": head.get("hash"),
+    }
+    if read_error is not None:
+        dim.findings.append(Finding("unknown", "audit.jsonl", read_error))
+    return dim, records
+
+
+def _verify_files(
+    root: Path,
+    records: list[dict[str, Any]],
+    conn: sqlite3.Connection | None,
+    open_runs: list[tuple[int, str | None]],
+) -> DimensionResult:
+    """files 维:有记录产物逐一重算 sha256 对照;删除/篡改分别定位。
+
+    - 无登记 hash(旧 loot 行 NULL 等)→ unknown;
+    - 未终态 run(链尾 run_started 无配对)期间记录的产物 → pending;
+    - 盘上存在但无任何记录(outputs//loot/ 扫描)→ unknown(不 fail);
+    - 界外/不可归一记录 → unknown,不打开不跟随(不判罚)。
+    """
+    dim = DimensionResult()
+    findings: list[Finding] = []
+    # rel → [(source, ref_id, recorded_sha256, in_open_run)]
+    recorded: dict[str, list[tuple[str, str, str | None, bool]]] = {}
+    open_since = min((seq for seq, _rid in open_runs), default=None)
+    open_run_ids = {rid for _seq, rid in open_runs if rid}
+
+    def add(
+        recorded_path: str | None,
+        sha256: str | None,
+        source: str,
+        ref_id: str,
+        in_open_run: bool,
+    ) -> None:
+        if not recorded_path:
+            return
+        located = _relocate(root, recorded_path)
+        if located is None:
+            findings.append(
+                Finding(
+                    "unknown",
+                    recorded_path,
+                    f"{source} {ref_id} 记录的路径在 engagement 界外/不可归一,"
+                    "不跟随不判罚",
+                )
+            )
+            return
+        rel, _abs = located
+        recorded.setdefault(rel, []).append(
+            (source, ref_id, sha256, in_open_run)
+        )
+
+    for rec in records:
+        if rec.get("kind") != KIND_EXEC_RESULT_META:
+            continue
+        payload = rec.get("payload") or {}
+        seq = rec.get("seq") or 0
+        add(
+            payload.get("output_path"),
+            payload.get("sha256"),
+            "exec_result_meta",
+            f"audit seq {seq}",
+            open_since is not None and seq >= open_since,
+        )
+
+    if conn is not None and _table_columns(conn, "job_events"):
+        for row in _query_dicts(
+            conn,
+            "SELECT event_id, run_id, status, output_refs FROM job_events "
+            "ORDER BY event_id",
+        ):
+            try:
+                refs = json.loads(row["output_refs"] or "{}")
+            except json.JSONDecodeError:
+                refs = {}
+            in_open = bool(row.get("run_id")) and row["run_id"] in open_run_ids
+            for path_key, sha_key in (
+                ("output_path", "sha256"),
+                ("stdout_path", "stdout_sha256"),
+                ("stderr_path", "stderr_sha256"),
+            ):
+                if refs.get(path_key):
+                    add(
+                        refs[path_key],
+                        refs.get(sha_key),
+                        "job_events",
+                        str(row["event_id"]),
+                        in_open,
+                    )
+
+    if conn is None:
+        findings.append(
+            Finding(
+                "unknown",
+                "index.sqlite",
+                "索引库缺失/无法只读打开,loot 登记快照无从核验",
+            )
+        )
+    elif not _table_columns(conn, "loot"):
+        findings.append(
+            Finding("unknown", "loot", "索引库缺 loot 表(legacy),无法核验")
+        )
+    else:
+        loot_has_hash = "sha256" in _table_columns(conn, "loot")
+        if not loot_has_hash:
+            findings.append(
+                Finding(
+                    "unknown",
+                    "loot.sha256",
+                    "索引库 schema 低于 v4(legacy),loot 无登记快照列",
+                )
+            )
+        for row in _query_dicts(conn, "SELECT * FROM loot ORDER BY path"):
+            registered = row.get("sha256") if loot_has_hash else None
+            add(row.get("path"), registered, "loot", f"loot/{row.get('id')}", False)
+
+    # manifest 里记录的产物(manifest 时点快照;同一文件多个 manifest 按
+    # generated_at 取最新——转录合法增长会产生新 manifest)
+    evidence_dir = root / "evidence"
+    manifests: list[dict[str, Any]] = []
+    if evidence_dir.is_dir():
+        for path in sorted(evidence_dir.glob("manifest-*.json")):
+            try:
+                manifests.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError) as exc:
+                findings.append(
+                    Finding("unknown", path.name, f"manifest 解析失败:{exc}")
+                )
+    manifests.sort(key=lambda m: str(m.get("generated_at") or ""))
+    for manifest in manifests:
+        for item in manifest.get("artifacts") or []:
+            located = _relocate(root, str(item.get("path") or ""))
+            if located is not None and item.get("sha256"):
+                recorded.setdefault(located[0], []).append(
+                    (
+                        "manifest",
+                        f"manifest:{manifest.get('run_id')}",
+                        item["sha256"],
+                        False,
+                    )
+                )
+
+    # 逐文件核验(每文件重算一次 sha256,各来源登记值分别对照)
+    checked = mismatch = missing = unknown_claims = 0
+    for rel in sorted(recorded):
+        claims = recorded[rel]
+        located = _relocate(root, rel)
+        if located is None:  # 防御:add 已归一,理论不可达
+            continue
+        _rel, abs_path = located
+        if not abs_path.is_file():
+            missing += 1
+            sources = ", ".join(f"{s} {r}" for s, r, _h, _o in claims)
+            findings.append(
+                Finding("fail", rel, f"文件已删除(记录来源:{sources})")
+            )
+            continue
+        try:
+            current = _sha256_file(abs_path)
+        except OSError as exc:
+            unknown_claims += 1
+            findings.append(Finding("unknown", rel, f"读取失败:{exc}"))
+            continue
+        has_hash_claim = False
+        for source, ref_id, recorded_sha, in_open_run in claims:
+            if not recorded_sha:
+                unknown_claims += 1
+                findings.append(
+                    Finding(
+                        "unknown",
+                        rel,
+                        f"{source} {ref_id} 无登记 hash(旧行/运行中记录),"
+                        "无法对照",
+                    )
+                )
+                continue
+            has_hash_claim = True
+            if recorded_sha != current:
+                mismatch += 1
+                findings.append(
+                    Finding(
+                        "fail",
+                        rel,
+                        f"hash 不符({source} {ref_id} 登记 "
+                        f"{_short(recorded_sha)} ≠ 现值 {_short(current)})",
+                    )
+                )
+            elif in_open_run:
+                findings.append(
+                    Finding(
+                        "pending",
+                        rel,
+                        f"{source} {ref_id} 属未终态 run,证据未收敛"
+                        "(当前 hash 一致)",
+                    )
+                )
+        if has_hash_claim:
+            checked += 1
+
+    # 盘上存在但无任何记录的文件(outputs//loot/ 扫描)——unknown,不判罚
+    unrecorded: list[str] = []
+    for sub in ("outputs", "loot"):
+        base = root / sub
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            rel = str(path.relative_to(root))
+            if rel not in recorded:
+                unrecorded.append(rel)
+    for rel in unrecorded:
+        findings.append(
+            Finding("unknown", rel, "盘上存在但无任何记录(未登记产物)")
+        )
+
+    if open_runs:
+        findings.append(
+            Finding(
+                "pending",
+                "run",
+                "存在未终态 run(run_started seq "
+                + ",".join(str(seq) for seq, _rid in open_runs)
+                + " 无配对 run_finished),产物证据未收敛",
+            )
+        )
+
+    fail_count = sum(1 for f in findings if f.status == "fail")
+    pending_count = sum(1 for f in findings if f.status == "pending")
+    unknown_count = sum(1 for f in findings if f.status == "unknown")
+    if fail_count:
+        dim.status = "fail"
+    elif pending_count:
+        dim.status = "pending"
+    elif unknown_count:
+        dim.status = "unknown"
+    else:
+        dim.status = "pass"
+    dim.summary = (
+        f"产物核验:一致 {checked - mismatch} / 不一致 {mismatch} / "
+        f"缺失 {missing} / 无登记或不可核验 {unknown_count}"
+        + (f" / 未收口 {pending_count}" if pending_count else "")
+    )
+    dim.findings = findings
+    dim.extra = {
+        "checked": checked,
+        "mismatch": mismatch,
+        "missing": missing,
+        "unknown": unknown_count,
+        "unrecorded_on_disk": unrecorded,
+    }
+    return dim
+
+
+def _verify_references(
+    root: Path, conn: sqlite3.Connection | None
+) -> DimensionResult:
+    """references 维:evidence_refs 逐条——界内查存在性;界外/绝对路径
+    不打开不跟随,标 unknown 并逐条定位(不判罚:解析器界外 provenance
+    属已知合法形态,决策 6;不核验内容,无登记 hash 可对照)。"""
+    dim = DimensionResult()
+    findings: list[Finding] = []
+    if conn is None:
+        dim.status = "unknown"
+        dim.summary = "索引库不可用(缺失/无法只读打开),证据引用无从核验"
+        return dim
+    has_refs_col = any(
+        "evidence_refs" in _table_columns(conn, table)
+        for table in ("vulns", "creds")
+    )
+    if not has_refs_col:
+        dim.status = "unknown"
+        dim.summary = "索引库 schema 低于 v3(legacy),无证据引用列"
+        return dim
+    total = passed = failed = external = 0
+    for table in ("vulns", "creds"):
+        if "evidence_refs" not in _table_columns(conn, table):
+            continue
+        for row in _query_dicts(
+            conn,
+            f"SELECT id, evidence_refs FROM {table} "  # noqa: S608  # 表名为本模块常量
+            "WHERE evidence_refs IS NOT NULL ORDER BY id",
+        ):
+            for ref in _decode_refs(row["evidence_refs"]):
+                total += 1
+                subject = f"{table}/{row['id']} → {ref}"
+                located = _relocate(root, ref)
+                if located is None:
+                    external += 1
+                    findings.append(
+                        Finding(
+                            "unknown",
+                            subject,
+                            "界外/绝对路径引用,不打开不跟随(可定位,不判罚)",
+                        )
+                    )
+                    continue
+                _rel, abs_path = located
+                if abs_path.is_file():
+                    passed += 1
+                else:
+                    failed += 1
+                    findings.append(
+                        Finding("fail", subject, "证据文件缺失(界内引用)")
+                    )
+    if failed:
+        dim.status = "fail"
+    elif external:
+        dim.status = "unknown"
+    else:
+        dim.status = "pass"
+    dim.summary = (
+        f"证据引用 {total} 条:存在 {passed} / 缺失 {failed} / "
+        f"界外不跟随 {external}"
+    )
+    dim.findings = findings
+    dim.extra = {
+        "total": total,
+        "present": passed,
+        "missing": failed,
+        "external": external,
+    }
+    return dim
+
+
+def _verify_coverage(
+    root: Path,
+    records: list[dict[str, Any]],
+    conn: sqlite3.Connection | None,
+    meta: dict[str, Any],
+    pairs: list[tuple[dict[str, Any], dict[str, Any] | None]],
+) -> DimensionResult:
+    """coverage 维:run 配对 / job_events pending / 会话覆盖 / manifest
+    在场性;外部锚定声明恒在人读与 JSON 输出层呈现(EXTERNAL_ANCHOR_NOTE)。"""
+    dim = DimensionResult()
+    findings: list[Finding] = []
+    unpaired = [
+        started
+        for started, finished in pairs
+        if finished is None and started.get("seq") is not None
+    ]
+    for started in unpaired:
+        findings.append(
+            Finding(
+                "pending",
+                f"run seq {started.get('seq')}",
+                f"run_started(run_id {_run_id_of(started) or '(无)'})"
+                "无配对 run_finished——run 未终态或进程崩溃",
+            )
+        )
+
+    pending_jobs: list[str] = []
+    if conn is None:
+        findings.append(
+            Finding("unknown", "index.sqlite", "索引库缺失/无法只读打开")
+        )
+    elif not _table_columns(conn, "job_events"):
+        findings.append(
+            Finding("unknown", "job_events", "索引库缺 job_events 表(legacy)")
+        )
+    else:
+        for row in _query_dicts(
+            conn,
+            "SELECT event_id FROM job_events WHERE status = 'pending' "
+            "ORDER BY event_id",
+        ):
+            pending_jobs.append(str(row["event_id"]))
+        if pending_jobs:
+            findings.append(
+                Finding(
+                    "pending",
+                    "job_events",
+                    f"{len(pending_jobs)} 条未消费占位(drain 超时登记):"
+                    + ", ".join(pending_jobs),
+                )
+            )
+
+    coverage = session_coverage(records)
+    if coverage == "legacy":
+        findings.append(
+            Finding("unknown", "session_op", "旧链无会话审计记录(legacy)")
+        )
+
+    terminal = next(
+        (pair for pair in reversed(pairs) if pair[1] is not None), None
+    )
+    manifest_status = "none_required"
+    if terminal is not None:
+        finished_payload = terminal[1].get("payload") or {}
+        run_id = (
+            finished_payload.get("run_id")
+            or _run_id_of(terminal[0])
+            or f"legacy-seq{terminal[1].get('seq')}"
+        )
+        safe = _SAFE_NAME_RE.sub("-", str(run_id))
+        if (root / "evidence" / f"manifest-{safe}.json").is_file():
+            manifest_status = "present"
+        else:
+            manifest_status = "missing"
+            findings.append(
+                Finding(
+                    "unknown",
+                    f"evidence/manifest-{safe}.json",
+                    "终末 run 无证据 manifest(旧 run 不补造;R09 前的终态"
+                    "或崩溃路径本无 manifest)",
+                )
+            )
+
+    pend = sum(1 for f in findings if f.status == "pending")
+    unk = sum(1 for f in findings if f.status == "unknown")
+    if pend:
+        dim.status = "pending"
+    elif unk:
+        dim.status = "unknown"
+    else:
+        dim.status = "pass"
+    dim.summary = (
+        f"覆盖:run {len(pairs)} 个(未配对 {len(unpaired)})/ "
+        f"job_events 未消费 {len(pending_jobs)} 条 / 会话审计 {coverage} / "
+        f"manifest {manifest_status}"
+    )
+    dim.findings = findings
+    dim.extra = {
+        "runs": len(pairs),
+        "unpaired_runs": len(unpaired),
+        "pending_job_events": pending_jobs,
+        "session_coverage": coverage,
+        "manifest": manifest_status,
+        "engagement_status": meta.get("status"),
+    }
+    return dim
+
+
+def verify_engagement(root: str | Path) -> VerifyResult:
+    """只读核验 engagement:chain/files/references/coverage 四维独立判定。
+
+    只读契约(决策 5):``EngagementPaths`` 纯实例化;索引库
+    ``mode=ro`` URI 连接(无 journal/迁移/chmod);不取单写者锁;不创建
+    任何文件;不执行旧命令;不跟随目录外引用。
+    """
+    root = Path(root)
+    paths = EngagementPaths(root)
+    generated_at = _utc_now_iso()
+    meta = _read_meta(paths)
+
+    chain_dim, records = _verify_chain(paths)
+    pairs = _pair_runs(records)
+    open_runs = [
+        (int(started["seq"]), _run_id_of(started))
+        for started, finished in pairs
+        if finished is None and started.get("seq") is not None
+    ]
+    conn = _open_index_ro(paths.index_db)
+    try:
+        files_dim = _verify_files(root, records, conn, open_runs)
+        references_dim = _verify_references(root, conn)
+        coverage_dim = _verify_coverage(root, records, conn, meta, pairs)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    dimensions = {
+        "chain": chain_dim,
+        "files": files_dim,
+        "references": references_dim,
+        "coverage": coverage_dim,
+    }
+    return VerifyResult(
+        root=str(root),
+        engagement_id=meta.get("id") or (root.name if meta else None),
+        generated_at=generated_at,
+        dimensions=dimensions,
+        overall=_worst(dimensions),
+    )
+
+
+# ---------------------------------------------------------------------------
+# verify 结果渲染(人读与 JSON 共用同一 VerifyResult,AC07)
+# ---------------------------------------------------------------------------
+
+
+def result_to_dict(result: VerifyResult) -> dict[str, Any]:
+    """VerifyResult 的机读形态(``--json`` 输出)。"""
+    return {
+        "format": 1,
+        "engagement": result.root,
+        "engagement_id": result.engagement_id,
+        "generated_at": result.generated_at,
+        "overall": result.overall,
+        "dimensions": {
+            name: {
+                "status": dim.status,
+                "summary": dim.summary,
+                "findings": [
+                    {"status": f.status, "subject": f.subject, "detail": f.detail}
+                    for f in dim.findings
+                ],
+                "extra": dim.extra,
+            }
+            for name, dim in result.dimensions.items()
+        },
+        "external_anchor": EXTERNAL_ANCHOR,
+        "external_anchor_note": EXTERNAL_ANCHOR_NOTE,
+    }
+
+
+_OVERALL_LABEL = {
+    "pass": "pass(所请求检查均通过且无未知项)",
+    "fail": "fail(已确认不一致)",
+    "unknown": "unknown(证据不足)",
+    "pending": "pending(运行未完成/证据未收敛)",
+}
+
+
+def render_human(result: VerifyResult) -> str:
+    """VerifyResult 的人读形态(默认 stdout)。"""
+    lines = [
+        f"核验 engagement:{result.root}"
+        + (f"(id {result.engagement_id})" if result.engagement_id else ""),
+        f"核验时间:{result.generated_at}",
+    ]
+    for name in DIMENSIONS:
+        dim = result.dimensions[name]
+        lines.append(f"[{name}] {dim.status}:{dim.summary}")
+        for finding in dim.findings:
+            mark = _STATUS_MARK.get(finding.status, "?")
+            lines.append(f"  {mark} {finding.subject}:{finding.detail}")
+    lines.append(f"总判定:{_OVERALL_LABEL.get(result.overall, result.overall)}")
+    lines.append(f"声明:{EXTERNAL_ANCHOR_NOTE}")
+    return "\n".join(lines) + "\n"
