@@ -70,12 +70,17 @@ def _open_index_ro(db_path: Path) -> sqlite3.Connection | None:
     """
     if not db_path.is_file():
         return None
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(
             f"file:{quote(str(db_path))}?mode=ro", uri=True
         )
         conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     except sqlite3.Error:
+        # 评审收口:探针失败路径同样关闭连接,不泄漏(connect 失败时
+        # conn 尚不存在,条件守卫区分)
+        if conn is not None:
+            conn.close()
         return None
     conn.row_factory = sqlite3.Row
     return conn
@@ -866,8 +871,12 @@ def _verify_files(
             registered = row.get("sha256") if loot_has_hash else None
             add(row.get("path"), registered, "loot", f"loot/{row.get('id')}", False)
 
-    # manifest 里记录的产物(manifest 时点快照;同一文件多个 manifest 按
-    # generated_at 取最新——转录合法增长会产生新 manifest)
+    # manifest 里记录的产物(时点快照;**同一 path 只保留 generated_at
+    # 最新一份**——转录类「合法增长」(resume 后续写)会产生新 manifest,
+    # 旧快照不构成冲突;B1 评审实测:不取最新会把合法增长谎报成篡改。
+    # 逐来源判定规则(§7 决策 11):exec_result_meta/job_events/loot 是
+    # 终态/登记账本,逐来源独立判定,冲突即真异常;manifest 快照是
+    # 账本之外的唯一记录面(session 转录无终态账本),只认最新一份)。
     evidence_dir = root / "evidence"
     manifests: list[dict[str, Any]] = []
     if evidence_dir.is_dir():
@@ -878,21 +887,29 @@ def _verify_files(
                 findings.append(
                     Finding("unknown", path.name, f"manifest 解析失败:{exc}")
                 )
-    manifests.sort(key=lambda m: str(m.get("generated_at") or ""))
+    # rel → (generated_at, ref_id, sha256)
+    latest_snapshots: dict[str, tuple[str, str, str]] = {}
     for manifest in manifests:
+        manifest_at = str(manifest.get("generated_at") or "")
+        ref_id = f"manifest:{manifest.get('run_id')}"
         for item in manifest.get("artifacts") or []:
+            if not item.get("sha256"):
+                continue
             located = _relocate(root, str(item.get("path") or ""))
-            if located is not None and item.get("sha256"):
-                recorded.setdefault(located[0], []).append(
-                    (
-                        "manifest",
-                        f"manifest:{manifest.get('run_id')}",
-                        item["sha256"],
-                        False,
-                    )
-                )
+            if located is None:
+                continue
+            rel = located[0]
+            existing = latest_snapshots.get(rel)
+            if existing is None or (manifest_at, ref_id) > (
+                existing[0],
+                existing[1],
+            ):
+                latest_snapshots[rel] = (manifest_at, ref_id, item["sha256"])
+    for rel, (_at, ref_id, sha256) in latest_snapshots.items():
+        recorded.setdefault(rel, []).append(("manifest", ref_id, sha256, False))
 
-    # 逐文件核验(每文件重算一次 sha256,各来源登记值分别对照)
+    # 逐文件核验(每文件重算一次 sha256;定位明细逐来源保留,
+    # 计数按文件聚合——同文件多来源不重复计「不一致」,摘要不出负数)
     checked = mismatch = missing = unknown_claims = 0
     for rel in sorted(recorded):
         claims = recorded[rel]
@@ -914,6 +931,7 @@ def _verify_files(
             findings.append(Finding("unknown", rel, f"读取失败:{exc}"))
             continue
         has_hash_claim = False
+        file_mismatch = False
         for source, ref_id, recorded_sha, in_open_run in claims:
             if not recorded_sha:
                 unknown_claims += 1
@@ -928,7 +946,7 @@ def _verify_files(
                 continue
             has_hash_claim = True
             if recorded_sha != current:
-                mismatch += 1
+                file_mismatch = True  # 计数按文件聚合;定位明细逐来源保留
                 findings.append(
                     Finding(
                         "fail",
@@ -946,6 +964,8 @@ def _verify_files(
                         "(当前 hash 一致)",
                     )
                 )
+        if file_mismatch:
+            mismatch += 1
         if has_hash_claim:
             checked += 1
 
@@ -1128,10 +1148,6 @@ def _verify_coverage(
             )
 
     coverage = session_coverage(records)
-    if coverage == "legacy":
-        findings.append(
-            Finding("unknown", "session_op", "旧链无会话审计记录(legacy)")
-        )
 
     terminal = next(
         (pair for pair in reversed(pairs) if pair[1] is not None), None
@@ -1158,6 +1174,29 @@ def _verify_coverage(
                 )
             )
 
+    if coverage == "legacy":
+        if manifest_status == "present":
+            # 评审收口(rc0 可达面):R09 代际新链(终末 run 已有 manifest)
+            # 且无 session_op = 无会话使用,非证据缺失——pass 注记,不拖
+            # unknown。无 manifest 且无 session_op(pre-R09/pre-R07 旧链)
+            # 保持 legacy unknown(设计口径:旧链保持 rc 3,见 §7)。
+            findings.append(
+                Finding(
+                    "pass",
+                    "session_op",
+                    "链无会话操作记录且终末 run 已有证据 manifest:"
+                    "无会话使用(R09 代际),非旧链证据缺失",
+                )
+            )
+            session_note = "无会话使用"
+        else:
+            findings.append(
+                Finding("unknown", "session_op", "旧链无会话审计记录(legacy)")
+            )
+            session_note = "legacy"
+    else:
+        session_note = "tracked"
+
     pend = sum(1 for f in findings if f.status == "pending")
     unk = sum(1 for f in findings if f.status == "unknown")
     if pend:
@@ -1168,7 +1207,7 @@ def _verify_coverage(
         dim.status = "pass"
     dim.summary = (
         f"覆盖:run {len(pairs)} 个(未配对 {len(unpaired)})/ "
-        f"job_events 未消费 {len(pending_jobs)} 条 / 会话审计 {coverage} / "
+        f"job_events 未消费 {len(pending_jobs)} 条 / 会话审计 {session_note} / "
         f"manifest {manifest_status}"
     )
     dim.findings = findings

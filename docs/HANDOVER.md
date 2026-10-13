@@ -853,3 +853,17 @@ WP-13(整合)依赖全部
   见 [v0.1.3.md](releases/v0.1.3.md)。
 - 下一步：发布门槛剩余项由用户裁定后按授权执行；或按
   [R 索引](items/README.md) 推进下一版本条目。
+
+- 2026-10-13 对抗评审收口（跟进提交）：两路独立评审，修 1 阻断 +
+  5 应修——B1 files 维 manifest 快照「只 sort 未取最新」把 resume
+  后转录合法增长谎报为篡改（证据工具最坏误报方向），修为按 path 只
+  保留 generated_at 最新快照并冻结逐来源判定规则（§7 决策 11：
+  账本来源冲突即真异常，manifest 快照只认最新）；coverage 会话维引
+  manifest 代际判定，R09 代际无会话健康 run 的 rc 0 可达（旧链保持
+  rc 3 设计口径，决策 12）；references 界内缺失 fail 补证据；files
+  摘要计数改按文件聚合（消除「一致 -1」）；`_open_index_ro` 探针失败
+  连接泄漏一行修；四终态（finished/killed/error/cancelled）manifest
+  生成参数化钉死。只记录不修四项（TUI 终态同步 hash 收尾延迟、loot
+  两列 vintage 口径错位注记、异构残缺库 per-dim 防御空缺、chain
+  read_error 残留与旧链 rc 3 口径明示）见 R09.md §7/§8。净增测试
+  10 例，全仓 **807 passed + 2 skipped**，ruff 全绿。

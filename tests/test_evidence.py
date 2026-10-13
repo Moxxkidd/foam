@@ -102,6 +102,7 @@ def _engagement_with_terminal_run(
     *,
     run_id: str = "run01a",
     status: str = "finished",
+    error: str | None = None,
     extra_before_finish: list[tuple[str, dict]] | None = None,
 ) -> Engagement:
     """合成终态 engagement:真实 scope 文件 + 链(scope_loaded → run_started
@@ -154,7 +155,7 @@ def _engagement_with_terminal_run(
             "rounds": 1,
             "input_tokens": 1,
             "output_tokens": 1,
-            "error": None,
+            "error": error,
             "run_id": run_id,
         },
     )
@@ -1177,3 +1178,251 @@ async def test_tui_run_generates_manifest(tmp_path):
     assert manifest["end_reason"]["status"] == "finished"
     assert manifest["chain"]["verify"] is True
     assert (root / "evidence" / f"summary-{run_id}.md").is_file()
+
+
+# ---------------------------------------------------------------------------
+# R09 评审收口(2026-10-13):B1 manifest 快照取最新 / rc0 可达面 /
+# references 缺失定位 / files 计数按文件聚合 / ro 探针连接泄漏 /
+# 终态四形态 manifest 专测
+# ---------------------------------------------------------------------------
+
+
+def _two_run_transcript_fixture(tmp_path: Path) -> Engagement:
+    """两个 run 的转录合法增长场景(B1 复现基座):
+
+    run1 终态(链 + 转录 v1)→ manifest-r1(转录快照 hash1)→ resume 起
+    run2 终态(转录续写为 v2)→ manifest-r2(快照 hash2)。session 转录无
+    终态账本,manifest 快照是其唯一记录面。
+    """
+    scope_file = tmp_path / "lab.scope"
+    scope_file.write_text(SCOPE_TEXT, encoding="utf-8")
+    engagement = Engagement.create(
+        tmp_path / "engagements",
+        "两次运行",
+        scope_path=scope_file,
+        engagement_id="tworun-eng",
+    )
+    root = engagement.paths.root
+    transcript = root / "outputs" / "sessions" / "s-aa.log"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_bytes(b"TESTONLY transcript v1\n")
+
+    from foam.evidence import write_manifest
+
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    audit.append(
+        KIND_SCOPE_LOADED,
+        scope_payload(parse_scope(SCOPE_TEXT), str(scope_file)),
+    )
+    audit.append(
+        "run_started",
+        {"objective": "两次运行", "provider": "fake",
+         "workdir": str(root), "run_id": "run-aaa"},
+    )
+    audit.append(
+        "run_finished",
+        {"status": "finished", "rounds": 1, "input_tokens": 1,
+         "output_tokens": 1, "error": None, "run_id": "run-aaa"},
+    )
+    audit.close()
+    m1 = write_manifest(root, generated_at="2026-10-13T00:00:00+00:00")
+    assert m1 is not None and m1[0].name == "manifest-run-aaa.json"
+
+    # resume 起 run2:转录合法续写,终态生成 manifest-r2
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    audit.append(
+        "run_started",
+        {"objective": "两次运行", "provider": "fake",
+         "workdir": str(root), "run_id": "run-bbb"},
+    )
+    audit.append(
+        "run_finished",
+        {"status": "finished", "rounds": 2, "input_tokens": 2,
+         "output_tokens": 2, "error": None, "run_id": "run-bbb"},
+    )
+    audit.close()
+    transcript.write_bytes(b"TESTONLY transcript v1\nv2 continued\n")
+    m2 = write_manifest(root, generated_at="2026-10-13T01:00:00+00:00")
+    assert m2 is not None and m2[0].name == "manifest-run-bbb.json"
+    # 防呆:两份 manifest 对转录的快照确实不同(否则没造出 B1 场景)
+    t1 = next(
+        a for a in m1[2]["artifacts"] if a["path"] == "outputs/sessions/s-aa.log"
+    )
+    t2 = next(
+        a for a in m2[2]["artifacts"] if a["path"] == "outputs/sessions/s-aa.log"
+    )
+    assert t1["sha256"] != t2["sha256"]
+    return engagement
+
+
+def test_verify_multi_run_uses_latest_manifest_snapshot(tmp_path):
+    """B1:转录合法增长(resume 后续写)只认 generated_at 最新的 manifest
+    快照——旧 manifest 的旧快照不得把合法增长判成篡改(证据工具谎报
+    是最坏的误报方向)。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _two_run_transcript_fixture(tmp_path)
+    result = verify_engagement(engagement.paths.root)
+    files = result.dimensions["files"]
+    assert files.status == "pass", (
+        f"合法增长被误报: {files.summary} {files.findings}"
+    )
+    assert result.overall != "fail"
+    engagement.close()
+
+
+def test_verify_tamper_after_latest_manifest_still_located(tmp_path):
+    """B1 不回归:最新 manifest 之后再改转录 → files fail 并定位
+    (崩溃续写与篡改不可区分,如实报;定位到最新快照来源)。"""
+    from foam.evidence import verify_engagement
+
+    engagement = _two_run_transcript_fixture(tmp_path)
+    transcript = engagement.paths.root / "outputs" / "sessions" / "s-aa.log"
+    transcript.write_bytes(b"TESTONLY tampered after manifest\n")
+    result = verify_engagement(engagement.paths.root)
+    files = result.dimensions["files"]
+    assert files.status == "fail"
+    assert any(
+        f.status == "fail" and f.subject == "outputs/sessions/s-aa.log"
+        and "hash 不符" in f.detail
+        for f in files.findings
+    )
+    engagement.close()
+
+
+def test_cli_verify_rc0_healthy_run_without_sessions(tmp_path, capsys):
+    """收口 2:R09 代际健康 run(终态 manifest 在场、无会话使用)→
+    verify rc 0 可达(修复前 session legacy unknown 恒拖成 rc 3)。"""
+    rc, workdir = run_cli_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0
+    rc = cli_main(["verify", str(workdir)])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.out + captured.err
+    assert "总判定:pass" in captured.out
+    assert "无会话使用" in captured.out  # 代际注记,而非 legacy unknown
+
+
+def test_verify_references_missing_contained_file_fails(tmp_path):
+    """收口 3:references 三态补证据——界内引用文件被删除 → fail 并定位
+    (此前只测了界内存在 pass 与界外 unknown 两态)。"""
+    from foam.evidence import verify_engagement, write_manifest
+
+    engagement = _engagement_with_terminal_run(tmp_path, run_id="refmiss")
+    evidence_file = engagement.paths.outputs / "ev.bin"
+    evidence_file.write_bytes(b"TESTONLY evidence")
+    with Index(engagement.paths.index_db) as index:
+        index.add_vuln(
+            "192.0.2.10", "config", "界内证据",
+            evidence_refs=["outputs/ev.bin"],
+        )
+    write_manifest(engagement.paths.root, generated_at=FIXED_NOW)
+    evidence_file.unlink()
+
+    result = verify_engagement(engagement.paths.root)
+    refs = result.dimensions["references"]
+    assert refs.status == "fail"
+    assert any(
+        f.status == "fail" and "outputs/ev.bin" in f.subject
+        and "缺失" in f.detail
+        for f in refs.findings
+    )
+    assert result.dimensions["chain"].status == "pass"  # 维度独立
+    assert result.overall == "fail"
+    engagement.close()
+
+
+def test_verify_files_summary_aggregates_per_file(tmp_path):
+    """收口 4:同一文件多来源(链 exec_result_meta + job_events + manifest)
+    被篡改——files 摘要按文件聚合,「不一致」不得超文件数、不出现负数。"""
+    from foam.evidence import verify_engagement
+
+    backend = FakeBackend(
+        [
+            [
+                ToolCall("tc-1", "run_command", {"command": "echo TESTONLY-m"}),
+                Usage(1, 1),
+            ],
+            FINISH,
+        ]
+    )
+    rc, workdir = run_cli_once(tmp_path, backend)
+    assert rc == 0
+    log = next((workdir / "outputs").glob("*.log"))
+    log.write_bytes(b"TESTONLY multi-source tamper\n")
+
+    result = verify_engagement(workdir)
+    files = result.dimensions["files"]
+    assert files.status == "fail"
+    rel = str(log.relative_to(workdir))
+    # 定位明细逐来源保留(定位价值);计数按文件聚合
+    hits = [
+        f for f in files.findings
+        if f.status == "fail" and f.subject == rel and "hash 不符" in f.detail
+    ]
+    assert len(hits) >= 2  # 至少链上与 job_events 两个来源各自定位
+    # 计数按文件聚合:3 个文件(合流/stdout/stderr)中 1 个被篡改——
+    # 「不一致」=1(不是按 claim 的 3),「一致」非负(修复前算出 -1)
+    assert "不一致 1" in files.summary, files.summary
+    assert "一致 2" in files.summary, files.summary
+    assert files.extra["mismatch"] == 1 and files.extra["checked"] == 3
+
+
+def test_open_index_ro_probe_failure_closes_connection(tmp_path, monkeypatch):
+    """收口 5:meta 探针失败(无 meta 表的异构库)→ 返回 None 且连接已关
+    (修复前探针抛错路径泄漏未关闭连接)。"""
+    import foam.evidence as ev
+
+    db = tmp_path / "bad.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE not_meta (x TEXT)")
+    conn.commit()
+    conn.close()
+
+    captured: dict[str, sqlite3.Connection] = {}
+    real_connect = sqlite3.connect
+
+    def spy_connect(*args, **kwargs):
+        captured["conn"] = real_connect(*args, **kwargs)
+        return captured["conn"]
+
+    monkeypatch.setattr(ev.sqlite3, "connect", spy_connect)
+    assert ev._open_index_ro(db) is None
+    with pytest.raises(sqlite3.ProgrammingError):  # 已关闭:execute 即抛
+        captured["conn"].execute("SELECT 1")
+
+
+@pytest.mark.parametrize(
+    "status,error,kill_reason",
+    [
+        ("finished", None, None),
+        ("killed", None, "操作员中止 TESTONLY"),
+        ("error", "后端故障 TESTONLY", None),
+        ("cancelled", "外部取消 TESTONLY", None),
+    ],
+)
+def test_write_manifest_all_terminal_states(
+    tmp_path, status, error, kill_reason
+):
+    """收口 6:四种终态(finished/killed/error/cancelled)都生成 manifest,
+    end_reason 绑定正确;killed 携最近 kill_switch 理由。"""
+    from foam.evidence import write_manifest
+
+    extra = None
+    if status == "killed":
+        extra = [
+            ("kill_switch", {"reason": kill_reason, "jobs": [], "cleanup": {}})
+        ]
+    engagement = _engagement_with_terminal_run(
+        tmp_path, run_id=f"st-{status}", status=status, error=error,
+        extra_before_finish=extra,
+    )
+    written = write_manifest(engagement.paths.root, generated_at=FIXED_NOW)
+    assert written is not None, f"{status} 终态应生成 manifest"
+    json_path, _md_path, manifest = written
+    assert manifest["run_id"] == f"st-{status}"
+    assert manifest["end_reason"]["status"] == status
+    assert manifest["end_reason"]["error"] == error
+    if kill_reason is not None:
+        assert manifest["end_reason"]["kill_reason"] == kill_reason
+    assert json_path.name == f"manifest-st-{status}.json"
+    engagement.close()
