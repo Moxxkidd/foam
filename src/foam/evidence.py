@@ -634,11 +634,12 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 def write_manifest(
     root: str | Path, *, generated_at: str | None = None
-) -> tuple[Path, Path] | None:
+) -> tuple[Path, Path, dict[str, Any]] | None:
     """构建并落盘 manifest + 结项页(0600);无 run_finished 返回 None。
 
-    返回 ``(manifest_json 路径, summary_md 路径)``。同输入与固定
-    ``generated_at`` 重写逐字节一致(幂等覆盖)。
+    返回 ``(manifest_json 路径, summary_md 路径, manifest dict)``——调用方
+    (CLI/TUI 终态接线)用返回的 dict 打印摘要要点,不二次构建。同输入与
+    固定 ``generated_at`` 重写逐字节一致(幂等覆盖)。
     """
     manifest = build_manifest(root, generated_at=generated_at)
     if manifest is None:
@@ -651,7 +652,7 @@ def write_manifest(
     text = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     _atomic_write_secret(json_path, text)
     _atomic_write_secret(md_path, render_summary_md(manifest))
-    return json_path, md_path
+    return json_path, md_path, manifest
 
 
 

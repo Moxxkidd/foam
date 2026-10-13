@@ -37,6 +37,10 @@
   mark_closed(D4,与 CLI 对齐);StateTool 的 Index 连接随 run 收口(此前
   永不关闭);cleanup_pending 上叙述流(D2);审计句柄仍在 run 收尾关闭,
   仪式重开补偿(WP-14c 第二轮对抗审查)保留为文档化例外。
+- R09(2026-10-12,终态证据):``_run_to_end`` 在 close_run 之后生成
+  证据 manifest/结项页(``evidence/manifest-<run_id>.json`` 与
+  ``summary-<run_id>.md``,foam.evidence);idle 待命期 run 未终态不产生
+  manifest;生成失败只上屏通知,不反转 run 结果。
 """
 
 from __future__ import annotations
@@ -81,6 +85,7 @@ from foam.agent.scope_compiler import (
     scope_event_payload,
 )
 from foam.agent.toolmap import render_tool_map, scan_tools
+from foam.evidence import write_manifest
 from foam.guard.audit import (
     KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
@@ -1581,6 +1586,27 @@ class TuiApp(App[None]):
             warning = cleanup_warning_text(report)
             if warning and self._main is not None:
                 self._main.narrative.add_notice("error", warning)
+        # R09:终态证据 manifest(close_run 之后,纯读源;失败只上屏,
+        # 不反转 run 结果;无 run_finished 不写、不补造)
+        if self.engagement is not None:
+            try:
+                written = write_manifest(self.engagement.paths.root)
+            except Exception as exc:  # 证据面故障不炸 app、不反转退出码
+                written = None
+                if self._main is not None:
+                    self._main.narrative.add_notice(
+                        "error",
+                        f"证据清单生成失败:{exc!r}(run 结果不受影响)",
+                    )
+            if written is not None and self._main is not None:
+                json_path, md_path, manifest = written
+                chain_ok = manifest["chain"]["verify"]
+                self._main.narrative.add_notice(
+                    "info",
+                    f"结项证据已生成:{json_path.name}(结项页 {md_path.name})· "
+                    f"审计链{'完整' if chain_ok else '**未通过**'} · "
+                    "未外部锚定(本地哈希链仅供篡改检测)",
+                )
         if self._main is not None:
             self._main.post_message(RunFinishedMsg(result, fatal))
 

@@ -88,6 +88,16 @@ R03(2026-10-06,统一运行时资源关闭,E04 收口):
 - **停止派发**:loop 终态置派发闸拒绝新工具调用;bash/session 在 aclose
   后拒绝新命令/新会话(工具层兜底)。
 
+R09(2026-10-12,verify 与终态证据):
+
+- ``verify`` 子命令:只读核验(chain/files/references/coverage 四维,
+  evidence.py);退出码 0/1/2/3(新增 EXIT_UNKNOWN=3,fail 优先于
+  unknown);--json 时 stdout 纯 JSON([config] .env 注记对 verify 改道
+  stderr)。
+- run 终态(finished/killed/error/cancelled)在 close_run 之后生成
+  证据 manifest 与结项页(``_write_terminal_evidence``;失败只 stderr
+  警告,不反转 run 退出码),TUI ``_run_to_end`` 同构接线。
+
 本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)→
 WP-14b(headless 双通道与 resume 对账)。
 """
@@ -130,7 +140,12 @@ from foam.config import (
     sanitize_url,
     validate_profile_name,
 )
-from foam.evidence import render_human, result_to_dict, verify_engagement
+from foam.evidence import (
+    render_human,
+    result_to_dict,
+    verify_engagement,
+    write_manifest,
+)
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_LOADED, AuditLog
 from foam.guard.scope import GuardDecision, Scope, parse_scope, scope_payload
 from foam.replay import (
@@ -620,6 +635,46 @@ def _report_cleanup_pending(report: dict[str, Any]) -> None:
         print(f"[cleanup_pending] {warning}", file=sys.stderr)
 
 
+def _write_terminal_evidence(runtime: _Runtime) -> None:
+    """R09(决策 3):run 终态在 close_run 之后生成证据 manifest/结项页。
+
+    从纯读源重建(审计链文件 + mode=ro 索引 + engagement.json),不干扰
+    R03 关闭序、不改 audit/index 既有字节;无 run_finished(装配失败/
+    崩溃)不写、不补造。生成失败只 stderr 警告,**不反转 run 退出码**;
+    成功时 stdout 打印两行摘要要点(不刷屏)。
+    """
+    engagement = runtime.engagement
+    if engagement is None:
+        return
+    try:
+        written = write_manifest(engagement.paths.root)
+    except Exception as exc:  # 证据面故障如实上报,不影响 run 退出码
+        print(
+            f"[evidence] 证据清单生成失败:{exc!r}(run 退出码不受影响)",
+            file=sys.stderr,
+        )
+        return
+    if written is None:
+        return  # 无终态记录(装配失败/崩溃),不补造
+    json_path, md_path, manifest = written
+    chain = manifest["chain"]
+    diverged = sum(
+        1 for s in manifest["loot_snapshots"] if s["status"] == "diverged"
+    )
+    print(
+        f"[evidence] 证据清单:evidence/{json_path.name}"
+        f"(结项页 evidence/{md_path.name})",
+        flush=True,
+    )
+    print(
+        f"[evidence] 链{'完整' if chain['verify'] else '**未通过**'}"
+        f"({chain['records']} 条)· 产物 {len(manifest['artifacts'])} 项 · "
+        f"loot 快照分叉 {diverged} 项 · 未外部锚定(本地哈希链仅供篡改检测,"
+        f"可用 verify 子命令复核)",
+        flush=True,
+    )
+
+
 def _assemble_runtime(
     args: argparse.Namespace,
     *,
@@ -727,6 +782,8 @@ async def _drive(
         # 修复旧 finally 先关审计后收割的倒挂;幂等(装配失败路径由命令层调)
         report = await close_run(runtime, run_id="cli", reason="run 收尾")
         _report_cleanup_pending(report)
+        # R09:终态证据 manifest(close_run 之后,纯读源;不反转退出码)
+        _write_terminal_evidence(runtime)
 
     print(
         f"\n[run {result.status}] {result.rounds} 轮,"

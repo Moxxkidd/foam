@@ -588,7 +588,8 @@ async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
         assert "呼号 nightowl" in main.query_one("#sb-center").content
         assert "已完成" in str(main.query_one("#sb-right").render())
         # 叙述流:objective 回显 → 思考块①(折叠)→ 正文① → 工具卡(✓ 折叠)
-        # → 思考块② → 正文② → final(每轮思考独立成块)
+        # → 思考块② → 正文② → 结项证据通知(R09:run 终态 manifest 落盘)
+        # → final(每轮思考独立成块)
         kinds = [type(w).__name__ for w in main.narrative.children]
         assert kinds == [
             "NoticeBlock",
@@ -597,8 +598,15 @@ async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
             "ToolCard",
             "ThinkingBlock",
             "StreamBlock",
+            "NoticeBlock",  # R09:结项证据通知(manifest-<run_id>.json 已生成)
             "NoticeBlock",
         ]
+        # R09:结项证据通知在 final 之前,含 manifest 文件名与锚定声明
+        evidence_notice = narrative_blocks(main, NoticeBlock)[-2]
+        assert evidence_notice.kind == "info"
+        assert "结项证据已生成" in evidence_notice.content
+        assert "manifest-" in evidence_notice.content
+        assert "未外部锚定" in evidence_notice.content
         objective = narrative_blocks(main, NoticeBlock)[0]
         assert objective.kind == "objective"
         assert "nightowl" in objective.content and "recon lab" in objective.content

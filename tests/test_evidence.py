@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import stat
 from collections import deque
@@ -374,14 +375,15 @@ def test_write_manifest_files_and_permissions(tmp_path):
     root = engagement.paths.root
     written = write_manifest(root, generated_at=FIXED_NOW)
     assert written is not None
-    json_path, md_path = written
+    json_path, md_path, written_manifest = written
     assert json_path == root / "evidence" / "manifest-w01.json"
     assert md_path == root / "evidence" / "summary-w01.md"
+    assert written_manifest == build_manifest(root, generated_at=FIXED_NOW)
     for path in (json_path, md_path):
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o600, f"{path.name} 应 0o600,实际 {mode:#o}"
     manifest = json.loads(json_path.read_text(encoding="utf-8"))
-    assert manifest == build_manifest(root, generated_at=FIXED_NOW)
+    assert manifest == written_manifest  # 落盘内容与返回 dict 一致
 
     first_bytes = json_path.read_bytes()
     first_md = md_path.read_bytes()
@@ -909,3 +911,269 @@ def test_cli_verify_json_unpolluted_by_dotenv(tmp_path, capsys, monkeypatch):
     assert data["overall"] == "pass"
     assert "[config]" in captured.err  # 注记改道 stderr
     engagement.close()
+
+
+# ---------------------------------------------------------------------------
+# R09-C:退出码矩阵 / run 终态自动接线(CLI+TUI)/ AC06 端到端
+# ---------------------------------------------------------------------------
+
+
+def test_verify_exit_code_matrix(tmp_path, capsys):
+    """退出码矩阵(决策 1):rc1 fail;fail+unknown 混合仍 rc1(fail 优先);
+    rc3 仅 unknown/pending。rc0/rc2 见 test_cli_verify_human_default_and_json
+    与 test_cli.test_verify_usage_errors_rc2。"""
+    # rc1:tamper(纯 fail)
+    engagement = _pass_fixture(tmp_path / "tamper")
+    (engagement.paths.outputs / "job01.log").write_bytes(b"TESTONLY tampered\n")
+    rc = cli_main(["verify", str(engagement.paths.root)])
+    assert rc == 1
+    assert "总判定:fail" in capsys.readouterr().out
+    engagement.close()
+
+    # rc1:fail(files)+ unknown(界外引用)混合,fail 优先
+    engagement = _pass_fixture(tmp_path / "mixed")
+    (engagement.paths.outputs / "job01.log").unlink()
+    with Index(engagement.paths.index_db) as index:
+        index.add_vuln(
+            "192.0.2.10", "config", "界外证据",
+            evidence_refs=[str(tmp_path / "mixed" / "outside.csv")],
+        )
+    rc = cli_main(["verify", str(engagement.paths.root), "--json"])
+    assert rc == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["overall"] == "fail"
+    assert data["dimensions"]["files"]["status"] == "fail"
+    assert data["dimensions"]["references"]["status"] == "unknown"
+    engagement.close()
+
+    # rc3:仅 unknown(无 manifest 的旧 run 形态)
+    engagement = _engagement_with_terminal_run(tmp_path / "unk", run_id="u01")
+    rc = cli_main(["verify", str(engagement.paths.root)])
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "总判定:unknown" in out
+    engagement.close()
+
+    # rc3:运行中 pending
+    scope_file = tmp_path / "pend" / "lab.scope"
+    scope_file.parent.mkdir(parents=True)
+    scope_file.write_text(SCOPE_TEXT, encoding="utf-8")
+    engagement = Engagement.create(
+        tmp_path / "pend" / "engagements",
+        "运行中",
+        scope_path=scope_file,
+        engagement_id="live-eng",
+    )
+    audit = AuditLog(engagement.paths.audit_jsonl)
+    audit.append(
+        "run_started",
+        {
+            "objective": "运行中",
+            "provider": "fake",
+            "workdir": str(engagement.paths.root),
+            "run_id": "live01",
+        },
+    )
+    audit.close()
+    rc = cli_main(["verify", str(engagement.paths.root)])
+    assert rc == 3
+    assert "总判定:pending" in capsys.readouterr().out
+    engagement.close()
+
+
+def test_run_terminal_generates_manifest(tmp_path, capsys):
+    """run 终态(close_run 之后)自动生成 manifest + 结项页并绑定正确;
+    stdout 打印摘要要点(数行,不刷屏)。"""
+    backend = FakeBackend(
+        [
+            [
+                ToolCall("tc-1", "run_command", {"command": "echo TESTONLY-c"}),
+                Usage(1, 1),
+            ],
+            FINISH,
+        ]
+    )
+    rc, workdir = run_cli_once(tmp_path, backend)
+    assert rc == 0
+
+    records = read_records(workdir / "audit.jsonl")
+    run_id = records[-1]["payload"]["run_id"]
+    manifest_path = workdir / "evidence" / f"manifest-{run_id}.json"
+    summary_path = workdir / "evidence" / f"summary-{run_id}.md"
+    assert manifest_path.is_file() and summary_path.is_file()
+    for path in (manifest_path, summary_path):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["run_id"] == run_id
+    assert manifest["end_reason"]["status"] == "finished"
+    assert manifest["end_reason"]["error"] is None
+    assert manifest["chain"]["verify"] is True
+    assert manifest["chain"]["head_hash"] == records[-1]["hash"]
+    scope_sha = hashlib.sha256(SCOPE_TEXT.encode()).hexdigest()
+    assert manifest["scope"]["sha256"] == scope_sha
+    artifact_paths = {a["path"] for a in manifest["artifacts"]}
+    assert any(p.startswith("outputs/") and p.endswith(".log") for p in artifact_paths)
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "未外部锚定" in summary and run_id in summary
+
+    out = capsys.readouterr().out
+    assert "[evidence] 证据清单" in out  # 摘要要点上 stdout
+    assert "未外部锚定" in out
+
+
+def test_run_killed_manifest_end_reason(tmp_path):
+    """killed 终态同样生成 manifest,end_reason=killed 并携 kill 理由。"""
+    import signal
+    import threading
+    import time
+
+    async def _hang_round(_messages):
+        import asyncio
+
+        await asyncio.sleep(60)
+        return [TextDelta("不应到达"), Usage(1, 1)]  # pragma: no cover
+
+    backend = FakeBackend([_hang_round])
+
+    def fire_sigint_when_running() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if len(backend.calls) >= 1:  # 首轮已挂起,SIGINT handler 已装配
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=fire_sigint_when_running, daemon=True)
+    thread.start()
+    rc, workdir = run_cli_once(tmp_path, backend)
+    assert rc == 130  # killed 退出码契约不变
+
+    records = read_records(workdir / "audit.jsonl")
+    run_id = records[-1]["payload"]["run_id"]
+    manifest_path = workdir / "evidence" / f"manifest-{run_id}.json"
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["end_reason"]["status"] == "killed"
+    assert "Ctrl-C" in (manifest["end_reason"]["kill_reason"] or "")
+
+
+def test_run_manifest_failure_keeps_exit_code(tmp_path, monkeypatch, capsys):
+    """manifest 生成失败不反转 run 退出码;stderr 如实警告。"""
+    import foam.cli as cli_module
+
+    def boom(_root, **_kwargs):
+        raise OSError("TESTONLY 模拟 evidence 写盘失败")
+
+    monkeypatch.setattr(cli_module, "write_manifest", boom)
+    rc, workdir = run_cli_once(tmp_path, FakeBackend([FINISH]))
+    assert rc == 0  # run 退出码不变
+    err = capsys.readouterr().err
+    assert "证据" in err and "失败" in err
+    assert not list((workdir / "evidence").glob("manifest-*.json"))
+
+
+def test_ac06_concurrent_terminal_manifest_e2e(tmp_path):
+    """AC06 端到端:并发终态(多后台 job 收尾临界完成)→ 自动生成的
+    manifest artifacts 全覆盖(接线后不经手工 build)。"""
+    backend = FakeBackend(
+        [
+            [
+                ToolCall(
+                    "tc-1", "run_command",
+                    {"command": "echo TESTONLY-bg-a", "background": True},
+                ),
+                ToolCall(
+                    "tc-2", "run_command",
+                    {"command": "echo TESTONLY-bg-b", "background": True},
+                ),
+                ToolCall(
+                    "tc-3", "run_command",
+                    {"command": "echo TESTONLY-bg-c", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            FINISH,
+        ]
+    )
+    rc, workdir = run_cli_once(tmp_path, backend)
+    assert rc == 0
+
+    records = read_records(workdir / "audit.jsonl")
+    run_id = records[-1]["payload"]["run_id"]
+    manifest = json.loads(
+        (workdir / "evidence" / f"manifest-{run_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    artifact_paths = {a["path"] for a in manifest["artifacts"]}
+    conn = _read_index_ro(workdir / "index.sqlite")
+    rows = conn.execute("SELECT event_id, output_refs FROM job_events").fetchall()
+    conn.close()
+    assert len(rows) == 3  # 三个并发后台 job 全部落账
+    for row in rows:
+        refs = json.loads(row["output_refs"])
+        for key in ("output_path", "stdout_path", "stderr_path"):
+            rel = str(Path(refs[key]).relative_to(workdir))
+            assert rel in artifact_paths, f"{row['event_id']} 的 {rel} 漏项"
+    assert manifest["pending"]["job_events"] == 0  # drain 收口干净
+    assert manifest["pending"]["unpaired_runs"] == []
+
+
+# ---------------------------------------------------------------------------
+# R09-C:TUI 终态接线(既有 TUI harness 形态,自包含极简版)
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for(predicate, deadline_seconds: float = 8.0):
+    """轮询直到条件为真(与 test_tui 同模式;8s 上界的抖动注记见 R05)。"""
+    import asyncio
+
+    deadline = asyncio.get_event_loop().time() + deadline_seconds
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("wait_for 超时:条件未达成")
+
+
+async def test_tui_run_generates_manifest(tmp_path):
+    """TUI 路径:run 结束后 evidence/manifest-<run_id>.json 存在且绑定正确。"""
+    from foam.tui import TuiApp, TUIConfig
+
+    scope_file = tmp_path / "lab.scope"
+    scope_file.write_text(SCOPE_TEXT, encoding="utf-8")
+    config = TUIConfig(
+        scope=parse_scope(SCOPE_TEXT),
+        scope_source=str(scope_file),
+        backend=FakeBackend([[TextDelta("完成"), Usage(1, 1)]]),
+        engagements_dir=tmp_path / "engagements",
+        config_home=tmp_path / "home",
+        wait_on_finish=False,
+    )
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.press(*"nightowl")
+        await pilot.press("enter")
+        await _wait_for(lambda: app._main is not None)
+        await pilot.pause(0.2)
+        await pilot.press(*"recon lab")
+        await pilot.press("enter")
+        await _wait_for(lambda: app._final_result is not None)
+        await _wait_for(
+            lambda: app._runtime is not None and app._runtime.closed
+        )
+        await pilot.pause(0.1)
+
+    assert app._final_result.status == "finished"
+    root = app.engagement.paths.root
+    manifests = list((root / "evidence").glob("manifest-*.json"))
+    assert len(manifests) == 1, f"manifest 未生成:{list((root / 'evidence').iterdir())}"
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    records = read_records(root / "audit.jsonl")
+    run_id = records[-1]["payload"]["run_id"]
+    assert manifest["run_id"] == run_id
+    assert manifest["end_reason"]["status"] == "finished"
+    assert manifest["chain"]["verify"] is True
+    assert (root / "evidence" / f"summary-{run_id}.md").is_file()
