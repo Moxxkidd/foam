@@ -819,3 +819,37 @@ WP-13(整合)依赖全部
   暴露面、hard link 逃逸边界与 TOCTOU mock 措辞校准、host 孤儿行/
   evidence_path 兼容列漂移/sensitive 无条件覆盖/apply_facts 部分提交面）
   见 R08.md §8 (h)–(j)。净增测试 9 例。
+
+
+## 当前状态（2026-10-13：R09 关闭）
+
+- [R09](items/R09.md) 完成并合入 main（v0.1.3 条目 4/4）：verify、证据
+  manifest 与结项页。三分片：R09-A（schema v4——loot 增 sha256 登记时
+  快照列，首次登记快照不可覆盖、旧 NULL 行允许升级；state_add_loot
+  校验/快照同一次打开；新模块 `evidence.py` 确定性
+  build_manifest/write_manifest/结项页，0600 原子写；evidence/ 目录
+  不入 LAYOUT，保 pre-R09 旧目录 resume）、R09-B（`foam verify <dir>
+  [--json]`：chain/files/references/coverage 四维独立判定
+  pass/fail/unknown/pending；只读契约——EngagementPaths 纯实例化 +
+  SQLite mode=ro，不取锁、不建文件、不跟随界外引用；VerifyResult 单
+  对象双渲染（AC07）；[config] .env 注记对 verify 改道 stderr，
+  --json stdout 纯 JSON）、R09-C（退出码冻结 0/1/2/3——新增
+  EXIT_UNKNOWN=3，fail 优先于 unknown；CLI/TUI run 终态 close_run 后
+  自动生成 manifest/结项页，生成失败不反转退出码；killed 形态
+  end_reason=killed 携 kill 理由）。逐条验收证据（R09-AC01–07）见
+  R09.md §5，红基线/分片/全量实录见 §6。
+- 关键边界：不声称外部不可抵赖（截尾/整体重写不可检测，一切输出恒显
+  「未外部锚定」）；session 转录无登记 hash（manifest 时点快照替代，
+  口径标注）；旧 run 无 manifest 不补造（verify 显示 unknown/legacy）；
+  界外/绝对路径证据引用可定位不判罚（解析器界外 provenance 合法形态）；
+  TUI idle 待命期不产生 manifest；verify 不核验证据引用的文件内容
+  （只查存在性/界内）。
+- 测试基线：全仓 **797 passed + 2 skipped**（基线 760+2，本条目净增
+  37 例），ruff 全绿。
+- **v0.1.3 四条全部完成（R06/R07/R08/R09）**：发布门槛第一/二/三条
+  已勾销；第四条条目侧证据（依赖/AC/pytest/ruff 对应 SHA）已齐，
+  干净安装与打包验证属发布动作未执行；第五条（迁移/边界说明、版本
+  历史核实、tag/包发布授权）未动。**v0.1.3 发布门槛复核归用户裁定**，
+  见 [v0.1.3.md](releases/v0.1.3.md)。
+- 下一步：发布门槛剩余项由用户裁定后按授权执行；或按
+  [R 索引](items/README.md) 推进下一版本条目。
