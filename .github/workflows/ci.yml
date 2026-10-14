@@ -20,6 +20,10 @@
 # 工具链钉 constraints-dev.txt(pytest==9.1.1 / pytest-asyncio==1.4.0 /
 # ruff==0.16.3,R05-A 决策 4);Python 3.13 为受支持较新版本
 # (Kali Rolling arm64 py3.13.7 实测先例,见 docs/HANDOVER.md 2026-08-22 补测)。
+#
+# TUI 抖动治理(陷阱 24,2026-10-14 根修):渲染竞态与 D9 守卫误吞已在
+# 代码层根除;test_tui.py 的 wait_for 预算经 FOAM_TEST_WAIT_TIMEOUT
+# 可调,CI 环境(CI=true)自动放宽到 30s,无需本文件配置。
 
 name: ci
 

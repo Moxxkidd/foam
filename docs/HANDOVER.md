@@ -461,6 +461,21 @@ WP-13(整合)依赖全部
     4 次全量跑 3 绿 1 红(红腿各挂 1 个不同的 TUI 用例,重跑即过)。
     判据:同 SHA 前后跑出绿、失败项每次不同、重跑恢复 = 时序抖动,
     非回归。未根因治理(调超时/加重试属测试基建条目);见 R05.md §8。
+    **已根修(2026-10-14)**:R06/R09 收口期累计 5 次 CI 首跑失败全在
+    macOS leg、仅两个 scope 用例、两种签名。本机 8 核 CPU 饱和压测
+    复现(修复前 4/12 轮失败),逐层定位到两类真缺陷:① 测试侧渲染
+    竞态——卡片已在叙述流但其 `.card-header` 子部件未挂载,`query_one`
+    抛 NoMatches(谓词内抛异常直接杀死等待循环)——`wait_card_part`/
+    `probe_card_part` 渲染就绪等待收口全部 10 处;② 产品级竞态——
+    `_scope_ceremony` 在 finally 的 `await card.remove()` 之后才释放
+    单例守卫,predeclare 完成通知「发送首条消息启动 run」发出到守卫
+    释放之间的窗口内,首条消息提交被 D9 守卫误吞、run 永不启动
+    (压测下 30s 预算照样失败、120s 预算 1.7s 通过 = 信号丢失非耗时)
+    ——改为冻结落账即释放守卫(`guard_released` 防 finally 代清新仪式),
+    回归测试用受控闸门阻断卡移除确定性钉死。另加预算旋钮
+    `FOAM_TEST_WAIT_TIMEOUT`(默认 8s,CI 环境自动 30s)吸收慢收敛。
+    修复后同压测 16 轮 0 失败(默认预算)。教训:抖动反复命中同一用例
+    时优先怀疑真竞态,别只调预算。
     另:git HTTPS OAuth 凭据无 `workflow` scope 时推不了
     .github/workflows/——同账户 SSH 推送不受此限(R05 §7 注记)。
 
@@ -867,3 +882,29 @@ WP-13(整合)依赖全部
   两列 vintage 口径错位注记、异构残缺库 per-dim 防御空缺、chain
   read_error 残留与旧链 rc 3 口径明示）见 R09.md §7/§8。净增测试
   10 例，全仓 **807 passed + 2 skipped**，ruff 全绿。
+
+
+## 当前状态（2026-10-14：陷阱 24 根修——CI 抖动治理）
+
+- 用户裁定启动 CI 抖动治理（截图指认 macOS leg 反复首跑失败）。证据盘点：
+  R06/R09 收口期 5 次首跑失败全部在 macos-latest leg、仅两个 scope 用例
+  （`test_scope_hot_swap_allows_previously_denied` /
+  `test_scope_predeclare_cjk_no_objective_conflict`）、两种签名
+  （NoMatches `.card-header` / wait_for 8s 超时）。
+- 根因（本机 8 核 CPU 饱和压测复现，修复前 4/12 轮失败）：
+  ① 测试侧渲染竞态——卡片在叙述流但子部件未挂载，`query_one` 在
+  `wait_for` 谓词内抛 NoMatches 直接杀死等待循环；② 产品级竞态——
+  `_scope_ceremony` 在 finally 的 `await card.remove()` 之后才释放
+  单例守卫，predeclare 完成通知发出到守卫释放之间的窗口内首条消息
+  提交被 D9 守卫误吞、run 永不启动（30s 预算照败、120s 预算 1.7s 过
+  = 信号丢失非耗时，不能靠调预算掩盖）。
+- 修复：`wait_card_part`/`probe_card_part` 渲染就绪等待收口 10 处
+  查询点；`_scope_ceremony` 冻结落账即释放守卫（`guard_released`
+  防 finally 代清误拆新仪式）；`wait_for` 预算旋钮
+  `FOAM_TEST_WAIT_TIMEOUT`（默认 8s，CI 环境自动 30s）吸收慢收敛。
+  新增确定性回归 `test_ceremony_guard_released_at_freeze_not_after_card_removal`
+  （受控闸门阻断卡移除撑开窗口，先红后绿）。
+- 验证：修复后同压测 16 轮 0 失败（默认 8s 预算）；全量
+  **808 passed + 2 skipped**（基线 807+2，净增 1 例），ruff 全绿。
+  陷阱 24 条目已更新为已根修。教训：抖动反复命中同一用例时优先
+  怀疑真竞态，别只调预算。

@@ -31,6 +31,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from textual.css.query import NoMatches
 from textual.widgets import Button, Input
 
 import foam.tui
@@ -155,14 +156,46 @@ def make_config(tmp_path: Path, script, **overrides) -> TUIConfig:
     return TUIConfig(**kwargs)
 
 
+# 陷阱 24:CI(尤其共享 vCPU 的 macOS runner)CPU 竞争下 Textual 消息泵
+# 显著变慢,固定 8s 预算反复偶发超时。预算可经 FOAM_TEST_WAIT_TIMEOUT
+# 显式覆盖;CI 环境(CI=true,GitHub Actions 默认设置)自动放宽到 30s。
+_WAIT_TIMEOUT = float(
+    os.environ.get("FOAM_TEST_WAIT_TIMEOUT", "30" if os.environ.get("CI") else "8")
+)
+
+
 async def wait_for(predicate):
     """轮询直到断言条件为真;pilot 测试里等待 loop/界面异步收敛。"""
-    deadline = asyncio.get_event_loop().time() + 8.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT
     while asyncio.get_event_loop().time() < deadline:
         if predicate():
             return
         await asyncio.sleep(0.05)
     raise AssertionError("wait_for 超时:条件未达成")
+
+
+def probe_card_part(card, selector: str) -> str | None:
+    """读卡片子部件 content;子部件尚未挂载(渲染竞态)时返回 None 而不是
+    抛 NoMatches——供等待谓词安全调用。"""
+    try:
+        return card.query_one(selector).content
+    except NoMatches:
+        return None
+
+
+async def wait_card_part(card, selector: str) -> str:
+    """等卡片子部件挂载完成并返回其 content(渲染竞态安全)。"""
+    cell: dict[str, str] = {}
+
+    def ready() -> bool:
+        text = probe_card_part(card, selector)
+        if text is None:
+            return False
+        cell["text"] = text
+        return True
+
+    await wait_for(ready)
+    return cell["text"]
 
 
 async def enter_main(app: TuiApp, pilot, callsign: str = "nightowl"):
@@ -615,7 +648,7 @@ async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
         assert all(t.expanded is False and t.done is True for t in thinkings)
         card = narrative_blocks(main, ToolCard)[0]
         assert card.running is False and card.expanded is False
-        assert "✓" in card.query_one(".card-header").content
+        assert "✓" in await wait_card_part(card, ".card-header")
         assert "exit 0" in card.summary
         streams = narrative_blocks(main, StreamBlock)
         assert streams[0].text == "开始侦察。\n"
@@ -657,11 +690,11 @@ async def test_failed_command_card_auto_expands(tmp_path):
         await start_run_and_wait(app, pilot)
         card = narrative_blocks(main, ToolCard)[0]
         assert card.expanded is True  # Q2 自动展开
-        header = card.query_one(".card-header").content
+        header = await wait_card_part(card, ".card-header")
         # R05:ls 不存在路径的退出码因平台而异(BSD/macOS=1,GNU/Linux=2),
         # Q2 契约是「非零退出上屏」,不断言具体码值。
         assert header.startswith("✗") and re.search(r"exit [1-9]\d*", header)
-        body = card.query_one(".card-body").content
+        body = await wait_card_part(card, ".card-body")
         assert "No such file or directory" in body
         assert "落盘" in body and "sha256:" in body
 
@@ -687,9 +720,9 @@ async def test_guard_denial_card_auto_expands_never_executes(tmp_path):
         await start_run_and_wait(app, pilot)
         card = narrative_blocks(main, ToolCard)[0]
         assert card.expanded is True
-        header = card.query_one(".card-header").content
+        header = await wait_card_part(card, ".card-header")
         assert header.startswith("⊘") and "护栏拒绝" in header
-        assert "8.8.8.8" in card.query_one(".card-body").content
+        assert "8.8.8.8" in await wait_card_part(card, ".card-body")
         # 护栏拒绝的命令不产生 job(outputs 目录无该命令落盘日志)
         assert main.sidebar.jobs == [] or all(
             "8.8.8.8" not in str(j.get("command")) for j in main.sidebar.jobs
@@ -986,7 +1019,7 @@ async def test_tui_idle_submit_goes_to_interject(tmp_path):
         await wait_for(lambda: loop._rounds >= 3 and loop.status == "idle")
         # 段 2 真跑了工具(卡片在),token 累计 = 两段之和
         assert any(
-            "echo deeper" in c.query_one(".card-header").content
+            "echo deeper" in (probe_card_part(c, ".card-header") or "")
             for c in narrative_blocks(main, ToolCard)
         )
         assert loop._total_input == 3 + 5 + 2
@@ -1466,7 +1499,7 @@ async def test_scope_ceremony_empty_rules_q9(tmp_path):
         assert confirmed["wildcards"] == [] and confirmed["url_prefixes"] == []
         # 空 scope 下 echo 10.11.0.5 被护栏拒绝(fail-closed)
         denied = narrative_blocks(main, ToolCard)[0]
-        assert denied.query_one(".card-header").content.startswith("⊘")
+        assert (await wait_card_part(denied, ".card-header")).startswith("⊘")
 
 
 async def test_scope_hot_swap_allows_previously_denied(tmp_path):
@@ -1511,7 +1544,7 @@ async def test_scope_hot_swap_allows_previously_denied(tmp_path):
         loop = app.run_handle.loop
         await wait_for(lambda: loop._rounds >= 2 and loop.status == "idle")
         cards = narrative_blocks(main, ToolCard)
-        assert cards[0].query_one(".card-header").content.startswith("⊘")
+        assert (await wait_card_part(cards[0], ".card-header")).startswith("⊘")
         prompt_before = loop._system_prompt
         bash_before = loop._bash
 
@@ -1578,7 +1611,7 @@ async def test_scope_hot_swap_allows_previously_denied(tmp_path):
         await wait_for(lambda: loop._rounds >= 4 and loop.status == "idle")
         cards = narrative_blocks(main, ToolCard)
         assert len(cards) == 2
-        assert "✓" in cards[1].query_one(".card-header").content
+        assert "✓" in await wait_card_part(cards[1], ".card-header")
         assert "exit 0" in cards[1].summary
 
         # D10:裸 /scope 以 TUI 侧权威引用为准(展示新规则)
@@ -1646,10 +1679,12 @@ async def test_scope_hot_swap_denies_previously_allowed(tmp_path):
             # 等 UI 消费轮 1 工具结果(卡片达 ✓ 终态)——不同步轮询 loop
             # 属性:loop 先置 idle,卡片 ✓ 由消息泵后处理,两者间有竞态窗口。
             cards = narrative_blocks(main, ToolCard)
+            header = probe_card_part(cards[0], ".card-header") if cards else None
             return (
                 bool(cards)
                 and loop.status == "idle"
-                and "✓" in cards[0].query_one(".card-header").content
+                and header is not None
+                and "✓" in header
             )
 
         await wait_for(first_card_succeeded)
@@ -1666,15 +1701,19 @@ async def test_scope_hot_swap_denies_previously_allowed(tmp_path):
         def second_card_denied() -> bool:
             # 同上:等第二张卡(被拒)达终态,而非同步读 loop._rounds。
             cards = narrative_blocks(main, ToolCard)
+            header = (
+                probe_card_part(cards[1], ".card-header") if len(cards) == 2 else None
+            )
             return (
                 len(cards) == 2
                 and loop.status == "idle"
-                and cards[1].query_one(".card-header").content.startswith("⊘")
+                and header is not None
+                and header.startswith("⊘")
             )
 
         await wait_for(second_card_denied)
         cards = narrative_blocks(main, ToolCard)
-        assert "10.11.0.5" in cards[1].query_one(".card-body").content
+        assert "10.11.0.5" in await wait_card_part(cards[1], ".card-body")
         loop.kill("收工")
         await wait_for(lambda: app._final_result is not None)
 
@@ -1945,6 +1984,51 @@ async def test_scope_predeclare_cjk_no_objective_conflict(tmp_path):
         records = read_records(app.engagement.paths.audit_jsonl)
         assert records[0]["kind"] == KIND_SCOPE_LOADED
         assert verify(app.engagement.paths.audit_jsonl)
+
+
+async def test_ceremony_guard_released_at_freeze_not_after_card_removal(
+    tmp_path, monkeypatch
+):
+    """陷阱 24 竞态回归(根修):predeclare 冻结落账后,完成通知「发送首条
+    消息启动 run」可见时单例守卫必须已释放。旧实现在 finally 里
+    ``await card.remove()`` 之后才清守卫——通知可见到卡移除完成的窗口内,
+    紧随的首条消息提交会被 ``ceremony_running`` 守卫(D9)误吞,run 永不
+    启动。本测试用受控闸门阻断卡移除,确定性撑开该窗口。"""
+    script = [
+        [TextDelta('{"rules": ["192.0.2.0/24"]}'), Usage(5, 2)],  # 预声明编译
+        [TextDelta("跑完。"), Usage(1, 1)],  # loop 首轮(终答)
+    ]
+    app = TuiApp(make_nl_config(tmp_path, script))
+    remove_entered = asyncio.Event()
+    remove_gate = asyncio.Event()
+    original_remove = ScopeConfirmCard.remove
+
+    async def gated_remove(self):
+        # 阻断 finally 的卡移除,把「通知已发、守卫未清」的窗口撑到确定
+        remove_entered.set()
+        await remove_gate.wait()
+        return await original_remove(self)
+
+    monkeypatch.setattr(ScopeConfirmCard, "remove", gated_remove)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        main = await enter_main(app, pilot)
+        app.submit_text("/scope 只对实验网段做侦察")
+        card = await wait_scope_card(main)
+        press_card(card, "scope-confirm")
+        # 完成通知已可见,而卡移除被闸门阻断(finally 停在 remove 上)
+        await wait_for(
+            lambda: notices_containing(main, "发送首条消息启动 run") != []
+        )
+        await wait_for(lambda: remove_entered.is_set())
+        # 冻结已落账:守卫必须已释放,否则紧随提交被 D9 守卫误吞
+        assert not app.ceremony_running
+        # 窗口内提交首条消息即启动 run(不依赖闸门释放)
+        app.submit_text("侦察实验网段并汇总存活主机")
+        await wait_for(lambda: app.run_handle is not None)
+        remove_gate.set()
+        await wait_for(lambda: app._final_result is not None)
+        assert app._final_result.status == "finished"
 
 
 async def test_scope_hot_swap_from_file_source_keeps_hash_lineage(tmp_path):

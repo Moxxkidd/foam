@@ -1327,6 +1327,7 @@ class TuiApp(App[None]):
         own_audit = False
         card = ScopeConfirmCard()
         card_mounted = False
+        guard_released = False  # 冻结落账即提前释放守卫;finally 不再代清
         try:
             if mode == "update":
                 engagement = self.engagement
@@ -1454,6 +1455,13 @@ class TuiApp(App[None]):
             self.config.scope = compilation.scope
             self.config.scope_source = meta_scope["path"]
             self._scope_frozen_via_nl = True
+            # 仪式在冻结落账时即逻辑完成:先释放单例守卫,再发完成通知。
+            # 否则通知可见到 finally 卡移除 await 完成的窗口内,紧随的
+            # 提交会被 ceremony_running 守卫(D9)误吞——「发送首条消息启动
+            # run」后首条消息永远不到达(陷阱 24 竞态根因,2026-10-14)。
+            self._ceremony = None
+            self._ceremony_action = None
+            guard_released = True
             summary = (
                 f"scope 已确认冻结:{len(compilation.rules)} 条规则 · "
                 f"canonical sha256:{frozen_sha[:12]}"
@@ -1481,8 +1489,11 @@ class TuiApp(App[None]):
                 audit.close()
             if card_mounted:
                 await card.remove()
-            self._ceremony_action = None
-            self._ceremony = None
+            if not guard_released:
+                # 守卫已在冻结落账时提前释放:此处不得代清——卡移除 await
+                # 期间可能已合法启动下一场仪式,代清会误拆新仪式的守卫。
+                self._ceremony_action = None
+                self._ceremony = None
 
     async def _await_card_action(self) -> ScopeCardAction:
         """挂起仪式 worker,等 operator 的确认卡动作(MainScreen 回填)。"""
