@@ -33,10 +33,16 @@ Foam 之于授权安全测试。
 - **解析增强 + 状态索引**:nmap / sqlmap / gobuster / nikto / hydra /
   whatweb 输出自动解析为原子事实,写入 SQLite 索引(hosts / ports /
   creds / vulns / loot);未识别的工具回退通用路径,不影响执行。
-- **scope 护栏**:每条命令先经授权范围校验,越界拒绝并向模型返回
-  可行动的纠正说明;放行与拒绝全程留痕。
+- **scope 护栏**:每条 `run_command` 先经授权范围校验,越界拒绝并向模型
+  返回可行动的纠正说明;放行与拒绝全程留痕。
 - **哈希链审计**:append-only JSONL,语义字段级防篡改;`replay`
   先校验后只读重放,链断即拒。
+- **证据清单与只读核验**:run 终态自动生成 manifest 与结项页;`verify`
+  分别核验审计链、产物 hash、证据引用和覆盖状态,不改被检查数据。
+
+**边界**:PTY 会话命令与输入不经过 `run_command` 的命令级 scope 检查;
+审计可见不等于授权隔离。网络层执行边界属于 v0.2 的 R10/R11,当前版本
+不得当作已交付。本地哈希链也未外部锚定,不能证明未截尾或整体重写。
 
 ## 法律与边界
 
@@ -62,9 +68,12 @@ foam tui
 #      确认冻结 / 用自然语言修正重编译 / 取消;确认后冻结进审计链
 #    → 运行中随时 /scope 查看当前规则,/scope <描述> 经同一仪式修改
 
-# 3. 回放与报告
+# 3. 回放、证据核验与报告
 foam replay engagements/<id>
+foam verify engagements/<id>          # 人读;--json 输出机读结果
 foam report engagements/<id> --out report.md
+# 分享视图只脱敏凭证节,其余章节仍须人工审阅:
+foam report engagements/<id> --redact --out report-share.md
 ```
 
 headless/CI 场景可用 scope 文件(零确认仪式,行为照旧;每行一条:
@@ -116,40 +125,36 @@ key/token/secret 字样的键一律剔除、不落盘。
 | `foam tui` | 全屏 TUI(NL scope 确认仪式 + `/scope` 热换;连续对话、插话、斜杠命令、侧栏状态) |
 | `foam resume <dir>` | 审计链校验 + objective/scope 对账后从现场继续 |
 | `foam replay <dir>` | 哈希链校验 + 只读重放审计时间线 |
-| `foam report <dir>` | 生成中文 markdown 报告(凭证节为全值,注意去向) |
+| `foam verify <dir>` | 只读核验证据;0=pass,1=fail,2=使用错误,3=unknown/pending |
+| `foam report <dir>` | 生成中文 markdown 报告;默认凭证全值,`--redact` 仅脱敏凭证节 |
 
 `fm` 为等价短别名。engagement 运行时产物(原始输出 / loot / 索引库)
 不入库(`.gitignore` 拦截)。
 
 ## 文档
 
+- 当前版本、迁移/回退与发布证据:`docs/releases/v0.1.3.md`
+- R 条目规格与逐条验收:`docs/items/README.md`
 - 战绩表与证据说明:`docs/track-record.md`
 - 实弹报告:`docs/e2e/scenario1-report.md`、`docs/demo/scenario2-report.md`、
   `docs/demo/htb-meow-20260908/`
 - 已知问题:`docs/known-issues.md`
-- 交接文档(含 24 条已知陷阱与里程碑记录):`docs/HANDOVER.md`
-- 规格与逐条核销:`docs/work-packages/`、`docs/spec-verification.md`
+- 交接文档(含已知陷阱与里程碑记录):`docs/HANDOVER.md`
+- 历史 WP 规格与核销:`docs/work-packages/`、`docs/spec-verification.md`
 
 ## 项目状态
 
-**v0.1.2(发布准备完成,未发布;2026-10-06)**:维护批次 R01–R05 完成——
-授权目标判定(E01/E02)、scope 冻结/恢复一致(E03/E07)、退出资源收口
-(E04)、报告全量分页(E05)修复,版本元数据/安装包/回归基座统一。
-包元数据与 CLI 版本一致为 0.1.2;**未打 tag、未建 release、未上传包**
-(发布授权见 `docs/releases/v0.1.2.md` 发布门槛)。
+**v0.1.3(发布候选;2026-10-24)**:包含 R06–R09 的后台终态事件、PTY
+操作/提示审计、通用成果登记与证据模型、verify/manifest/结项页,并承接
+未单独发布的 v0.1.2(R01–R05)全部变更。包元数据与 CLI 版本统一为
+0.1.3;完整发布验证、实际 tag/release 与资产回验结果以
+`docs/releases/v0.1.3.md` 为准,不把候选状态提前写成已发布。
 
-- 测试基线:**685 passed + 2 skipped**(2026-10-06,HEAD `e6451f8`,
-  macOS arm64 py3.12.14;2 项 skip 为 ssh/msfconsole 环境门控,理由见
-  `.github/workflows/ci.yml` 头注)。
-- 离线 CI:pytest(py3.12/3.13 × ubuntu/macos)+ ruff 五 job 全绿,
-  实测 <https://github.com/Moxxkidd/foam/actions/runs/37438177289>
-  (CI 各 leg 686 passed + 1 skipped:ssh 集成项在 runner 实跑通过)。
-- 历史发布:v0.1.0(2026-09-08,唯一 GitHub release)。v0.1.1 仅有 tag
-  与文档宣告,包元数据当时未同步(仍为 0.1.0)——历史 tag 不改动,
-  异常如实记录于 `docs/releases/v0.1.2.md`。
-- 逐条验收证据:`docs/items/R01.md`–`R05.md`;版本排期与发布门槛:
-  `docs/releases/v0.1.2.md`;后续批次方向见 `docs/HANDOVER.md`
-  「v1 立项清单」节。
+- v0.1.2 不补打历史 tag,其剩余版本级验收由 v0.1.3 承接。
+- 历史发布:v0.1.0 有 GitHub release;v0.1.1 仅有 tag,且当时包元数据
+  仍为 0.1.0。历史 tag 不改动,异常记录于 `docs/releases/v0.1.2.md`。
+- 后续 v0.2.0 从 R10 的 Kali 执行边界实证开始;设计文档或在飞草稿不
+  代表隔离执行已经交付。
 
 ## License
 

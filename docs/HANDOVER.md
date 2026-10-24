@@ -908,3 +908,22 @@ WP-13(整合)依赖全部
   **808 passed + 2 skipped**（基线 807+2，净增 1 例），ruff 全绿。
   陷阱 24 条目已更新为已根修。教训：抖动反复命中同一用例时优先
   怀疑真竞态，别只调预算。
+
+
+## 当前状态（2026-10-24：v0.1.3 发布候选收口）
+
+- v0.1.3 纳入 R06–R09，并承接未单独发布的 v0.1.2（R01–R05）；四条 v0.1.3
+  条目均已完成，但 R 完成不等于发布完成。发布线基线 `1378d4d`，明确不含
+  main 已入库的 R10-A 与未验证的 R10-B 草稿；R10 不属于本 tag。
+- 新增 `tests/test_release_journey.py` 组合门：file/NL 多 run 与收窄恢复、
+  finished/error/killed 资源及证据一致、1001 条 CLI 报告，当前 **6 passed**。
+  组合验收命中并修复一个真实问题：后台 running 快照已有终态 job_events
+  仍使 verify=unknown/rc3；修复后 R09 既有 **38 passed**。完整全量门、
+  构建与干净安装尚未在本候选记录时点执行，见 [v0.1.3](releases/v0.1.3.md)。
+- 发布边界必须保持显著：PTY 会话不经过 run_command 的命令级 scope 检查；
+  verify 只做证据完整性核验，不是漏洞独立验证，`verified` 无生产置位入口；
+  本地哈希链未外部锚定。v0.1.2 不补历史 tag，v0.1.1 元数据异常不改历史。
+- 下一步：完成隔离全量 pytest/ruff、wheel/sdist 与真实安装/CLI 验收，合并
+  main 并确认五 job CI 后发布 annotated v0.1.3 tag 与 GitHub release；发布
+  后回填真实 tag/SHA/资产 hash，再以 R10-B 的 opt-in Docker 实证作为 v0.2.0
+  下一动作。裸 Kali SSH 通道未恢复，不得把设计或 macOS 结果写成裸 Kali 已验证。

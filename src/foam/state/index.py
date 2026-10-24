@@ -13,8 +13,8 @@ tools/state.py 的 LLM 工具都走这层统一的 upsert/查询接口。
   数组)/verification_status/observed_at/reproduction);add_vuln/add_cred
   改为单事务 read-modify-write(refs 并集追加不丢、verified 不被登记
   路径降级),返回 ``(id, created)``;验证状态枚举冻结:
-  unknown(迁移默认)/unverified(登记默认)/verified(仅 R09 独立验证
-  流程可置,登记路径拒绝)。
+  unknown(迁移默认)/unverified(登记默认)/verified(保留给独立验证
+  流程;登记路径拒绝,当前无生产置位入口)。
 - creds.secret 在本层**完整落盘**(供 WP-10 报告);给 LLM 的脱敏在
   tools/state.py 工具层做,本层不涉及——attack_surface 汇总只返回
   username/source,不带 secret。
@@ -171,9 +171,9 @@ _MIGRATION_V4_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 PRE_V4_BACKUP_SUFFIX = ".pre-v4.bak"
 
 #: R08 决策 2:验证状态枚举冻结。unknown=旧记录无从判断(迁移默认);
-#: unverified=已登记未独立验证(解析器/手工登记默认);verified=仅 R09
-#: 独立验证流程可置——登记路径(add_vuln/add_cred/state_add_*/apply_facts)
-#: 一律拒绝 verified,模型自述不升级。
+#: unverified=已登记未独立验证(解析器/手工登记默认);verified 保留给
+#: 独立验证流程——登记路径(add_vuln/add_cred/state_add_*/apply_facts)
+#: 一律拒绝 verified,模型自述不升级;当前无生产置位入口。
 VERIFICATION_STATES = frozenset({"unknown", "unverified", "verified"})
 
 #: query() 通用接口允许的 kind 及各自可过滤字段(白名单)。
@@ -244,7 +244,7 @@ def _check_verification_status(value: str | None) -> None:
     if value not in VERIFICATION_STATES - {"verified"}:
         raise ValueError(
             f"登记路径不接受 verification_status={value!r}:可选 unknown/"
-            "unverified;verified 仅独立验证流程(R09)可置,模型自述不升级"
+            "unverified;verified 需独立验证流程,登记路径与模型自述不升级"
         )
 
 

@@ -1824,7 +1824,7 @@ async def test_registration_dedup_union_refs(state_tool):
     )
     assert p2["record_id"] == p1["record_id"] and p2["deduplicated"] is True
 
-    # verified 不被降级:模拟 R09 独立验证流程直接把行置 verified
+    # verified 不被降级:模拟独立验证流程直接把行置 verified
     state_tool._index._conn.execute(
         "UPDATE vulns SET verification_status = 'verified' WHERE kind = 'xss'"
     )
