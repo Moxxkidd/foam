@@ -807,10 +807,25 @@ def _verify_files(
             (source, ref_id, sha256, in_open_run)
         )
 
+    job_event_rows: list[dict[str, Any]] = []
+    terminal_job_ids: set[str] = set()
+    if conn is not None and _table_columns(conn, "job_events"):
+        job_event_rows = _query_dicts(
+            conn,
+            "SELECT event_id, job_id, run_id, status, output_refs FROM job_events "
+            "ORDER BY event_id",
+        )
+        terminal_job_ids = {str(row["job_id"]) for row in job_event_rows}
+
     for rec in records:
         if rec.get("kind") != KIND_EXEC_RESULT_META:
             continue
         payload = rec.get("payload") or {}
+        if (
+            payload.get("status") == "running"
+            and payload.get("job_id") in terminal_job_ids
+        ):
+            continue
         seq = rec.get("seq") or 0
         add(
             payload.get("output_path"),
@@ -820,30 +835,25 @@ def _verify_files(
             open_since is not None and seq >= open_since,
         )
 
-    if conn is not None and _table_columns(conn, "job_events"):
-        for row in _query_dicts(
-            conn,
-            "SELECT event_id, run_id, status, output_refs FROM job_events "
-            "ORDER BY event_id",
+    for row in job_event_rows:
+        try:
+            refs = json.loads(row["output_refs"] or "{}")
+        except json.JSONDecodeError:
+            refs = {}
+        in_open = bool(row.get("run_id")) and row["run_id"] in open_run_ids
+        for path_key, sha_key in (
+            ("output_path", "sha256"),
+            ("stdout_path", "stdout_sha256"),
+            ("stderr_path", "stderr_sha256"),
         ):
-            try:
-                refs = json.loads(row["output_refs"] or "{}")
-            except json.JSONDecodeError:
-                refs = {}
-            in_open = bool(row.get("run_id")) and row["run_id"] in open_run_ids
-            for path_key, sha_key in (
-                ("output_path", "sha256"),
-                ("stdout_path", "stdout_sha256"),
-                ("stderr_path", "stderr_sha256"),
-            ):
-                if refs.get(path_key):
-                    add(
-                        refs[path_key],
-                        refs.get(sha_key),
-                        "job_events",
-                        str(row["event_id"]),
-                        in_open,
-                    )
+            if refs.get(path_key):
+                add(
+                    refs[path_key],
+                    refs.get(sha_key),
+                    "job_events",
+                    str(row["event_id"]),
+                    in_open,
+                )
 
     if conn is None:
         findings.append(
@@ -874,9 +884,10 @@ def _verify_files(
     # manifest 里记录的产物(时点快照;**同一 path 只保留 generated_at
     # 最新一份**——转录类「合法增长」(resume 后续写)会产生新 manifest,
     # 旧快照不构成冲突;B1 评审实测:不取最新会把合法增长谎报成篡改。
-    # 逐来源判定规则(§7 决策 11):exec_result_meta/job_events/loot 是
-    # 终态/登记账本,逐来源独立判定,冲突即真异常;manifest 快照是
-    # 账本之外的唯一记录面(session 转录无终态账本),只认最新一份)。
+    # 逐来源判定规则(§7 决策 11):终态 exec_result_meta/job_events/loot
+    # 逐来源独立判定,冲突即真异常;running 即时快照在同 job 终态事件
+    # 在场时不重复计 unknown,未接替的旧快照仍保留 unknown。manifest
+    # 快照是账本之外的唯一记录面(session 转录无终态账本),只认最新一份。
     evidence_dir = root / "evidence"
     manifests: list[dict[str, Any]] = []
     if evidence_dir.is_dir():
