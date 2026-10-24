@@ -930,3 +930,31 @@ WP-13(整合)依赖全部
   release；发布后回填真实 tag/SHA/资产 hash，再以 R10-B 的 opt-in Docker
   实证作为 v0.2.0 下一动作。裸 Kali SSH 通道未恢复，不得把设计或 macOS
   结果写成裸 Kali 已验证。
+
+
+## 当前状态（2026-10-24：v0.1.3 已发布，v0.2.0 接手基线）
+
+- **v0.1.3 已正式公开并设 latest**：<https://github.com/Moxxkidd/foam/releases/tag/v0.1.3>。
+  annotated tag `v0.1.3` 解析到 `fad75d9e0f4d59c112f3ca5b55b9f8631d5bd7d7`，
+  main 合并提交为 `24b5c72ef344c3b5f609f58b9b85d4401e7ea4ed`。R10-A 在
+  main 已入库，但不在 tag；R10-B/C 均不在 tag。
+- 最终 tag 本机 **814 passed + 2 skipped**、ruff 全绿；main 干净合并树
+  **814 passed + 4 skipped**（增加两项默认关闭的 R10-A 实验）；CI run
+  `40088646666` 五 job 全绿、无 rerun，四个 pytest leg 均
+  **815 passed + 3 skipped**。wheel/sdist 独立重构、干净安装、539 例安装包
+  回归与真实 CLI file/NL 旅程通过。
+- 三项线上资产已下载回验并做下载 wheel 安装 smoke：wheel sha256
+  `4538b9d4c6d1e10f93a75c6ed94cca385717bfcf0499ffcdd2b3daed47695929`；
+  sdist sha256 `9edb585cc912a8c2642bb0bdebbcf156c8abfde282c4d9c9b7c460f33cfebfee`；
+  SHA256SUMS 自身 sha256 `ab30149296d1f05c4125ebf05f8eec72db0d1331ac682fd0a55f43948a0eec22`。
+  未发布 PyPI/Kali 安装体，历史 v0.1.0/v0.1.1 tag 未改。
+- **v0.2.0 从 R10 继续，不把草稿当完成**：R10-A（实验设计、opt-in 集成层、
+  环境基线）已关闭并入库；R10-B 只有主仓未提交、未实证的两方案实现草稿；
+  R10-C 未开始。R11–R14 仍只有规格，未实施。当前仅保留 R10.md 的 /28 订正
+  与 tests/integration/test_network_boundary.py 的 R10-B 草稿两个有意未提交
+  文件，发布相关改动已全部入库。
+- 下一步：先评审 R10-B 草稿及清理/失败场景，再在可用 Docker 环境显式执行
+  `FOAM_INTEGRATION=1 .venv/bin/python -m pytest -q tests/integration/ -v`，
+  以端点独立证据决定两方案结论，之后进入 R10-C。默认离线套件不得全局
+  skip 掩盖实证缺口；裸 Kali SSH 通道未恢复，macOS/容器结果不得写成裸
+  Kali 已验证。
