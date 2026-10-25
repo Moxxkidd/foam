@@ -958,3 +958,27 @@ WP-13(整合)依赖全部
   以端点独立证据决定两方案结论，之后进入 R10-C。默认离线套件不得全局
   skip 掩盖实证缺口；裸 Kali SSH 通道未恢复，macOS/容器结果不得写成裸
   Kali 已验证。
+
+
+## 当前状态（2026-10-25：R10 研究关闭，下一步评审 R11）
+
+- [R10](items/R10.md) A/B/C 已完成，AC01–AC05 逐条有场景与真实输出。
+  本轮只交付 `tests/integration/` 隔离 PoC、规格/版本/交接记录；未改
+  `src/foam/` 或依赖，未进入 R11 生产接线。v0.2.0 仍在进行且未发布，
+  R11–R14 未实施，v0.1.3 发布结果不变。
+- 方案选择：推荐 R11 评审 **netns＋nftables**，容器＋gw 保留对照；理由是
+  少一个 Docker daemon 信任及版本相关 DNS/网桥/NAT 路径依赖，不是性能
+  排名。A 的 privileged harness 只是研究控制面，不是最小权限生产 helper。
+- 验证：Docker Desktop 29.2.1 / linuxkit 6.12.72 aarch64 上显式 opt-in
+  **28 passed in 171.97s**；前置 **231 passed + 2 skipped**；完整离线
+  **814 passed + 30 skipped**，ruff 全绿。离线 skip 中 28 项 R10 已由实机
+  命令另行覆盖，其余两项是既有 sshd/msfconsole 环境门。真实命令、镜像
+  ID、红绿输出、性能观察和清理结果见 R10 §6/§8。
+- 边界：仅支持普通 TCP/UDP、非特权 ICMP、bash/PTY/普通后代的显式
+  L3/L4 白名单；raw/nmap、URL 路径、域名动态绑定、代理/隧道和远端二次
+  跳转不支持，未验证公网 IPv6/SLAAC/DHCPv6、裸 Kali、真实 Kali 工具集或
+  Foam 生产旅程。daemon/宿主崩溃、掉电、pytest SIGKILL、所有启动中断点
+  与既有连接热收窄未验收；限制和拒绝启动情形见 R10 §6。
+- 下一步：只评审 [R11](items/R11.md) 的最小权限 helper、scope 编译与
+  失败拒绝/恢复设计，消费 R10 结论；不要把 R10 研究完成当成 R11 已实施。
+  本条未打 tag、未发布软件包。

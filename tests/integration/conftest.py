@@ -4,9 +4,9 @@
 
     FOAM_INTEGRATION=1 .venv/bin/python -m pytest -q tests/integration/ -v
 
-前置:本机 docker 可用、本地已有 ``debian:12-slim`` 镜像(经镜像站拉取并重
-tag,见 docs/items/R10.md §6)。实验镜像 ``foam-r10-lab:local`` 由本层现场
-构建;全部容器/网络/镜像在会话结束清理,清理结果断言无残留。
+前置:本机 docker 可用、本地已有镜像站 ``debian:12-slim`` 镜像(见
+docs/items/R10.md §6)。实验镜像按会话唯一 tag 现场构建;本会话容器/网络/
+镜像在会话结束清理,并按会话 label 查询残留。
 """
 
 from __future__ import annotations
@@ -17,12 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from .labkit import LAB_IMAGE, Lab, docker_available
+from .labkit import Lab, docker_available
 
 _HERE = Path(__file__).resolve().parent
 
 _ENABLE_HINT = (
-    "R10 集成实验默认关闭(需要本机 docker 与 debian:12-slim 镜像,"
+    "R10 集成实验默认关闭(需要本机 docker 与本地 "
+    "docker.m.daocloud.io/library/debian:12-slim 镜像,"
     "全部实验在容器/docker 网络内完成);启用:"
     "FOAM_INTEGRATION=1 .venv/bin/python -m pytest -q tests/integration/ -v"
 )
@@ -50,47 +51,85 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 @pytest.fixture(scope="session")
 def lab() -> Iterator[Lab]:
-    """会话级实验台账:建销全部 docker 资源,结尾留清理实证并断言无残留。"""
+    """会话级实验台账:逐项清理,查询与清理错误均随实录上报。"""
     lab = Lab()
-    yield lab
-    lab.cleanup()
-    rc_ps, ps = lab.run(["ps", "-a", "--format", "{{.Names}}"], check=False)
-    rc_net, nets = lab.run(
-        ["network", "ls", "--format", "{{.Names}}"], check=False
-    )
-    rc_img, imgs = lab.run(
-        ["images", "--format", "{{.Repository}}:{{.Tag}}"], check=False
-    )
-    residue = [
-        line
-        for line in (ps + nets + imgs).splitlines()
-        if lab.tag in line or LAB_IMAGE in line
-    ]
-    lab.evidence.append(
-        "# 清理实证(会话收尾)\n"
-        f"docker ps -a rc={rc_ps}; docker network ls rc={rc_net}; "
-        f"docker images rc={rc_img}\n"
-        f"本实验残留(应为空): {residue or '无'}\n"
-    )
-    path = lab.dump_evidence()
-    print(f"\n[R10] docker 命令级实验实录: {path}")
-    assert not residue, f"实验资源未清干净: {residue}"
+    try:
+        yield lab
+    finally:
+        cleanup_errors: list[str] = []
+        query_errors: list[str] = []
+        residue: list[str] = []
+        try:
+            cleanup_errors.extend(lab.cleanup())
+        except Exception as exc:
+            cleanup_errors.append(f"cleanup 异常: {type(exc).__name__}: {exc}")
+
+        queries = (
+            (
+                "容器",
+                [
+                    "ps", "-a", "--filter", f"label=foam.r10.run={lab.tag}",
+                    "--format", "{{.Names}}",
+                ],
+            ),
+            (
+                "网络",
+                [
+                    "network", "ls", "--filter", f"label=foam.r10.run={lab.tag}",
+                    "--format", "{{.Names}}",
+                ],
+            ),
+            (
+                "镜像",
+                [
+                    "images", "--filter", f"label=foam.r10.run={lab.tag}",
+                    "--format", "{{.Repository}}:{{.Tag}}",
+                ],
+            ),
+        )
+        for kind, args in queries:
+            try:
+                rc, out = lab.run(args, check=False, timeout=20)
+            except Exception as exc:
+                query_errors.append(f"{kind}查询异常: {type(exc).__name__}: {exc}")
+                continue
+            if rc != 0:
+                query_errors.append(f"{kind}查询失败 rc={rc}")
+                continue
+            residue.extend(
+                f"{kind}: {line}" for line in out.splitlines() if line.strip()
+            )
+
+        lab.evidence.append(
+            "# 清理实证(会话收尾)\n"
+            f"清理错误(应为空): {cleanup_errors or '无'}\n"
+            f"查询错误(应为空): {query_errors or '无'}\n"
+            f"本实验残留(应为空): {residue or '无'}\n"
+        )
+        path = lab.dump_evidence()
+        print(f"\n[R10] docker 命令级实验实录: {path}")
+        failures = [*cleanup_errors, *query_errors]
+        if residue:
+            failures.append(f"实验资源未清干净: {residue}")
+        if failures:
+            pytest.fail("\n".join(failures))
 
 
 @pytest.fixture(scope="session")
 def lab_image(lab: Lab) -> str:
     lab.build_image()
-    return LAB_IMAGE
+    return lab.image
 
 
 @pytest.fixture(scope="session")
 def harness(lab: Lab, lab_image: str) -> str:
     """方案 A 的特权实验容器:netns/nftables 实验全部在它内部完成。"""
-    name = lab.add_container(lab.name("harness"))
+    name = lab.name("harness")
     lab.run(
         [
-            "run", "-d", "--name", name, "--privileged",
-            lab_image, "sleep", "infinity",
+            "run", "-d", "--name", name, "--init", "--privileged",
+            *lab.label_args(), lab_image, "sleep", "infinity",
         ]
     )
+    lab.add_container(name)
     return name

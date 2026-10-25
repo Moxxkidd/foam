@@ -14,8 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
-LAB_IMAGE = "foam-r10-lab:local"
-DEBIAN_IMAGE = "debian:12-slim"
+DEBIAN_IMAGE = "docker.m.daocloud.io/library/debian:12-slim"
 
 # 容器内 apt 换 TUNA 源(deb.debian.org 直连在本网络不可用,见 R10.md §6)。
 # dnsmasq-base 只取 dnsmasq 二进制,不带 init 脚本;bsdutils 提供 script(PTY)。
@@ -32,8 +31,8 @@ APT_PREPARE = (
 )
 
 # 合成 HTTP 端点:每收到一个 GET 把请求路径追加到 ``__file__.<port>.hits``
-# ——允许/拒绝的端点侧独立证据,不依赖被测侧输出。v6 不可用时(plan B 的
-# docker 默认网络)退化为纯 v4,不影响实验。
+# ——允许/拒绝的端点侧独立证据,不依赖被测侧输出。双栈 socket 不可用时
+# 退回纯 v4;各方案的 v6 验收由独立探针决定,不把退回视为 v6 通过。
 SERVE_PY = '''\
 import contextlib
 import socket
@@ -102,15 +101,28 @@ def dnsmasq_cmd(answer_ip: str, log: str) -> str:
     )
 
 
+def _output_text(output: str | bytes | None) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode(errors="replace")
+    return output
+
+
 class Lab:
-    """实验资源台账:创建时登记,``cleanup`` 统一销毁,全程命令留证。"""
+    """实验资源台账:创建成功后登记,``cleanup`` 统一销毁,全程命令留证。"""
 
     def __init__(self) -> None:
         self.tag = uuid.uuid4().hex[:8]
+        self.image = f"foam-r10-lab:{self.tag}"
         self.containers: list[str] = []
         self.networks: list[str] = []
         self.built_image = False
         self.evidence: list[str] = []
+
+    def label_args(self) -> list[str]:
+        """返回供 docker create/run/build/network create 显式展开的会话标签。"""
+        return ["--label", f"foam.r10.run={self.tag}"]
 
     def run(
         self,
@@ -121,21 +133,29 @@ class Lab:
         input_text: str | None = None,
     ) -> tuple[int, str]:
         started = time.monotonic()
-        proc = subprocess.run(  # noqa: S603  # 固定 argv 编排 docker,无 shell
-            [_DOCKER, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            input=input_text,
-        )
+        try:
+            proc = subprocess.run(  # noqa: S603  # 固定 argv 编排 docker,无 shell
+                [_DOCKER, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                input=input_text,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            elapsed = time.monotonic() - started
+            out = ""
+            if isinstance(exc, subprocess.TimeoutExpired):
+                out = _output_text(exc.output) + _output_text(exc.stderr)
+            self.evidence.append(
+                f"$ docker {' '.join(args)}\n"
+                f"# {type(exc).__name__} ({elapsed:.1f}s): {exc}\n{out}\n"
+            )
+            raise
         out = (proc.stdout or "") + (proc.stderr or "")
         elapsed = time.monotonic() - started
-        shown = out.rstrip()
-        if len(shown) > 4000:
-            shown = shown[:4000] + "\n...(截断)"
         self.evidence.append(
             f"$ docker {' '.join(args)}\n"
-            f"# rc={proc.returncode} ({elapsed:.1f}s)\n{shown}\n"
+            f"# rc={proc.returncode} ({elapsed:.1f}s)\n{out}\n"
         )
         if check and proc.returncode != 0:
             raise RuntimeError(
@@ -147,29 +167,110 @@ class Lab:
         return f"r10-{role}-{self.tag}"
 
     def add_container(self, name: str) -> str:
+        """仅在 docker run 成功后登记;创建失败不得登记或删除同名资源。"""
         self.containers.append(name)
         return name
 
     def add_network(self, name: str) -> str:
+        """仅在 network create 成功后登记;创建失败不得登记或删除同名资源。"""
         self.networks.append(name)
         return name
 
     def build_image(self) -> None:
-        dockerfile = f"FROM {DEBIAN_IMAGE}\nRUN {APT_PREPARE}\n"
+        rc, out = self.run(
+            [
+                "image", "inspect", "--format",
+                "{{.Id}} {{json .RepoDigests}}", DEBIAN_IMAGE,
+            ],
+            check=False,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"R10 基础镜像 {DEBIAN_IMAGE} 不在本地或无法检查;"
+                f"不会自动访问 Docker Hub 拉取:\n{out}"
+            )
+        dockerfile = (
+            f"FROM {DEBIAN_IMAGE}\nRUN {APT_PREPARE}\n"
+            # 默认 ping 的权限位与 NNP 执行冲突;副本只走非特权 ICMP。
+            "RUN cp /usr/bin/ping /usr/local/bin/ping"
+            " && chmod 0755 /usr/local/bin/ping\n"
+        )
+        self.built_image = True
         self.run(
-            ["build", "-t", LAB_IMAGE, "-"],
+            [
+                "build", "--pull=false", *self.label_args(),
+                "-t", self.image, "-",
+            ],
             timeout=900,
             input_text=dockerfile,
         )
-        self.built_image = True
 
-    def cleanup(self) -> None:
-        for name in reversed(self.containers):
-            self.run(["rm", "-f", name], check=False)
-        for name in reversed(self.networks):
-            self.run(["network", "rm", name], check=False)
-        if self.built_image:
-            self.run(["rmi", LAB_IMAGE], check=False)
+    def cleanup(self) -> list[str]:
+        """清理台账及本会话 label 资源;逐项留错并继续。"""
+        errors: list[str] = []
+        owned_images = [self.image] if self.built_image else []
+        queries = (
+            (
+                "容器",
+                [
+                    "ps", "-a", "--filter", f"label=foam.r10.run={self.tag}",
+                    "--format", "{{.Names}}",
+                ],
+                self.containers,
+            ),
+            (
+                "网络",
+                [
+                    "network", "ls", "--filter", f"label=foam.r10.run={self.tag}",
+                    "--format", "{{.Name}}",
+                ],
+                self.networks,
+            ),
+            (
+                "镜像",
+                [
+                    "images", "--filter", f"label=foam.r10.run={self.tag}",
+                    "--format", "{{.Repository}}:{{.Tag}}",
+                ],
+                owned_images,
+            ),
+        )
+        for kind, args, owned in queries:
+            try:
+                rc, out = self.run(args, check=False, timeout=20)
+            except Exception as exc:
+                errors.append(f"{kind}归属查询异常: {type(exc).__name__}: {exc}")
+                continue
+            if rc != 0:
+                errors.append(f"{kind}归属查询失败 rc={rc}: {out.strip()}")
+                continue
+            for name in out.splitlines():
+                if name and name not in owned:
+                    owned.append(name)
+
+        actions = [
+            ("容器", name, ["rm", "-f", name])
+            for name in reversed(self.containers)
+        ]
+        actions.extend(
+            ("网络", name, ["network", "rm", name])
+            for name in reversed(self.networks)
+        )
+        actions.extend(
+            ("镜像", name, ["rmi", name]) for name in reversed(owned_images)
+        )
+        for kind, name, args in actions:
+            try:
+                rc, out = self.run(args, check=False, timeout=20)
+            except Exception as exc:
+                errors.append(f"{kind} {name} 清理异常: {type(exc).__name__}: {exc}")
+                continue
+            absent = "no such" in out.lower() or (
+                kind == "网络" and "not found" in out.lower()
+            )
+            if rc != 0 and not absent:
+                errors.append(f"{kind} {name} 清理失败 rc={rc}: {out.strip()}")
+        return errors
 
     def dump_evidence(self) -> Path:
         path = Path(tempfile.gettempdir()) / f"foam-r10-evidence-{self.tag}.md"
@@ -200,6 +301,9 @@ def docker_exec(
 def push_file(lab: Lab, container: str, dest: str, content: str) -> None:
     """把文本内容写入容器内文件(经 stdin,避免引号转义层叠)。"""
     lab.run(
-        ["exec", "-i", container, "bash", "-c", f"cat > {dest}"],
+        [
+            "exec", "-i", "--user", "0", container,
+            "bash", "-c", 'cat > "$1"', "bash", dest,
+        ],
         input_text=content,
     )
