@@ -963,9 +963,9 @@ WP-13(整合)依赖全部
 ## 当前状态（2026-10-25：R10 研究关闭，下一步评审 R11）
 
 - [R10](items/R10.md) A/B/C 已完成，AC01–AC05 逐条有场景与真实输出。
-  本轮只交付 `tests/integration/` 隔离 PoC、规格/版本/交接记录；未改
-  `src/foam/` 或依赖，未进入 R11 生产接线。v0.2.0 仍在进行且未发布，
-  R11–R14 未实施，v0.1.3 发布结果不变。
+  本轮只交付 `tests/integration/` 隔离 PoC、规格/版本/交接记录及 CI
+  skip 历史计数注释校正；未改 `src/foam/` 或依赖，未进入 R11 生产接线。
+  v0.2.0 仍在进行且未发布，R11–R14 未实施，v0.1.3 发布结果不变。
 - 方案选择：推荐 R11 评审 **netns＋nftables**，容器＋gw 保留对照；理由是
   少一个 Docker daemon 信任及版本相关 DNS/网桥/NAT 路径依赖，不是性能
   排名。A 的 privileged harness 只是研究控制面，不是最小权限生产 helper。

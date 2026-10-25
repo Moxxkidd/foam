@@ -12,8 +12,10 @@
 #      规格 skip)」。
 #   2. test_msfconsole_full_flow —— 需 msfconsole(Kali 才有);CI 四类
 #      runner 与非 Kali 本机均 skipif,待 Kali 实测补跑。
-# 即:CI 各 leg 恰 1 skipped(msfconsole 项);本机基线(macOS arm64,
-# py3.12.14)为 685 passed + 2 skipped;同一套件总用例数恒 687。
+# 即:R05-B 当时 CI 各 leg 恰 1 skipped(msfconsole 项);本机基线(macOS
+# arm64,py3.12.14)为 685 passed + 2 skipped;总用例数 687。以上为历史
+# 计数;后续 R10 Linux opt-in 实验默认在 CI 另产生 skip,须用
+# FOAM_INTEGRATION=1 在隔离 Linux 环境实跑,不得把 CI skip 当作实证。
 # (2026-10-06 收口修正:初版注释误称 runner 无 sshd、预期 2 skipped,
 # 与上述实测相反,已按 run 日志实况改写。)
 #
