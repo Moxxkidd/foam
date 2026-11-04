@@ -1001,3 +1001,5 @@ WP-13(整合)依赖全部
 - 下一步：进入 R11-B，先接 run/resume/TUI 的显式 legacy/protected 模式，
   再按既有评审顺序停止旧代际、替换规则、精确清 conntrack 并验证已有连接
   被撤销；任何失败保持停止，不自动 fallback。
+- 交付：主提交 `414f1a6` 与 PTY 修复 `c7ef5b8` 已推送 main；修复后 CI
+  `41774195624` 五 job 全绿、无 rerun。详见 R11 §8。
