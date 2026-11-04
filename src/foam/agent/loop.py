@@ -466,6 +466,18 @@ class AgentLoop:
         # R03 停止派发闸:任何终态路径置位后,_execute_tool 拒绝执行新调用
         # (工具层 aclose 拒绝为兜底;正常流程终态后不会再有调用,此为防线)。
         self._dispatch_stopped = False
+        self._dispatch_gate = asyncio.Event()
+        self._dispatch_gate.set()
+        self._executor = getattr(bash, "executor", None)
+        if (
+            session is not None
+            and self._executor is not None
+            and self._executor.boundary is not None
+            and session.executor is not self._executor
+        ):
+            raise ValueError("protected Bash 与 PTY 必须共用同一个 ToolExecutor")
+        self._scope_change_lock = asyncio.Lock()
+        self._scope_failure: str | None = None
         # R03 收割报告(kill 路径先收,统一终态面复用,不重复收割)。
         self._cleanup_report: dict[str, Any] | None = None
         self._wake = asyncio.Event()
@@ -527,17 +539,61 @@ class AgentLoop:
         if task is not None and not task.done():
             task.cancel()
 
-    def replace_scope(self, scope: Scope) -> None:
-        """原子换护栏 scope(WP-14c,定案 D2):frozen dataclass 一次引用赋值,
-        asyncio 单线程无撕裂,下一条命令即生效;不重建 system prompt(Q3),
-        不动会话/jobs/索引。终态拒绝:run 已收尾不可再授权。
-
-        注意(定案 D10):AgentLoop 不加公开 scope 读取面——无 property、无
-        getter;loop 内的 Scope 是执行面私有状态,只能经本方法原子换。
-        """
+    async def replace_scope(
+        self, scope: Scope, *, digest: str = "", dns: str | None = None
+    ) -> None:
+        """legacy 原子换引用；protected 停派发、杀旧代际并换新边界。"""
         if self._status in ("finished", "killed", "error", "cancelled"):
             raise RuntimeError("run 已终态,不可更换 scope(D2)")
-        self._scope = scope
+        async with self._scope_change_lock:
+            boundary = (
+                self._executor.boundary if self._executor is not None else None
+            )
+            if boundary is None:
+                self._scope = scope
+                return
+            self._dispatch_gate.clear()
+            try:
+                async with self._executor.generation_transition():
+                    await asyncio.to_thread(boundary.retire_generation)
+                    for label, tool in (
+                        ("bash", self._bash),
+                        ("session", self._session),
+                    ):
+                        if tool is None:
+                            continue
+                        report = await tool.retire()
+                        if report.get("cleanup_status") != "ok":
+                            raise RuntimeError(
+                                f"{label} 旧代际收割未完成: {report}"
+                            )
+                    drain = await self.drain_job_exits()
+                    if drain.get("errors"):
+                        raise RuntimeError(f"旧 job 事件排空失败: {drain['errors']}")
+                    await asyncio.to_thread(
+                        boundary.apply_scope, scope, dns=dns, digest=digest
+                    )
+                    if self._dispatch_stopped:
+                        raise RuntimeError("run 正在收尾,拒绝恢复新代际")
+                    self._scope = scope
+                    if self._index is not None:
+                        self._bash.on_job_exit = self._schedule_job_exit
+            except Exception as exc:
+                self._dispatch_stopped = True
+                self._executor.close()
+                self._scope_failure = f"scope 热收窄失败,run 终止: {exc}"
+                self._dispatch_gate.set()
+                self._wake.set()
+                task = self._run_task
+                if (
+                    task is not None
+                    and not task.done()
+                    and task is not asyncio.current_task()
+                ):
+                    task.cancel()
+                raise
+            else:
+                self._dispatch_gate.set()
 
     # ---------- 主入口 ----------
 
@@ -565,10 +621,10 @@ class AgentLoop:
         try:
             result = await self._main()
         except asyncio.CancelledError:
-            if not self._kill_requested:
-                # 外部取消(R03):不直接裸传——先走统一终态面(停止派发、收割、
-                # run_finished(status=cancelled)),再如实重抛。该路径此前无
-                # 终态记录,是 R03 新增(kind 不变,重放兼容;见 R03.md §7)。
+            if self._scope_failure is not None:
+                result = self._finalize_error(self._scope_failure)
+            elif not self._kill_requested:
+                # 外部取消(R03):先走统一终态面，再如实重抛。
                 result = RunResult(
                     status="cancelled",
                     summary="",
@@ -579,7 +635,8 @@ class AgentLoop:
                 )
                 result = await self._finish(result)
                 raise asyncio.CancelledError from None
-            result = await self._finalize_killed()
+            else:
+                result = await self._finalize_killed()
         except BackendError as exc:
             result = self._finalize_error(str(exc))
         except Exception as exc:  # 非预期异常:如实记 error,不炸 headless
@@ -853,6 +910,7 @@ class AgentLoop:
     # ---------- 工具执行 ----------
 
     async def _execute_tool(self, call: ToolCall) -> dict[str, Any]:
+        await self._dispatch_gate.wait()
         # R03 停止派发闸:终态后不再执行任何工具(防线;正常流程到不了这里,
         # 工具层 aclose 拒绝是兜底)。不开卡不上屏:调用从未发生。
         if self._dispatch_stopped:

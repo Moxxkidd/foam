@@ -604,6 +604,8 @@ def _run_argv(home: Path, *extra: str) -> list[str]:
     scope_file.write_text(SCOPE_TEXT, encoding="utf-8")
     return [
         "run",
+        "--execution-mode",
+        "legacy",
         "--scope",
         str(scope_file),
         "--objective",

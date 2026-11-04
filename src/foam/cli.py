@@ -98,6 +98,14 @@ R09(2026-10-12,verify 与终态证据):
   证据 manifest 与结项页(``_write_terminal_evidence``;失败只 stderr
   警告,不反转 run 退出码),TUI ``_run_to_end`` 同构接线。
 
+R11-B(2026-11-04,执行边界入口):
+
+- run/resume/tui 必须显式选择 ``--execution-mode protected|legacy``;
+  不从 env/profile 推断。protected 绑定授权字节 digest,为 Bash/PTY
+  注入同一 ToolExecutor;任何 boundary 错误均拒绝启动,不回退 legacy。
+- legacy 明示仅有 Bash 参数级护栏、无网络强制、继承完整环境,已有连接
+  不随 scope 撤销;protected 显示 boundary_id 与 epoch。
+
 本文件所有权:WP-04 初版 → WP-10 接管(两 WP 开发日志均有声明)→
 WP-14b(headless 双通道与 resume 对账)。
 """
@@ -147,6 +155,7 @@ from foam.evidence import (
     write_manifest,
 )
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_LOADED, AuditLog
+from foam.guard.network import BoundaryError, NetworkBoundary
 from foam.guard.scope import GuardDecision, Scope, parse_scope, scope_payload
 from foam.replay import (
     build_report,
@@ -167,6 +176,7 @@ from foam.state.files import (
 )
 from foam.tools.bash import TOOL_SCHEMAS as BASH_TOOL_SCHEMAS
 from foam.tools.bash import BashTool
+from foam.tools.execution import ToolExecutor
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
 from foam.tools.session import SessionTool, mask_call_arguments
 from foam.tools.state import TOOL_SCHEMAS as STATE_TOOL_SCHEMAS
@@ -297,6 +307,13 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
         help="本次装配成功后,把解析出的 backend/model/base-url 存为 profile "
         "并设为 active(下次启动自动生效;密钥永不落盘,仍只走环境变量;"
         "base-url 落盘副本脱敏——剥 userinfo、敏感 query 打码,运行时原值不动)",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=("protected", "legacy"),
+        required=True,
+        help="执行边界(必须显式选择):protected=Linux root 隔离执行;"
+        "legacy=传统路径,无网络强制且继承环境;不从 env/profile 猜测",
     )
 
 
@@ -681,6 +698,7 @@ def _assemble_runtime(
     runtime: _Runtime,
     scope: Scope,
     scope_source: str,
+    scope_digest: str,
     backend: LLMBackend,
     observer: LoopObserver,
 ) -> _Runtime:
@@ -695,9 +713,14 @@ def _assemble_runtime(
     runtime.scope_loaded_record = audit.append(
         KIND_SCOPE_LOADED, scope_payload(scope, scope_source)
     )
-    bash = BashTool(engagement.paths.outputs)
+    executor = ToolExecutor()
+    if args.execution_mode == "protected":
+        boundary = NetworkBoundary.create(scope, digest=scope_digest)
+        runtime.boundary = boundary
+        executor = ToolExecutor(boundary=boundary)
+    bash = BashTool(engagement.paths.outputs, executor=executor)
     runtime.bash = bash
-    session = SessionTool(engagement.paths.outputs / "sessions")
+    session = SessionTool(engagement.paths.outputs / "sessions", executor=executor)
     runtime.session = session
     state = StateTool(engagement)
     runtime.state = state
@@ -735,6 +758,18 @@ def _assemble_runtime(
     runtime.loop = loop
     runtime.toolmap_line = render_startup_line(scan)
     runtime.backend = backend
+    if runtime.boundary is None:
+        print(
+            "[execution] mode=legacy;仅 Bash 参数级护栏,无网络强制,"
+            "继承完整环境,已有连接不随 scope 撤销",
+            flush=True,
+        )
+    else:
+        print(
+            f"[execution] mode=protected boundary={runtime.boundary.boundary_id} "
+            f"epoch={runtime.boundary.epoch}",
+            flush=True,
+        )
     return runtime
 
 
@@ -937,14 +972,22 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
             "越界命令将被护栏拒绝并记审计",
             flush=True,
         )
-        _assemble_runtime(
-            args,
-            runtime=runtime,
-            scope=scope,
-            scope_source=str(args.scope),
-            backend=backend,
-            observer=_CliObserver(),
-        )
+        try:
+            _assemble_runtime(
+                args,
+                runtime=runtime,
+                scope=scope,
+                scope_source=str(args.scope),
+                scope_digest=scope_digest,
+                backend=backend,
+                observer=_CliObserver(),
+            )
+        except BoundaryError as exc:
+            print(
+                f"[错误] protected 执行边界创建失败:{exc};未回退 legacy",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
         # Q8:file 流装配后补确认记录(与 scope_loaded 相邻、run_started 之前)
         _append_file_scope_confirm(runtime.audit, scope, str(args.scope), scope_digest)
         # D6 写入点①:file 流装配时落动态段
@@ -1005,7 +1048,7 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
             audit.close()
             return EXIT_USAGE  # W14b-4:编译失败归 2,无进程内重试(Q6)
         try:
-            freeze_scope(
+            scope_digest = freeze_scope(
                 engagement, audit, compilation, source="nl", nl_text=args.scope_text
             )
         except OSError as exc:
@@ -1031,14 +1074,22 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
             print(f"  {rule}", flush=True)
         if not compilation.rules:
             print("  (空——任何网络目标都会被拒)", flush=True)  # Q9 醒目行
-        _assemble_runtime(
-            args,
-            runtime=runtime,
-            scope=compilation.scope,
-            scope_source=str(confirmed_path),
-            backend=backend,
-            observer=_CliObserver(),
-        )
+        try:
+            _assemble_runtime(
+                args,
+                runtime=runtime,
+                scope=compilation.scope,
+                scope_source=str(confirmed_path),
+                scope_digest=scope_digest,
+                backend=backend,
+                observer=_CliObserver(),
+            )
+        except BoundaryError as exc:
+            print(
+                f"[错误] protected 执行边界创建失败:{exc};未回退 legacy",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
         driven = True
         return await _drive(runtime, objective=args.objective)
     finally:
@@ -1280,14 +1331,22 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
             f"{args.recent_rounds} 轮)",
             flush=True,
         )
-        _assemble_runtime(
-            args,
-            runtime=runtime,
-            scope=scope,
-            scope_source=scope_source,
-            backend=backend,
-            observer=_CliObserver(),
-        )
+        try:
+            _assemble_runtime(
+                args,
+                runtime=runtime,
+                scope=scope,
+                scope_source=scope_source,
+                scope_digest=scope_digest,
+                backend=backend,
+                observer=_CliObserver(),
+            )
+        except BoundaryError as exc:
+            print(
+                f"[错误] protected 执行边界创建失败:{exc};未回退 legacy",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
         if args.scope:
             # W14b-3:--scope 显式覆盖 = 命令行重新授权,与 run file 流同义补写
             # (Q8;plain resume 不补,确认计数不变)。R02 提交协议:确认记录

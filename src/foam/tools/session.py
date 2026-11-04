@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .execution import ToolExecutor, wait_for_exit
+from .execution import ExecutionPaused, ToolExecutor, wait_for_exit
 from .output import OutputManifest, OutputRecorder
 
 #: 同时存活的会话上限(含已退出未关闭的:master fd 仍占着,关了才算释放)。
@@ -430,20 +430,30 @@ class SessionTool:
 
     async def session_open(self, command: str) -> dict[str, Any]:
         if self._closed:
-            # R03:aclose 后拒绝新会话(停止派发兜底;否则新会话无人收割)
             return {
                 "error": "会话层已关闭(run 已收尾),拒绝开新会话",
                 "status": "closed",
             }
-        active = [s for s in self._sessions.values() if s.status != "closed"]
-        if len(active) >= self._max_sessions:
-            return {
-                "error": (
-                    f"已达会话上限 {self._max_sessions}(未关闭会话 "
-                    f"{len(active)} 个);先 session_close 释放再开。"
-                )
-            }
         session_id = "s-" + uuid.uuid4().hex[:10]
+        try:
+            async with self.executor.generation() as epoch:
+                active = [
+                    s for s in self._sessions.values() if s.status != "closed"
+                ]
+                if len(active) >= self._max_sessions:
+                    return {
+                        "error": (
+                            f"已达会话上限 {self._max_sessions}(未关闭会话 "
+                            f"{len(active)} 个);先 session_close 释放再开。"
+                        )
+                    }
+                return await self._open_session(command, session_id, epoch)
+        except ExecutionPaused as exc:
+            return {"error": str(exc), "session_id": None, "status": "paused"}
+
+    async def _open_session(
+        self, command: str, session_id: str, epoch: int | None
+    ) -> dict[str, Any]:
         master, slave = pty.openpty()
         _set_winsize(slave, _PTY_ROWS, _PTY_COLS)
         try:
@@ -459,7 +469,7 @@ class SessionTool:
             os.close(master)
             os.close(slave)
             raise
-        os.close(slave)  # 父进程只留 master;留着 slave 永远等不到 EOF
+        os.close(slave)
 
         loop = asyncio.get_running_loop()
         reader: asyncio.StreamReader = asyncio.StreamReader(
@@ -471,26 +481,23 @@ class SessionTool:
                 os.fdopen(master, "rb", buffering=0),
             )
         except Exception:
-            _kill_process_group(proc)  # 别留无主子进程
+            _kill_process_group(proc)
             await proc.wait()
             os.close(master)
             raise
         recorder = OutputRecorder(
-            self.output_dir, session_id,
-            ring_buffer_bytes=self._ring_bytes, split=False,
+            self.output_dir,
+            session_id,
+            ring_buffer_bytes=self._ring_bytes,
+            split=False,
         )
-        # R07(AC04):转录是敏感产物(可能含口令回显),权限钉 0600——
-        # OutputRecorder 构造即建文件(output.py:84),此处直接 chmod,
-        # 不随 umask 漂移。评审收口:chmod 失败与 spawn/connect 失败同形态
-        # ——清理已建资源(杀进程组/收割/关 transport 与 recorder 句柄/删
-        # 空转录)后上抛:open 失败即无会话产生,不留未注册孤儿。
         try:
             os.chmod(recorder.combined_path, 0o600)
         except Exception:
             _kill_process_group(proc)
             await proc.wait()
             transport.close()
-            recorder.finalize()  # 幂等关闭文件句柄
+            recorder.finalize()
             with contextlib.suppress(OSError):
                 os.unlink(recorder.combined_path)
             raise
@@ -503,7 +510,7 @@ class SessionTool:
             master_fd=master,
             started_mono=time.monotonic(),
             started_wall=time.time(),
-            epoch=self.executor.epoch,
+            epoch=epoch,
         )
         self._sessions[session_id] = session
         session.reader_task = asyncio.create_task(self._reader_loop(session, reader))
@@ -512,7 +519,7 @@ class SessionTool:
             "status": "running",
             "pid": proc.pid,
             "output_path": str(recorder.combined_path),
-            "sha256": None,  # 会话存活期间哈希未定稿
+            "sha256": None,
             "note": (
                 "用 session_send 写入(自动补行尾),session_read 读增量输出"
                 "(可带 wait_pattern 等待),session_close 关闭并释放配额。"
@@ -700,30 +707,31 @@ class SessionTool:
             )
         return {"sessions": entries, "count": len(entries)}
 
+    async def retire(self) -> dict[str, Any]:
+        """收割当前代际；成功后作废旧 id，但不关闭共享 executor。"""
+        result = await self._reap_sessions()
+        if result["cleanup_status"] == "ok":
+            self._sessions.clear()
+        return result
+
     async def aclose(self) -> dict[str, Any]:
-        """关闭全部会话(R03 统一关闭原语;WP-04 kill switch / 收尾用)。
-
-        语义与 bash 层对齐:无宽限期整组 SIGKILL;收割等待一次
-        ``wait_for(gather(全部 done.wait()))``,总上界
-        ``CLOSE_REAP_TIMEOUT_SECONDS``;幂等——二次调用短路返回首次结果对象。
-
-        R03-AC06 修复:收割上界内未完成的会话**不再强标 closed**(旧实现
-        :634-635 的粉饰),如实列入 ``remaining_resources``(以 done.is_set()
-        为准);transport 仍照常关闭释放本端 fd——直接子进程 SIGKILL 必死,
-        残留形态是组外逃逸后代占着 pty slave,关 master 让读循环尽快落地。
-        closing 标记与自然退出(exited)的区分不变(WP-05 陷阱)。
-        """
+        """永久关闭会话层并有界收割全部未完结会话。"""
         if self._close_result is not None:
             return self._close_result
         self._closed = True
         self.executor.close()
+        result = await self._reap_sessions()
+        self._close_result = result
+        return result
+
+    async def _reap_sessions(self) -> dict[str, Any]:
         errors: list[str] = []
         for session in self._sessions.values():
             if session.status == "running" and not session.done.is_set():
                 session.closing = True
                 try:
                     _kill_process_group(session.proc)
-                except OSError as exc:  # _kill_process_group 已自收 Lookup;防御
+                except OSError as exc:
                     errors.append(f"会话 {session.session_id}: 杀进程组异常: {exc!r}")
         waits = [
             s.done.wait() for s in self._sessions.values() if not s.done.is_set()
@@ -734,12 +742,12 @@ class SessionTool:
                     asyncio.gather(*waits), timeout=CLOSE_REAP_TIMEOUT_SECONDS
                 )
             except TimeoutError:
-                pass  # 上界到点:下方如实上报残留(R03-AC06)
+                pass
         remaining: list[dict[str, Any]] = []
         for session in self._sessions.values():
             if session.done.is_set():
                 if session.status == "running":
-                    session.status = "closed"  # 我们杀的;自然退出的保持 exited
+                    session.status = "closed"
             else:
                 remaining.append(
                     {
@@ -753,14 +761,12 @@ class SessionTool:
             try:
                 session.transport.close()
             except OSError:
-                pass  # EOF 后 transport 可能已自闭合
-        result: dict[str, Any] = {
+                pass
+        return {
             "cleanup_status": "partial" if (remaining or errors) else "ok",
             "remaining_resources": remaining,
             "errors": errors,
         }
-        self._close_result = result
-        return result
 
     # ---------- 内部:读循环、提示识别、结果装配 ----------
 

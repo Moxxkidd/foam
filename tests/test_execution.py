@@ -207,3 +207,46 @@ async def test_close_run_reaps_tools_before_boundary() -> None:
     result = await close_run(runtime, reason="R11 test")
     assert result["cleanup_status"] == "ok"
     assert order == ["bash", "session", "boundary"]
+
+
+async def test_pty_spawn_and_registration_complete_before_generation_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executor = ToolExecutor()
+    sessions = SessionTool(tmp_path / "sessions", executor=executor)
+    original_spawn = executor.spawn
+    spawn_started = asyncio.Event()
+    allow_spawn = asyncio.Event()
+
+    async def controlled_spawn(*args, **kwargs):
+        spawn_started.set()
+        await allow_spawn.wait()
+        return await original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "spawn", controlled_spawn)
+    transition_entered = asyncio.Event()
+    release_transition = asyncio.Event()
+
+    async def transition():
+        async with executor.generation_transition():
+            transition_entered.set()
+            await release_transition.wait()
+
+    open_task = asyncio.create_task(sessions.session_open("sleep 5"))
+    transition_task = None
+    try:
+        await asyncio.wait_for(spawn_started.wait(), timeout=2)
+        transition_task = asyncio.create_task(transition())
+        await asyncio.sleep(0.05)
+        assert not transition_entered.is_set()
+        allow_spawn.set()
+        opened = await asyncio.wait_for(open_task, timeout=2)
+        assert opened["status"] == "running"
+        await asyncio.wait_for(transition_entered.wait(), timeout=2)
+    finally:
+        allow_spawn.set()
+        release_transition.set()
+        if transition_task is not None:
+            await asyncio.wait_for(transition_task, timeout=2)
+        await open_task
+        await sessions.aclose()

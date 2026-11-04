@@ -620,12 +620,12 @@ async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
         # 顶栏:engagement id + 呼号;状态 finished
         assert "呼号 nightowl" in main.query_one("#sb-center").content
         assert "已完成" in str(main.query_one("#sb-right").render())
-        # 叙述流:objective 回显 → 思考块①(折叠)→ 正文① → 工具卡(✓ 折叠)
-        # → 思考块② → 正文② → 结项证据通知(R09:run 终态 manifest 落盘)
-        # → final(每轮思考独立成块)
+        # 叙述流:objective 回显 → 执行模式 → 思考块① → 正文① → 工具卡
+        # → 思考块② → 正文② → 结项证据通知 → final。
         kinds = [type(w).__name__ for w in main.narrative.children]
         assert kinds == [
             "NoticeBlock",
+            "NoticeBlock",  # R11:显式执行模式与能力边界
             "ThinkingBlock",
             "StreamBlock",
             "ToolCard",
@@ -1883,13 +1883,13 @@ async def test_replace_scope_terminal_states_raise(tmp_path):
     task = asyncio.create_task(loop.run("obj"))
     await wait_for(lambda: loop._rounds >= 1 and loop.status == "idle")
     new_scope = parse_scope("10.0.0.0/8\n")
-    loop.replace_scope(new_scope)
+    await loop.replace_scope(new_scope)
     assert loop._scope is new_scope  # 一次引用赋值(D2)
     loop.kill("收工")
     result = await asyncio.wait_for(task, timeout=5)
     assert result.status == "killed"
     with pytest.raises(RuntimeError):
-        loop.replace_scope(parse_scope("192.0.2.0/24\n"))
+        await loop.replace_scope(parse_scope("192.0.2.0/24\n"))
     audit.close()
 
     # finished 拒绝
@@ -1897,7 +1897,7 @@ async def test_replace_scope_terminal_states_raise(tmp_path):
     result2 = await loop2.run("obj")
     assert result2.status == "finished"
     with pytest.raises(RuntimeError):
-        loop2.replace_scope(parse_scope("10.0.0.0/8\n"))
+        await loop2.replace_scope(parse_scope("10.0.0.0/8\n"))
     audit2.close()
 
 
@@ -2509,7 +2509,7 @@ async def test_file_scope_modified_after_start_run_unaffected_and_resume_refuses
     # 须离开本测试的事件循环,放线程里跑)
     rc = await asyncio.to_thread(
         cli_main,
-        ["resume", str(root)],
+        ["resume", "--execution-mode", "legacy", str(root)],
         backend_factory=lambda _a: ScriptedBackend([[TextDelta("x"), Usage(1, 1)]]),
     )
     assert rc == 2
@@ -2592,7 +2592,7 @@ def test_tui_created_engagement_resumes_from_different_cwd(
     other_cwd.mkdir()
     monkeypatch.chdir(other_cwd)
     rc = cli_main(
-        ["resume", str(root)],
+        ["resume", "--execution-mode", "legacy", str(root)],
         backend_factory=lambda _a: ScriptedBackend([[TextDelta("x"), Usage(1, 1)]]),
     )
     assert rc == 0, capsys.readouterr().err
@@ -2796,3 +2796,140 @@ def test_tool_call_display_session_send_mask_and_surrogate():
         "session_send", {"session_id": "s-x", "text": "a\ud800b"}
     )
     assert "***（" in shown2
+
+
+async def test_tui_protected_start_failure_never_falls_back(tmp_path, monkeypatch):
+    from foam.guard.network import ExecutionUnsupportedError, NetworkBoundary
+
+    def fail_create(_scope, **_kwargs):
+        raise ExecutionUnsupportedError("TESTONLY TUI protected unsupported")
+
+    monkeypatch.setattr(NetworkBoundary, "create", fail_create)
+    app = TuiApp(make_config(tmp_path, [], execution_mode="protected"))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("recon protected")
+        await wait_for(
+            lambda: notices_containing(main, "protected 执行边界创建失败") != []
+        )
+        assert app.run_handle is None
+        assert app.config.backend.chat_count == 0
+        error = notices_containing(main, "protected 执行边界创建失败")[-1].content
+        assert "TESTONLY TUI protected unsupported" in error
+        assert "未回退 legacy" in error
+
+
+@pytest.mark.parametrize("mode", ["legacy", "protected"])
+async def test_tui_displays_execution_capabilities_and_cleans_boundary(
+    tmp_path, monkeypatch, mode
+):
+    from foam.guard.network import NetworkBoundary
+
+    created = []
+
+    class Boundary:
+        boundary_id = "b-tui"
+        epoch = 1
+
+        def __init__(self):
+            self.closed = False
+
+        def aclose(self):
+            self.closed = True
+            return {"cleanup_status": "clean", "remaining_resources": [], "errors": []}
+
+    boundary = Boundary()
+
+    def create(scope, **kwargs):
+        created.append((scope, kwargs))
+        if mode == "legacy":
+            raise AssertionError("legacy 不得创建 boundary")
+        return boundary
+
+    monkeypatch.setattr(NetworkBoundary, "create", create)
+    scope_bytes = b"127.0.0.0/8\n"
+    config = make_config(
+        tmp_path,
+        [[TextDelta("done"), Usage(1, 1)]],
+        execution_mode=mode,
+        scope=parse_scope(scope_bytes.decode()),
+        scope_bytes=scope_bytes,
+    )
+    Path(config.scope_source).write_bytes(scope_bytes)
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        assert app._final_result.status == "finished"
+        notice = notices_containing(main, f"执行模式:{mode}")[-1].content
+        if mode == "legacy":
+            assert "无网络强制" in notice and "继承完整环境" in notice
+            assert not boundary.closed
+        else:
+            assert "b-tui" in notice and "epoch=1" in notice
+            assert created[0][1]["digest"] == hashlib.sha256(scope_bytes).hexdigest()
+            assert boundary.closed
+
+
+async def test_tui_protected_narrowing_failure_stops_run_without_success(
+    tmp_path, monkeypatch
+):
+    from foam.guard.network import BoundaryError, NetworkBoundary
+
+    class Boundary:
+        boundary_id = "b-narrow-fail"
+        epoch = 1
+
+        def __init__(self):
+            self.closed = False
+
+        def retire_generation(self):
+            return None
+
+        def apply_scope(self, _scope, **_kwargs):
+            raise BoundaryError("TESTONLY nft apply failed")
+
+        def aclose(self):
+            self.closed = True
+            return {"cleanup_status": "clean", "remaining_resources": [], "errors": []}
+
+    boundary = Boundary()
+    monkeypatch.setattr(
+        NetworkBoundary, "create", lambda _scope, **_kwargs: boundary
+    )
+    script = [
+        [TextDelta("ready"), Usage(1, 1)],
+        [TextDelta('{"rules": []}'), Usage(1, 1)],
+    ]
+    app = TuiApp(
+        make_config(
+            tmp_path, script, execution_mode="protected", wait_on_finish=True
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("recon before narrowing")
+        await wait_for(
+            lambda: app.run_handle is not None
+            and app.run_handle.loop.status == "idle"
+        )
+        loop = app.run_handle.loop
+        old_rules = app.config.scope.rules
+        app.submit_text("/scope deny all")
+        card = await wait_scope_card(main)
+        press_card(card, "scope-confirm")
+        await wait_for(lambda: app._final_result is not None)
+        assert app._final_result.status == "error"
+        assert "scope 热收窄失败" in app._final_result.error
+        await wait_for(
+            lambda: notices_containing(main, "scope 热收窄失败") != []
+        )
+        assert app.config.scope.rules == old_rules
+        assert not [
+            notice
+            for notice in notices_containing(main, "下一条命令即生效")
+            if notice.kind == "success"
+        ]
+        rejected = await loop._bash.run_command("printf TESTONLY-NOT-EXECUTED")
+        assert rejected["status"] == "closed"
+        assert boundary.closed

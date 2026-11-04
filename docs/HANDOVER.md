@@ -1003,3 +1003,23 @@ WP-13(整合)依赖全部
   被撤销；任何失败保持停止，不自动 fallback。
 - 交付：主提交 `414f1a6` 与 PTY 修复 `c7ef5b8` 已推送 main；修复后 CI
   `41774195624` 五 job 全绿、无 rerun。详见 R11 §8。
+
+
+## 当前状态（2026-11-04：R11-B 关闭）
+
+- [R11](items/R11.md) 全入口接线与热收窄完成：run/resume/TUI 必须显式
+  选择 protected/legacy；protected 为 Bash/PTY 共用 boundary，legacy
+  明示能力限制；protected 创建/换代失败不回退。
+- 热收窄固定顺序为阻止新派发并等在途注册、杀旧 PID init、收割 Bash/PTY
+  与旧事件、替换规则并精确清 conntrack、创建 fresh 代际，成功后才换
+  scope/epoch 并恢复。旧 job/session id 不再可用；失败将 run 置 error，
+  TUI 不显示伪成功。PTY spawn→注册竞态已有确定性回归。
+- 验证：完整离线 **891 passed + 37 skipped**，ruff/diff 全绿；R10+R11
+  真实 Linux 整组 **35 passed**。独立端点确认旧 TCP 连接在收窄后停止，
+  CLI run/resume 均真实到达授权端点且无 boundary 残留。证据见 R11 §6
+  「R11-B 完成证据」。
+- 边界：AC03 已核销；AC05 崩溃 cleanup、AC07 完整 macOS/权限不足矩阵
+  仍未完成。不要把本片完成当成 R11 或 v0.2.0 完成，未打 tag/发布。
+- 下一步：进入 R11-C，覆盖 Foam/helper 崩溃、权限不足、DNS/IPv6/代理及
+  macOS unsupported 的跨入口用户表现；继续保持专用 Docker/linuxkit
+  实验边界，不自动取得宿主 root。

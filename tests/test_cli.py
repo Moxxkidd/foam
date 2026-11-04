@@ -53,6 +53,7 @@ from foam.state.files import (
 from foam.tools.bash import BashTool
 
 SCOPE_TEXT = "127.0.0.0/8\nlocalhost\n"
+LEGACY = ("--execution-mode", "legacy")
 
 
 @pytest.fixture(autouse=True)
@@ -138,7 +139,7 @@ def run_once(tmp_path: Path, backend: FakeBackend, *, objective: str = "侦察�
     workdir = tmp_path / "eng"
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             str(scope_file),
             "--objective",
@@ -221,7 +222,7 @@ def test_run_idempotent_reopen_and_conflict(tmp_path, capsys):
     scope_file = write_scope(tmp_path)
     workdir = tmp_path / "eng"
     argv = [
-        "run",
+        "run", *LEGACY,
         "--scope",
         str(scope_file),
         "--objective",
@@ -236,7 +237,7 @@ def test_run_idempotent_reopen_and_conflict(tmp_path, capsys):
     assert verify(workdir / "audit.jsonl")
     # 参数冲突(同目录不同 objective):明确报错
     conflict = [
-        "run",
+        "run", *LEGACY,
         "--scope",
         str(scope_file),
         "--objective",
@@ -252,7 +253,7 @@ def test_run_idempotent_reopen_and_conflict(tmp_path, capsys):
 def test_run_missing_scope_file(tmp_path, capsys):
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             str(tmp_path / "nope.scope"),
             "--objective",
@@ -271,7 +272,7 @@ def test_run_missing_api_key(tmp_path, monkeypatch, capsys):
     scope_file = write_scope(tmp_path)
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             str(scope_file),
             "--objective",
@@ -301,7 +302,7 @@ def test_resume_rebuilds_context(tmp_path, capsys):
 
     resumed = FakeBackend([FINISH])
     rc = cli_main(
-        ["resume", str(workdir)],
+        ["resume", *LEGACY, str(workdir)],
         backend_factory=lambda _args: resumed,
     )
     assert rc == 0
@@ -331,7 +332,10 @@ def test_resume_missing_audit_jsonl(tmp_path, capsys):
     """验收 3 后半:目录缺 audit.jsonl 时报错明确。"""
     empty = tmp_path / "empty-eng"
     empty.mkdir()
-    rc = cli_main(["resume", str(empty)], backend_factory=lambda _args: FakeBackend([]))
+    rc = cli_main(
+        ["resume", *LEGACY, str(empty)],
+        backend_factory=lambda _args: FakeBackend([]),
+    )
     assert rc == 2
     err = capsys.readouterr().err
     assert "audit.jsonl" in err
@@ -349,7 +353,7 @@ def test_resume_broken_chain_refused(tmp_path, capsys):
     audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _args: FakeBackend([])
+        ["resume", *LEGACY, str(workdir)], backend_factory=lambda _args: FakeBackend([])
     )
     assert rc == 1
     err = capsys.readouterr().err
@@ -365,7 +369,7 @@ def test_resume_scope_drift_detected(tmp_path, capsys):
     scope_file.write_text(SCOPE_TEXT + "10.0.0.0/8\n", encoding="utf-8")
 
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _args: FakeBackend([])
+        ["resume", *LEGACY, str(workdir)], backend_factory=lambda _args: FakeBackend([])
     )
     assert rc == 2
     assert "sha256 不符" in capsys.readouterr().err
@@ -373,7 +377,7 @@ def test_resume_scope_drift_detected(tmp_path, capsys):
     # 显式 --scope 覆盖 = 操作员重新授权,放行并续链
     resumed = FakeBackend([FINISH])
     rc = cli_main(
-        ["resume", str(workdir), "--scope", str(scope_file)],
+        ["resume", *LEGACY, str(workdir), "--scope", str(scope_file)],
         backend_factory=lambda _args: resumed,
     )
     assert rc == 0
@@ -393,7 +397,7 @@ def test_resume_scope_drift_detected(tmp_path, capsys):
 
 def test_resume_missing_dir(tmp_path, capsys):
     rc = cli_main(
-        ["resume", str(tmp_path / "nope")],
+        ["resume", *LEGACY, str(tmp_path / "nope")],
         backend_factory=lambda _args: FakeBackend([]),
     )
     assert rc == 2
@@ -413,7 +417,7 @@ def test_tui_entry_wired_config_error(tmp_path, capsys, monkeypatch):
     """
     monkeypatch.delenv("FOAM_LLM_BASE_URL", raising=False)
     scope_file = write_scope(tmp_path)
-    rc = cli_main(["tui", "--scope", str(scope_file)])
+    rc = cli_main(["tui", *LEGACY, "--scope", str(scope_file)])
     assert rc == 2
     err = capsys.readouterr().err
     assert "FOAM_LLM_BASE_URL" in err  # 到达 main():scope 通过、后端装配报错
@@ -423,12 +427,12 @@ def test_help_all_subcommands(capsys):
     """验收 4:--help 全子命令可用(argparse SystemExit(0))。"""
     for argv in (
         ["--help"],
-        ["run", "--help"],
-        ["resume", "--help"],
+        ["run", *LEGACY, "--help"],
+        ["resume", *LEGACY, "--help"],
         ["replay", "--help"],
         ["report", "--help"],
         ["verify", "--help"],  # R09-B:verify 子命令
-        ["tui", "--help"],
+        ["tui", *LEGACY, "--help"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             cli_main(argv)
@@ -440,7 +444,7 @@ def test_help_all_subcommands(capsys):
     assert f"{__app_name__} " in capsys.readouterr().out
     # WP-14b 验收 1:run --help 含 --scope-text(互斥组上屏)
     with pytest.raises(SystemExit):
-        cli_main(["run", "--help"])
+        cli_main(["run", *LEGACY, "--help"])
     assert "--scope-text" in capsys.readouterr().out
 
 
@@ -459,6 +463,55 @@ def test_no_hardcoded_brand_in_sources():
 def test_cli_no_subcommand_prints_help(capsys):
     assert cli_main([]) == 0
     assert "run" in capsys.readouterr().out
+
+
+def test_run_resume_tui_require_explicit_execution_mode(tmp_path, capsys):
+    scope_file = write_scope(tmp_path)
+    commands = (
+        ["run", "--scope", str(scope_file), "--objective", "x"],
+        ["resume", str(tmp_path)],
+        ["tui"],
+    )
+    for argv in commands:
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main(argv)
+        assert excinfo.value.code == 2
+        assert "--execution-mode" in capsys.readouterr().err
+
+
+def test_protected_run_creation_failure_never_falls_back(
+    tmp_path, monkeypatch, capsys
+):
+    from foam.guard.network import ExecutionUnsupportedError, NetworkBoundary
+
+    calls = []
+
+    def fail_create(scope, **kwargs):
+        calls.append((scope, kwargs))
+        raise ExecutionUnsupportedError("TESTONLY protected unsupported")
+
+    monkeypatch.setattr(NetworkBoundary, "create", fail_create)
+    scope_file = write_scope(tmp_path, "127.0.0.0/8\n")
+    backend = FakeBackend([FINISH])
+    rc = cli_main(
+        [
+            "run",
+            "--execution-mode",
+            "protected",
+            "--scope",
+            str(scope_file),
+            "--objective",
+            "x",
+            "--workdir",
+            str(tmp_path / "eng"),
+        ],
+        backend_factory=lambda _args: backend,
+    )
+    assert rc == 1
+    assert backend.calls == []
+    assert len(calls) == 1
+    assert calls[0][1]["digest"] == hashlib.sha256(scope_file.read_bytes()).hexdigest()
+    assert "TESTONLY protected unsupported" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +534,7 @@ def run_nl_once(
     workdir = workdir or tmp_path / "eng"
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope-text",
             nl,
             "--objective",
@@ -500,7 +553,7 @@ def test_run_scope_mutex_group(tmp_path, capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli_main(
             [
-                "run",
+                "run", *LEGACY,
                 "--scope",
                 str(scope_file),
                 "--scope-text",
@@ -514,7 +567,7 @@ def test_run_scope_mutex_group(tmp_path, capsys):
     assert "not allowed with argument" in capsys.readouterr().err
 
     with pytest.raises(SystemExit) as excinfo:
-        cli_main(["run", "--objective", "x"])
+        cli_main(["run", *LEGACY, "--objective", "x"])
     assert excinfo.value.code == 2
     assert "--scope" in capsys.readouterr().err  # 必给其一
 
@@ -647,7 +700,8 @@ def test_resume_nl_engagement_via_metadata(tmp_path):
     assert rc == 0
 
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+        ["resume", *LEGACY, str(workdir)],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
     records = audit_records(workdir)
@@ -696,7 +750,7 @@ def test_resume_chain_only_scope_confirmed(tmp_path):
     assert record["origin"] == "nl"
 
     rc = cli_main(
-        ["resume", str(root)], backend_factory=lambda _a: FakeBackend([FINISH])
+        ["resume", *LEGACY, str(root)], backend_factory=lambda _a: FakeBackend([FINISH])
     )
     assert rc == 0  # _resolve_scope 链上回退零适配消费,无新分支
     loaded = [
@@ -727,7 +781,8 @@ def test_resume_pure_chain_recovery_scope_equal(tmp_path):
     (workdir / "engagement.json").unlink()
 
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+        ["resume", *LEGACY, str(workdir)],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
     records = audit_records(workdir)
@@ -744,7 +799,7 @@ def test_resume_pure_chain_recovery_scope_equal(tmp_path):
 def test_tui_without_scope_passes_argparse(tmp_path, capsys, monkeypatch):
     """验收 9:tui 不给 --scope 过 argparse 关,到达后端预检才报配置错。"""
     monkeypatch.delenv("FOAM_LLM_BASE_URL", raising=False)
-    rc = cli_main(["tui"])
+    rc = cli_main(["tui", *LEGACY])
     assert rc == 2
     # 报的是后端配置错(而非 argparse usage 错)即证明 --scope 已可选
     assert "FOAM_LLM_BASE_URL" in capsys.readouterr().err
@@ -794,7 +849,8 @@ def test_resume_rewrites_scope_section(tmp_path):
     assert "过期内容" in (workdir / "ENGAGEMENT.md").read_text(encoding="utf-8")
 
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+        ["resume", *LEGACY, str(workdir)],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
     md = (workdir / "ENGAGEMENT.md").read_text(encoding="utf-8")
@@ -824,7 +880,7 @@ def test_resume_narrowing_persists(tmp_path):
     workdir = tmp_path / "eng"
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             str(scope_a),
             "--objective",
@@ -839,7 +895,7 @@ def test_resume_narrowing_persists(tmp_path):
     # 收窄 + 改目标(显式重新授权)
     rc = cli_main(
         [
-            "resume",
+            "resume", *LEGACY,
             str(workdir),
             "--scope",
             str(scope_b),
@@ -859,7 +915,7 @@ def test_resume_narrowing_persists(tmp_path):
     for _ in range(2):
         resumed = FakeBackend([FINISH])
         rc = cli_main(
-            ["resume", str(workdir)], backend_factory=lambda _a, b=resumed: b
+            ["resume", *LEGACY, str(workdir)], backend_factory=lambda _a, b=resumed: b
         )
         assert rc == 0
         meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
@@ -884,7 +940,7 @@ def test_resume_from_different_cwd(tmp_path, monkeypatch, capsys):
     workdir = tmp_path / "eng"
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             "lab.scope",  # as-given 相对串:审计展示口径照旧
             "--objective",
@@ -906,7 +962,7 @@ def test_resume_from_different_cwd(tmp_path, monkeypatch, capsys):
     other_cwd.mkdir()
     monkeypatch.chdir(other_cwd)
     resumed = FakeBackend([FINISH])
-    rc = cli_main(["resume", str(workdir)], backend_factory=lambda _a: resumed)
+    rc = cli_main(["resume", *LEGACY, str(workdir)], backend_factory=lambda _a: resumed)
     assert rc == 0, capsys.readouterr().err
     loaded = [r for r in audit_records(workdir) if r["kind"] == "scope_loaded"]
     assert loaded[-1]["payload"]["source"] == str((tmp_path / "lab.scope").resolve())
@@ -921,14 +977,15 @@ def test_second_writer_lock_refused(tmp_path, capsys):
     lock = acquire_engagement_lock(workdir)
     try:
         rc = cli_main(
-            ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+            ["resume", *LEGACY, str(workdir)],
+            backend_factory=lambda _a: FakeBackend([FINISH]),
         )
         assert rc == 2
         err = capsys.readouterr().err
         assert "另一个运行中的写者" in err and "engagement.lock" in err
         rc = cli_main(
             [
-                "run",
+                "run", *LEGACY,
                 "--scope",
                 str(tmp_path / "lab.scope"),
                 "--objective",
@@ -947,7 +1004,8 @@ def test_second_writer_lock_refused(tmp_path, capsys):
         lock.release()
     # 释放后 resume 恢复(锁不是残留态)
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+        ["resume", *LEGACY, str(workdir)],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
 
@@ -964,7 +1022,15 @@ def test_resume_override_commits_with_backup_and_chain_prefix_intact(tmp_path):
     scope_b = tmp_path / "b.scope"
     scope_b.write_text("192.0.2.7/32\n", encoding="utf-8")
     rc = cli_main(
-        ["resume", str(workdir), "--scope", str(scope_b), "--objective", "新目标"],
+        [
+            "resume",
+            *LEGACY,
+            str(workdir),
+            "--scope",
+            str(scope_b),
+            "--objective",
+            "新目标",
+        ],
         backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
@@ -982,7 +1048,7 @@ def test_resume_override_commits_with_backup_and_chain_prefix_intact(tmp_path):
     }
     # 第二次提交不覆盖备份
     rc = cli_main(
-        ["resume", str(workdir), "--objective", "再改目标"],
+        ["resume", *LEGACY, str(workdir), "--objective", "再改目标"],
         backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
@@ -1001,7 +1067,8 @@ def test_resume_missing_scope_file_requires_reconfirm(tmp_path, capsys):
     scope_file.unlink()
 
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+        ["resume", *LEGACY, str(workdir)],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -1027,7 +1094,7 @@ def test_run_reopens_legacy_dir_with_relative_scope_path(tmp_path, monkeypatch, 
     assert meta["scope"]["path"] == "lab.scope"  # pre-R02 as-given 相对形态
 
     argv = [
-        "run",
+        "run", *LEGACY,
         "--scope",
         "lab.scope",
         "--objective",
@@ -1112,7 +1179,7 @@ def test_run_max_rounds_reaps_background_job_e04(tmp_path):
     workdir = tmp_path / "eng"
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             str(scope_file),
             "--objective",
@@ -1166,7 +1233,7 @@ def test_ctrl_c_first_press_kills_and_reaps(tmp_path):
     thread.start()
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             str(scope_file),
             "--objective",
@@ -1204,7 +1271,7 @@ def test_assembly_failure_closes_everything(tmp_path, monkeypatch, capsys):
     with pytest.raises(RuntimeError, match="合成装配故障"):
         cli_main(
             [
-                "run",
+                "run", *LEGACY,
                 "--scope",
                 str(scope_file),
                 "--objective",
@@ -1479,7 +1546,8 @@ def test_resume_legacy_engagement_without_evidence_dir(tmp_path):
     assert rc == 0
     shutil.rmtree(workdir / "evidence")  # 模拟 pre-R09 旧目录形态
     rc = cli_main(
-        ["resume", str(workdir)], backend_factory=lambda _a: FakeBackend([FINISH])
+        ["resume", *LEGACY, str(workdir)],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
     assert verify(workdir / "audit.jsonl")

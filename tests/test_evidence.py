@@ -85,6 +85,8 @@ def run_cli_once(tmp_path: Path, backend: FakeBackend, *, objective: str = "ä¾¦å
     rc = cli_main(
         [
             "run",
+            "--execution-mode",
+            "legacy",
             "--scope",
             str(scope_file),
             "--objective",

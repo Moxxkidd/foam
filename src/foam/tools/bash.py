@@ -447,32 +447,32 @@ class BashTool:
             }
         return self._result(job)
 
+    async def retire(self) -> dict[str, Any]:
+        """收割当前代际；成功后作废旧 id，但不关闭共享 executor。"""
+        result = await self._reap_jobs()
+        if result["cleanup_status"] == "ok":
+            self._jobs.clear()
+        return result
+
     async def aclose(self) -> dict[str, Any]:
-        """关闭 exec 层(R03 统一关闭原语):拒绝新命令,收割全部未完结 job。
-
-        语义:无宽限期(与 kill_job/timeout 的既有 SIGKILL 语义一致——run 结束
-        时残留的 job 按定义已无人看管);只杀本工具登记 job 的进程组,不碰组外
-        进程(自行 setsid/daemonize 逃逸组外的后代不在收割范围,见 R03 §7)。
-        收割等待有总时间上界 ``CLOSE_REAP_TIMEOUT_SECONDS``:一次
-        ``wait_for(gather(全部 done.wait()))``,不按 job 逐个累计。
-
-        幂等:二次调用短路返回首次结果对象。返回清理报告:
-        ``cleanup_status`` = "ok" / "partial";``remaining_resources`` 列出
-        上界内未收割的 job(以 done.is_set()/proc.returncode 为准,不看
-        job.status——诚实上报,不粉饰终态);``errors`` 收集杀组异常。
-        """
+        """永久关闭 exec 层并有界收割全部未完结 job。"""
         if self._close_result is not None:
             return self._close_result
         self._closed = True
         self.executor.close()
+        result = await self._reap_jobs()
+        self._close_result = result
+        return result
+
+    async def _reap_jobs(self) -> dict[str, Any]:
         errors: list[str] = []
         for job in self._jobs.values():
             if job.done.is_set():
                 continue
-            job.kill_requested = True  # 看管记账为 killed(非自然完结)
+            job.kill_requested = True
             try:
                 self._kill_group(job)
-            except Exception as exc:  # _kill_group 已自收 Lookup/Permission;防御
+            except Exception as exc:
                 errors.append(f"job {job.job_id}: 杀进程组异常: {exc!r}")
         waits = [
             job.done.wait() for job in self._jobs.values() if not job.done.is_set()
@@ -483,7 +483,7 @@ class BashTool:
                     asyncio.gather(*waits), timeout=CLOSE_REAP_TIMEOUT_SECONDS
                 )
             except TimeoutError:
-                pass  # 上界到点:下方如实上报残留(R03-AC06)
+                pass
         remaining: list[dict[str, Any]] = []
         for job in self._jobs.values():
             if job.done.is_set() and job.proc.returncode is not None:
@@ -497,13 +497,11 @@ class BashTool:
                     "reaped": job.proc.returncode is not None,
                 }
             )
-        result: dict[str, Any] = {
+        return {
             "cleanup_status": "partial" if (remaining or errors) else "ok",
             "remaining_resources": remaining,
             "errors": errors,
         }
-        self._close_result = result
-        return result
 
     # ---------- 内部:看管、杀进程、视图渲染 ----------
 

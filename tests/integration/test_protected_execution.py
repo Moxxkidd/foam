@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
+import pytest
+
 from .labkit import Lab, docker_exec, push_file
 
 
@@ -295,3 +299,285 @@ def test_r11_linux_pty_output_drain(r11_lab: Lab, r11_harness: str) -> None:
         check=False,
     )
     assert rc == 0, out
+
+
+_REUSE_SERVER = r"""\
+import socket
+
+with socket.socket() as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", 9091))
+    server.listen()
+    with open("/tmp/r11-reuse-server.hits", "ab", buffering=0) as hits:
+        while True:
+            connection, _ = server.accept()
+            with connection:
+                pending = b""
+                while True:
+                    data = connection.recv(4096)
+                    if not data:
+                        break
+                    pending += data
+                    lines = pending.split(b"\n")
+                    pending = lines.pop()
+                    for line in lines:
+                        hits.write(line + b"\n")
+"""
+
+
+_NARROW_DRIVER = r"""\
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+
+from foam.agent.loop import AgentLoop
+from foam.guard.audit import AuditLog
+from foam.guard.network import NetworkBoundary
+from foam.guard.scope import parse_scope
+from foam.tools.bash import BashTool
+from foam.tools.execution import ToolExecutor
+from foam.tools.session import SessionTool
+
+CLIENT = r'''\
+import socket
+import time
+
+connection = socket.create_connection(("172.45.0.11", 9091))
+connection.sendall(b"connected\n")
+while True:
+    connection.sendall(b"tick\n")
+    time.sleep(0.1)
+'''
+
+
+class Backend:
+    provider = "r11-narrow-fake"
+
+
+async def main():
+    old_scope = parse_scope("172.45.0.11/32\n")
+    old_digest = hashlib.sha256(b"172.45.0.11/32\n").hexdigest()
+    boundary = NetworkBoundary.create(old_scope, digest=old_digest)
+    executor = ToolExecutor(boundary=boundary)
+    bash = BashTool("/tmp/r11-narrow-bash", executor=executor)
+    sessions = SessionTool("/tmp/r11-narrow-sessions", executor=executor)
+    audit = AuditLog("/tmp/r11-narrow-audit.jsonl")
+    loop = AgentLoop(
+        backend=Backend(),
+        bash=bash,
+        scope=old_scope,
+        audit=audit,
+        workdir="/tmp",
+        system_prompt="",
+        session=sessions,
+    )
+    Path("/tmp/r11-reuse-client.py").write_text(CLIENT, encoding="utf-8")
+    try:
+        old_job = await bash.run_command(
+            "python /tmp/r11-reuse-client.py", background=True
+        )
+        assert old_job["status"] == "running", old_job
+        old_session = await sessions.session_open("sleep 60")
+        assert old_session["status"] == "running", old_session
+        Path("/tmp/r11-old-started").touch()
+        while not Path("/tmp/r11-narrow-now").exists():
+            await asyncio.sleep(0.05)
+        new_digest = hashlib.sha256(b"").hexdigest()
+        await loop.replace_scope(parse_scope(""), digest=new_digest)
+        fresh = await bash.run_command("printf fresh")
+        assert fresh["exit_code"] == 0 and fresh["output_view"] == "fresh", fresh
+        assert fresh["epoch"] == 2, fresh
+        assert "未知 job_id" in (await bash.read_output(old_job["job_id"]))["error"]
+        assert "未知 session_id" in (
+            await sessions.session_read(old_session["session_id"])
+        )["error"]
+        print("NARROW_OK " + json.dumps(fresh, sort_keys=True))
+    finally:
+        await bash.aclose()
+        await sessions.aclose()
+        print("CLEANUP=" + json.dumps(boundary.aclose(), sort_keys=True))
+        audit.close()
+
+
+asyncio.run(main())
+"""
+
+
+def _hit_count(lab: Lab, endpoint: str) -> int:
+    _, out = docker_exec(
+        lab,
+        endpoint,
+        "python -c 'from pathlib import Path; "
+        "p=Path(\"/tmp/r11-reuse-server.hits\"); "
+        "print(len(p.read_text().splitlines()) if p.exists() else 0)'",
+    )
+    return int(out.strip())
+
+
+def test_scope_narrowing_revokes_existing_connection(
+    r11_lab: Lab, r11_endpoints: dict[str, str]
+) -> None:
+    """旧 TCP 连接与 PTY 随代际撤销；新工具只能在 fresh epoch 运行。"""
+    harness = r11_endpoints["harness"]
+    allowed = r11_endpoints["allowed"]
+    push_file(r11_lab, allowed, "/opt/r11-reuse-server.py", _REUSE_SERVER)
+    push_file(r11_lab, harness, "/opt/r11-narrow.py", _NARROW_DRIVER)
+    r11_lab.run(["exec", "-d", allowed, "python", "/opt/r11-reuse-server.py"])
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            docker_exec(
+                r11_lab,
+                harness,
+                "python -c 'import socket; "
+                "s=socket.create_connection((\"172.45.0.11\", 9091), 2); "
+                "s.sendall(b\"ready\\n\"); s.close()'",
+            )
+            break
+        except AssertionError:
+            time.sleep(0.1)
+    else:
+        pytest.fail("reuse server 未就绪")
+
+    r11_lab.run(
+        [
+            "exec",
+            "-d",
+            harness,
+            "bash",
+            "-c",
+            "PYTHONUNBUFFERED=1 timeout --signal=KILL 60s python /opt/r11-narrow.py "
+            "> /tmp/r11-narrow.out 2>&1; echo $? > /tmp/r11-narrow.done",
+        ]
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if _hit_count(r11_lab, allowed) >= 3:
+            break
+        if docker_exec(
+            r11_lab,
+            harness,
+            "test -f /tmp/r11-narrow.done",
+            check=False,
+        )[0] == 0:
+            break
+        time.sleep(0.1)
+    _, early_out = docker_exec(r11_lab, harness, "cat /tmp/r11-narrow.out")
+    assert _hit_count(r11_lab, allowed) >= 3, early_out
+
+    docker_exec(r11_lab, harness, "touch /tmp/r11-narrow-now")
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if docker_exec(
+            r11_lab,
+            harness,
+            "test -f /tmp/r11-narrow.done",
+            check=False,
+        )[0] == 0:
+            break
+        time.sleep(0.1)
+    _, out = docker_exec(r11_lab, harness, "cat /tmp/r11-narrow.out")
+    assert "NARROW_OK" in out, out
+    assert '"cleanup_status": "clean"' in out, out
+    settled = _hit_count(r11_lab, allowed)
+    time.sleep(0.5)
+    assert _hit_count(r11_lab, allowed) == settled, out
+
+
+_CLI_DRIVER = r"""\
+from collections import deque
+from pathlib import Path
+
+from foam.agent.backends.base import TextDelta, ToolCall, Usage
+from foam.cli import main
+
+
+class Backend:
+    provider = "r11-cli-fake"
+
+    def __init__(self, marker):
+        self.marker = marker
+        self.round = 0
+
+    async def aclose(self):
+        return None
+
+    def chat(self, _messages, _tools=None):
+        self.round += 1
+        return self._stream()
+
+    async def _stream(self):
+        if self.round == 1:
+            yield ToolCall(
+                "cli-call",
+                "run_command",
+                {
+                    "command": (
+                        "curl --noproxy '*' -sS -m 5 "
+                        f"http://172.45.0.11:8080/{self.marker}"
+                    )
+                },
+            )
+            yield Usage(1, 1)
+        else:
+            yield TextDelta("done")
+            yield Usage(1, 1)
+
+
+scope = Path("/tmp/r11-cli.scope")
+scope.write_text("172.45.0.11/32\n", encoding="utf-8")
+workdir = Path("/tmp/r11-cli-eng")
+run_rc = main(
+    [
+        "run",
+        "--execution-mode",
+        "protected",
+        "--scope",
+        str(scope),
+        "--objective",
+        "TESTONLY protected CLI",
+        "--workdir",
+        str(workdir),
+    ],
+    backend_factory=lambda _args: Backend("r11-cli-run"),
+)
+resume_rc = main(
+    ["resume", "--execution-mode", "protected", str(workdir)],
+    backend_factory=lambda _args: Backend("r11-cli-resume"),
+)
+assert run_rc == 0 and resume_rc == 0, (run_rc, resume_rc)
+print("CLI_PROTECTED_OK")
+"""
+
+
+def test_cli_protected_run_and_resume(r11_lab: Lab, r11_endpoints) -> None:
+    """真实 CLI 两次入口均创建受保护边界，工具到达独立授权端点。"""
+    harness = r11_endpoints["harness"]
+    push_file(r11_lab, harness, "/opt/r11-cli.py", _CLI_DRIVER)
+    rc, out = docker_exec(
+        r11_lab,
+        harness,
+        "HOME=/tmp/r11-cli-home PYTHONUNBUFFERED=1 "
+        "timeout --signal=KILL 100s python /opt/r11-cli.py",
+        timeout=120,
+        check=False,
+    )
+    assert rc == 0, out
+    assert "CLI_PROTECTED_OK" in out, out
+    assert out.count("mode=protected") == 2, out
+    assert "mode=legacy" not in out, out
+    _, markers = docker_exec(
+        r11_lab, r11_endpoints["allowed"], "cat /opt/serve.py.8080.hits"
+    )
+    assert "/r11-cli-run" in markers and "/r11-cli-resume" in markers
+    rc, residue = docker_exec(
+        r11_lab,
+        harness,
+        "python -c 'from pathlib import Path; "
+        "items=list(Path(\"/run/foam/network\").glob(\"fb*\")) "
+        "+ list(Path(\"/run/foam/tool-work\").glob(\"fb*\")); "
+        "print(items); raise SystemExit(bool(items))'",
+        check=False,
+    )
+    assert rc == 0, f"CLI boundary 残留: {residue}\n{out}"

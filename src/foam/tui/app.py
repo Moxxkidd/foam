@@ -19,12 +19,13 @@
   只发一次,placeholder 更新在一处。
 - WP-14c scope 确认仪式(定案 Q5/D8/D9):``config.scope is None`` 时首条
   消息承载 objective+NL scope → 仪式 worker 两段结构(编译 → 确认卡 →
-  冻结,完成后才调既有 ``start_run``,其同步方法体一字不动);engagement
-  在首条消息到达即建(``scope_path=None``)。``/scope`` 裸命令只读展示
-  (数据源为 TUI 侧权威引用 ``TUIConfig.scope``,D10),带参经同一仪式
-  热换(确认后 ``loop.replace_scope`` 原子换,D2)。file 流零仪式照旧,
-  链上 ``scope_loaded`` 之后补一条 ``scope_confirmed(source="file")``
-  (Q8,payload 语义对齐 14b W14b-2)。
+  冻结,完成后才调既有 ``start_run``);engagement 在首条消息到达即建。
+  ``/scope`` 裸命令只读展示,带参经同一仪式热换。R11-B 起 legacy 仍只换
+  护栏引用;protected 等待 ``loop.replace_scope`` 完成旧代际收割与规则
+  换代后才更新 TUI 引用并显示成功。file 流零仪式照旧,链上
+  ``scope_loaded`` 后补 ``scope_confirmed(source="file")``。
+- R11-B 执行模式:CLI 必须显式选择 protected/legacy;protected 为
+  Bash/PTY 装配共享 boundary,失败不回退;legacy 明示能力限制。
 - R02-C(2026-10-06,file 流开跑前预备,E07 收口):
   ``_prepare_file_run_engagement`` 与 NL 侧预备对称——``start_run`` 前
   同一同步块建/开 engagement 并写动态段,首轮上下文即含真实规则;
@@ -92,6 +93,7 @@ from foam.guard.audit import (
     KIND_SCOPE_UPDATED,
     AuditLog,
 )
+from foam.guard.network import BoundaryError, NetworkBoundary
 from foam.guard.scope import Scope, render_canonical_rules, scope_payload
 from foam.runtime import RunRuntime, cleanup_warning_text, close_run
 from foam.state.files import (
@@ -100,6 +102,7 @@ from foam.state.files import (
     _default_engagement_id,
 )
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
+from foam.tools.execution import ToolExecutor
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
 from foam.tools.session import SessionTool
 from foam.tools.state import TOOL_SCHEMAS as STATE_TOOL_SCHEMAS
@@ -201,6 +204,7 @@ class TUIConfig:
     scope_source: str
     backend: LLMBackend
     model_label: str = ""
+    execution_mode: str = "legacy"
     engagements_dir: str | Path = DEFAULT_ENGAGEMENTS_DIR
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     first_event_timeout: float = FIRST_EVENT_TIMEOUT_SECONDS
@@ -236,6 +240,7 @@ class RunHandle:
     sessions: Any | None = None  # WP-05 SessionTool;None = 会话层未接线
     engagement: Engagement | None = None
     state: Any | None = None  # R03:StateTool;统一关闭要关其 Index 连接
+    boundary: Any | None = None
 
 
 LoopFactory = Callable[[RunContext], RunHandle]
@@ -249,38 +254,61 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
     """
     config = ctx.config
     engagement = ctx.engagement
-    bash = BashTool(engagement.paths.outputs)
-    session = SessionTool(engagement.paths.outputs / "sessions")
-    state = StateTool(engagement)
-    registry = ToolRegistry()
-    registry.register_module(TOOL_SCHEMAS, bash.dispatch)
-    registry.register_module(SESSION_TOOL_SCHEMAS, session.dispatch)
-    registry.register_module(STATE_TOOL_SCHEMAS, state.dispatch)
-    prompt = build_system_prompt(
-        workdir=engagement.paths.root,
-        tool_map_text=render_tool_map(scan_tools()),
-    )
-    loop = AgentLoop(
-        backend=config.backend,
-        bash=bash,
-        scope=config.scope,
-        audit=ctx.audit,
-        workdir=engagement.paths.root,
-        system_prompt=prompt,
-        registry=registry,
-        observer=ctx.observer,
-        session=session,
-        engagement=engagement,
-        index=state.index,  # WP-11 声明的一行接线:解析层 facts 入库(TUI 同享)
-        operator=ctx.operator,
-        max_context_tokens=config.max_context_tokens,
-        first_event_timeout=config.first_event_timeout,
-        max_rounds=config.max_rounds,
-        wait_on_finish=config.wait_on_finish,  # WP-09 更正当:连续对话待命
-    )
-    return RunHandle(
-        loop=loop, bash=bash, sessions=session, engagement=engagement, state=state
-    )
+    executor = ToolExecutor()
+    boundary = None
+    if config.execution_mode == "protected":
+        if config.scope is None:
+            raise BoundaryError("protected 启动前必须冻结 scope")
+        data = config.scope_bytes
+        if data is None:
+            data = render_canonical_rules(config.scope.rules).encode("utf-8")
+        boundary = NetworkBoundary.create(
+            config.scope, digest=hashlib.sha256(data).hexdigest()
+        )
+        executor = ToolExecutor(boundary=boundary)
+    try:
+        bash = BashTool(engagement.paths.outputs, executor=executor)
+        session = SessionTool(engagement.paths.outputs / "sessions", executor=executor)
+        state = StateTool(engagement)
+        registry = ToolRegistry()
+        registry.register_module(TOOL_SCHEMAS, bash.dispatch)
+        registry.register_module(SESSION_TOOL_SCHEMAS, session.dispatch)
+        registry.register_module(STATE_TOOL_SCHEMAS, state.dispatch)
+        prompt = build_system_prompt(
+            workdir=engagement.paths.root,
+            tool_map_text=render_tool_map(scan_tools()),
+        )
+        loop = AgentLoop(
+            backend=config.backend,
+            bash=bash,
+            scope=config.scope,
+            audit=ctx.audit,
+            workdir=engagement.paths.root,
+            system_prompt=prompt,
+            registry=registry,
+            observer=ctx.observer,
+            session=session,
+            engagement=engagement,
+            index=state.index,
+            operator=ctx.operator,
+            max_context_tokens=config.max_context_tokens,
+            first_event_timeout=config.first_event_timeout,
+            max_rounds=config.max_rounds,
+            wait_on_finish=config.wait_on_finish,
+        )
+        return RunHandle(
+            loop=loop,
+            bash=bash,
+            sessions=session,
+            engagement=engagement,
+            state=state,
+            boundary=boundary,
+        )
+    except Exception:
+        executor.close()
+        if boundary is not None:
+            boundary.aclose()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1452,9 +1480,11 @@ class TuiApp(App[None]):
                 audit = None
             # D10:TUI 侧权威引用同步更新(path 取冻结刚落盘的 meta,单源)
             meta_scope = engagement.metadata()["scope"]
-            self.config.scope = compilation.scope
-            self.config.scope_source = meta_scope["path"]
-            self._scope_frozen_via_nl = True
+            if mode != "update":
+                self.config.scope = compilation.scope
+                self.config.scope_source = meta_scope["path"]
+                self.config.scope_bytes = compilation.canonical_text.encode("utf-8")
+                self._scope_frozen_via_nl = True
             # 仪式在冻结落账时即逻辑完成:先释放单例守卫,再发完成通知。
             # 否则通知可见到 finally 卡移除 await 完成的窗口内,紧随的
             # 提交会被 ceremony_running 守卫(D9)误吞——「发送首条消息启动
@@ -1473,8 +1503,13 @@ class TuiApp(App[None]):
                 self.start_run(text)
             elif mode == "update":
                 loop = self.active_loop
-                if loop is not None:
-                    loop.replace_scope(compilation.scope)  # D2 原子换
+                if loop is None:
+                    raise RuntimeError("run 已结束,scope 不可更改(D2)")
+                await loop.replace_scope(compilation.scope, digest=frozen_sha)
+                self.config.scope = compilation.scope
+                self.config.scope_source = meta_scope["path"]
+                self.config.scope_bytes = compilation.canonical_text.encode("utf-8")
+                self._scope_frozen_via_nl = True
                 main.narrative.add_notice(
                     "success", summary + "(下一条命令即生效)"
                 )
@@ -1545,6 +1580,13 @@ class TuiApp(App[None]):
         factory = self.config.loop_factory or default_loop_factory
         try:
             handle = factory(ctx)
+        except BoundaryError as exc:
+            audit.close()
+            engagement.close()
+            main.narrative.add_notice(
+                "error", f"protected 执行边界创建失败:{exc};未回退 legacy"
+            )
+            return
         except Exception as exc:  # 装配失败:如实呈现并收口资源
             audit.close()
             engagement.close()
@@ -1563,9 +1605,21 @@ class TuiApp(App[None]):
             backend=self.config.backend,
             lock=None,
             loop=handle.loop,
+            boundary=handle.boundary,
         )
         main.statusbar.set_engagement(engagement.paths.root.name, self.operator)
         main.input_dock.input_box.placeholder = _PLACEHOLDER_RUNNING
+        if handle.boundary is None:
+            execution = (
+                "执行模式:legacy;仅 Bash 参数级护栏,无网络强制,"
+                "继承完整环境,已有连接不随 scope 撤销"
+            )
+        else:
+            execution = (
+                f"执行模式:protected boundary={handle.boundary.boundary_id} "
+                f"epoch={handle.boundary.epoch}"
+            )
+        main.narrative.add_notice("info", execution)
         self._run_task = asyncio.create_task(self._run_to_end(handle, objective))
 
     async def _run_to_end(self, handle: RunHandle, objective: str) -> None:
@@ -1716,6 +1770,7 @@ def main(args) -> int:
         scope_source=scope_source,
         backend=backend,
         model_label=args.model or os.environ.get(ENV_MODEL) or "",
+        execution_mode=args.execution_mode,
         engagements_dir=args.workdir or DEFAULT_ENGAGEMENTS_DIR,
         max_rounds=getattr(args, "max_rounds", 0) or 0,
         scope_bytes=scope_bytes,

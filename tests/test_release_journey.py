@@ -27,6 +27,7 @@ from foam.state.index import Index
 from tests.test_cli import (
     COMPILE_OK,
     FINISH,
+    LEGACY,
     FakeBackend,
     _hang_round,
     audit_records,
@@ -112,7 +113,7 @@ def test_release_file_nl_multi_run_journey(tmp_path, capsys, channel):
 
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             *scope_args,
             "--objective",
             "TESTONLY 发布组合验收",
@@ -130,7 +131,7 @@ def test_release_file_nl_multi_run_journey(tmp_path, capsys, channel):
 
     narrowed = FakeBackend(_command_then_finish(second_marker))
     rc = cli_main(
-        ["resume", str(root), "--scope", str(narrow)],
+        ["resume", *LEGACY, str(root), "--scope", str(narrow)],
         backend_factory=lambda _args: narrowed,
     )
     assert rc == 0
@@ -151,7 +152,7 @@ def test_release_file_nl_multi_run_journey(tmp_path, capsys, channel):
 
     resumed = FakeBackend([FINISH])
     rc = cli_main(
-        ["resume", str(root)], backend_factory=lambda _args: resumed
+        ["resume", *LEGACY, str(root)], backend_factory=lambda _args: resumed
     )
     assert rc == 0
     final_meta = json.loads((root / "engagement.json").read_text(encoding="utf-8"))
@@ -253,7 +254,7 @@ def test_release_terminal_resources_and_evidence(
         signal_thread.start()
     rc = cli_main(
         [
-            "run",
+            "run", *LEGACY,
             "--scope",
             str(scope),
             "--objective",

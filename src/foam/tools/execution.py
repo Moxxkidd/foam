@@ -67,6 +67,16 @@ class ToolExecutor:
             self._ensure_accepting()
             yield self.epoch
 
+    @asynccontextmanager
+    async def generation_transition(self) -> AsyncIterator[None]:
+        """停住新注册并等待在途 spawn；仅成功退出时恢复新代际。"""
+        self.pause_new()
+        async with self._generation_lock:
+            if self._closed:
+                raise ExecutionPaused("执行层已关闭，拒绝 scope 换代")
+            yield
+            self.resume_new()
+
     def pause_new(self) -> None:
         self._accepting = False
 
@@ -92,7 +102,8 @@ class ToolExecutor:
         preexec_fn: Any = None,
         term: str | None = None,
     ) -> asyncio.subprocess.Process:
-        self._ensure_accepting()
+        if self._closed:
+            raise ExecutionPaused("执行层已关闭，拒绝创建新工具进程")
         kwargs: dict[str, Any] = {
             "stdin": stdin,
             "stdout": stdout,
