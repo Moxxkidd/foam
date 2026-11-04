@@ -982,3 +982,21 @@ WP-13(整合)依赖全部
 - 下一步：只评审 [R11](items/R11.md) 的最小权限 helper、scope 编译与
   失败拒绝/恢复设计，消费 R10 结论；不要把 R10 研究完成当成 R11 已实施。
   本条未打 tag、未发布软件包。
+
+
+## 当前状态（2026-11-04：R11-A 关闭）
+
+- [R11](items/R11.md) 最小权限执行边界完成：限权 helper、per-run
+  netns/nftables、PID 代际与 manifest 恢复、Bash/PTY 共用 ToolExecutor、
+  白名单 env 和 runtime boundary 清理已落地；真实工具为 UID/GID 65534、
+  capability 全零、NNP=1，不能写控制 socket/scope/audit 或改 nft。
+- 验证：针对性 **158 passed + 2 skipped**；完整离线 **884 passed +
+  34 skipped**，ruff/diff 全绿；R11 真实 Linux **4 passed**，共享 harness
+  的 R10+R11 整组 **32 passed**，容器/网络/镜像及 boundary 均无残留。
+  证据与本轮六个红基线的根因见 R11 §6「R11-A 完成证据」。
+- 边界：目前仅适配器层 AC01/02/04/06 核销，CLI/TUI 尚未装配，不能从
+  产品入口选择 protected；热收窄、helper 死亡、macOS/权限不足用户面
+  提示仍未验收。不要把本片完成当成 R11 或 v0.2.0 完成，未打 tag/发布。
+- 下一步：进入 R11-B，先接 run/resume/TUI 的显式 legacy/protected 模式，
+  再按既有评审顺序停止旧代际、替换规则、精确清 conntrack 并验证已有连接
+  被撤销；任何失败保持停止，不自动 fallback。

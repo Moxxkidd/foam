@@ -500,6 +500,79 @@ async def test_msfconsole_full_flow(tool):
     assert done["sha256"] is not None
 
 
+async def test_detached_slave_fd_does_not_block_session_eof(tool, monkeypatch):
+    """leader 退出后,detached 后代持有 PTY slave 不得让会话永久等待 EOF。"""
+    monkeypatch.setattr(
+        "foam.tools.session.OUTPUT_DRAIN_TIMEOUT_SECONDS", 0.2, raising=False
+    )
+    real_reader_loop = SessionTool._reader_loop
+
+    async def hold_eof_beyond_drain_timeout(self, session, reader):
+        class HeldOpenReader:
+            async def read(self, size):
+                chunk = await reader.read(size)
+                if chunk:
+                    return chunk
+                # macOS 会在 leader 退出时提前报 EOF;显式把 EOF 延到排空
+                # 上界之后,在所有平台覆盖后代持 FD 的同一阻塞路径。
+                await asyncio.sleep(0.5)
+                return b""
+
+        await real_reader_loop(self, session, HeldOpenReader())
+
+    monkeypatch.setattr(SessionTool, "_reader_loop", hold_eof_beyond_drain_timeout)
+    pid_path = tool.output_dir / "detached.pid"
+    code = (
+        "import os,pathlib,time;os.setsid();"
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()));"
+        "time.sleep(300)"
+    )
+    opened = await tool.session_open(
+        f"python3 -c {json.dumps(code)} & "
+        f"while [ ! -e {json.dumps(str(pid_path))} ]; do sleep 0.01; done; "
+        "printf 'leader-done'"
+    )
+    sid = opened["session_id"]
+    session = tool._sessions[sid]
+    pid = None
+    try:
+        await asyncio.wait_for(session.done.wait(), timeout=2)
+        pid = int(pid_path.read_text())
+        assert session.proc.returncode == 0
+        result = await tool.session_close(sid)
+        assert result["status"] == "exited"
+        assert result["exit_code"] == 0
+        assert Path(result["output_path"]).read_bytes() == b"leader-done"
+        assert "输出可能未收尽" in result["error"]
+        os.kill(pid, 0)  # 组外后代仍持有 FD,关闭 master 不等于杀死该后代
+    finally:
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await asyncio.wait_for(session.done.wait(), timeout=3)
+
+
+async def test_fresh_process_output_is_drained_before_finalize(tool, monkeypatch):
+    """即使读循环启动时 leader 已退出,已到 PTY 的正常输出仍须全量落盘。"""
+    real_reader_loop = SessionTool._reader_loop
+
+    async def delayed_reader_loop(self, session, reader):
+        await session.proc.wait()
+        assert session.proc.returncode == 0
+        await real_reader_loop(self, session, reader)
+
+    monkeypatch.setattr(SessionTool, "_reader_loop", delayed_reader_loop)
+    opened = await tool.session_open("printf 'fresh-proc-output'")
+    session = tool._sessions[opened["session_id"]]
+    await asyncio.wait_for(session.done.wait(), timeout=2)
+    result = await tool.session_close(opened["session_id"])
+    assert result["status"] == "exited"
+    assert "error" not in result
+    assert Path(result["output_path"]).read_bytes() == b"fresh-proc-output"
+
+
 # ---------- R03-A:统一关闭原语(aclose 诚实上报 / 有界收割 / 幂等) ----------
 
 

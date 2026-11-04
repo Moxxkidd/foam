@@ -10,12 +10,13 @@ CLI/TUI 共享同一关闭服务 :func:`close_run`——修复前各入口各自
    各自有总上界;loop 收尾已先收割时此处为幂等空转)。收割阶段总上界 =
    两层上界之和(文档化约定,单层见 tools/bash.py、tools/session.py 的
    ``CLOSE_REAP_TIMEOUT_SECONDS``)。
-2. **关闭索引/状态**:state(StateTool 的 Index 连接)→ engagement(含其
+2. **清理执行边界**(R11):后台完成事件排空后清理 boundary；legacy 无此步。
+3. **关闭索引/状态**:state(StateTool 的 Index 连接)→ engagement(含其
    懒加载 Index)。
-3. **关闭审计**(永远最后:终态记录必须先于它落链;loop 在调用本服务前
+4. **关闭审计**(永远最后:终态记录必须先于它落链;loop 在调用本服务前
    已写妥 run_finished)。
-4. **关闭后端**(httpx 连接等)。
-5. **释放单写者锁**(R02;TUI 未接锁时 lock 为 None)。
+5. **关闭后端**(httpx 连接等)。
+6. **释放单写者锁**(R02;TUI 未接锁时 lock 为 None)。
 
 任一步失败如实记入返回报告(``cleanup_status="partial"`` +
 ``remaining_resources``/``errors``),**不跳过后续步骤**(AC06);全程幂等,
@@ -41,6 +42,7 @@ class RunRuntime:
 
     bash: Any = None  # BashTool
     session: Any = None  # SessionTool
+    boundary: Any = None  # R11 NetworkBoundary;None = legacy
     state: Any = None  # StateTool
     engagement: Any = None  # Engagement
     audit: Any = None  # AuditLog
@@ -117,6 +119,17 @@ async def _close_run_impl(
             await drain_fn()
         except Exception as exc:
             errors.append(f"job_exit 排空异常: {exc!r}")
+
+    # 1.75 R11:工具与完成事件收割后清理 boundary;失败不跳过后续关闭。
+    if runtime.boundary is not None:
+        try:
+            report = await asyncio.to_thread(runtime.boundary.aclose)
+        except Exception as exc:
+            errors.append(f"boundary 清理异常: {exc!r}")
+            report = None
+        if report:
+            remaining.extend(report.get("remaining_resources", []))
+            errors.extend(report.get("errors", []))
 
     # 2. 关闭索引/状态
     if runtime.state is not None:

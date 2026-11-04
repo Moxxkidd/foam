@@ -112,9 +112,11 @@ def _output_text(output: str | bytes | None) -> str:
 class Lab:
     """实验资源台账:创建成功后登记,``cleanup`` 统一销毁,全程命令留证。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, label: str = "foam.r10.run", prefix: str = "r10") -> None:
         self.tag = uuid.uuid4().hex[:8]
-        self.image = f"foam-r10-lab:{self.tag}"
+        self.label = label
+        self.prefix = prefix
+        self.image = f"foam-{prefix}-lab:{self.tag}"
         self.containers: list[str] = []
         self.networks: list[str] = []
         self.built_image = False
@@ -122,7 +124,7 @@ class Lab:
 
     def label_args(self) -> list[str]:
         """返回供 docker create/run/build/network create 显式展开的会话标签。"""
-        return ["--label", f"foam.r10.run={self.tag}"]
+        return ["--label", f"{self.label}={self.tag}"]
 
     def run(
         self,
@@ -164,7 +166,7 @@ class Lab:
         return proc.returncode, out
 
     def name(self, role: str) -> str:
-        return f"r10-{role}-{self.tag}"
+        return f"{self.prefix}-{role}-{self.tag}"
 
     def add_container(self, name: str) -> str:
         """仅在 docker run 成功后登记;创建失败不得登记或删除同名资源。"""
@@ -175,6 +177,17 @@ class Lab:
         """仅在 network create 成功后登记;创建失败不得登记或删除同名资源。"""
         self.networks.append(name)
         return name
+
+    def build_image_from(self, dockerfile: str) -> None:
+        self.built_image = True
+        self.run(
+            [
+                "build", "--pull=false", *self.label_args(),
+                "-t", self.image, "-",
+            ],
+            timeout=900,
+            input_text=dockerfile,
+        )
 
     def build_image(self) -> None:
         rc, out = self.run(
@@ -195,15 +208,7 @@ class Lab:
             "RUN cp /usr/bin/ping /usr/local/bin/ping"
             " && chmod 0755 /usr/local/bin/ping\n"
         )
-        self.built_image = True
-        self.run(
-            [
-                "build", "--pull=false", *self.label_args(),
-                "-t", self.image, "-",
-            ],
-            timeout=900,
-            input_text=dockerfile,
-        )
+        self.build_image_from(dockerfile)
 
     def cleanup(self) -> list[str]:
         """清理台账及本会话 label 资源;逐项留错并继续。"""
@@ -213,7 +218,7 @@ class Lab:
             (
                 "容器",
                 [
-                    "ps", "-a", "--filter", f"label=foam.r10.run={self.tag}",
+                    "ps", "-a", "--filter", f"label={self.label}={self.tag}",
                     "--format", "{{.Names}}",
                 ],
                 self.containers,
@@ -221,7 +226,7 @@ class Lab:
             (
                 "网络",
                 [
-                    "network", "ls", "--filter", f"label=foam.r10.run={self.tag}",
+                    "network", "ls", "--filter", f"label={self.label}={self.tag}",
                     "--format", "{{.Name}}",
                 ],
                 self.networks,
@@ -229,7 +234,7 @@ class Lab:
             (
                 "镜像",
                 [
-                    "images", "--filter", f"label=foam.r10.run={self.tag}",
+                    "images", "--filter", f"label={self.label}={self.tag}",
                     "--format", "{{.Repository}}:{{.Tag}}",
                 ],
                 owned_images,
@@ -273,9 +278,12 @@ class Lab:
         return errors
 
     def dump_evidence(self) -> Path:
-        path = Path(tempfile.gettempdir()) / f"foam-r10-evidence-{self.tag}.md"
+        path = (
+            Path(tempfile.gettempdir())
+            / f"foam-{self.prefix}-evidence-{self.tag}.md"
+        )
         path.write_text(
-            "# R10 集成实验实录(docker 命令级)\n\n"
+            f"# {self.prefix.upper()} 集成实验实录(docker 命令级)\n\n"
             + "\n---\n\n".join(self.evidence),
             encoding="utf-8",
         )

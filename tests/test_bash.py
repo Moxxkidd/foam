@@ -303,6 +303,45 @@ async def test_dispatch_unknown_tool_raises(tool):
         await tool.dispatch("not-a-tool", {})
 
 
+async def test_detached_descendant_does_not_block_output_eof(tool, monkeypatch):
+    """leader 退出后,detached 后代持有 pipe 不得让 job 永久等待 EOF。"""
+    monkeypatch.setattr(
+        "foam.tools.bash.OUTPUT_DRAIN_TIMEOUT_SECONDS", 0.2, raising=False
+    )
+    pid_path = tool.output_dir / "detached.pid"
+    code = (
+        "import os,pathlib,time;os.setsid();"
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()));"
+        "time.sleep(300)"
+    )
+    task = asyncio.create_task(
+        tool.run_command(
+            f"python3 -c {json.dumps(code)} & printf 'leader-done\\n'",
+            timeout_seconds=None,
+        )
+    )
+    pid = None
+    try:
+        for _ in range(100):
+            if pid_path.exists():
+                break
+            await asyncio.sleep(0.02)
+        pid = int(pid_path.read_text())
+        result = await asyncio.wait_for(task, timeout=2)
+        assert result["status"] == "completed"
+        assert result["exit_code"] == 0
+        assert result["output_view"] == "leader-done\n"
+        assert "输出可能未收尽" in result["error"]
+        os.kill(pid, 0)  # 场景成立:组外后代仍存活,不是被顺带 kill 后得到 EOF
+    finally:
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=3)
+
+
 # ---------- R03-A:统一关闭原语(aclose / 取消安全看管 / 有界收割) ----------
 
 

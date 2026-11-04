@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .execution import ExecutionPaused, ToolExecutor, wait_for_exit
 from .output import (
     OutputManifest,
     OutputRecorder,
@@ -42,6 +43,8 @@ DEFAULT_RING_BUFFER_BYTES = 256 * 1024
 #: aclose 收割等待的总时间上界(秒):与 session 层同量级;单次 close 的最坏
 #: 耗时上界(R03-AC05;上界内未收割的 job 如实进 remaining_resources,不粉饰)。
 CLOSE_REAP_TIMEOUT_SECONDS = 5.0
+#: leader 退出后的输出排空上界;组外后代可能继续持有 stdout/stderr。
+OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
 #: 流读取块大小。刻意不用行迭代:无换行的巨量单行会把行缓冲撑爆(验收 3)。
 _READ_CHUNK_BYTES = 64 * 1024
 #: list_jobs 里 command 的展示截断长度(全文不落 LLM 视图,防 context 浪费)。
@@ -215,6 +218,7 @@ class _Job:
     manifest: OutputManifest | None = None
     kill_requested: bool = False
     error: str | None = None
+    epoch: int | None = None  # R11:创建 job 时的 boundary 代际
     exit_event_sent: bool = False  # R06:完成事件每 job 恰一次的守卫
     done: asyncio.Event = field(default_factory=asyncio.Event)
     wait_task: asyncio.Task[None] | None = None  # 看管任务(前台/后台一律独立任务)
@@ -230,6 +234,7 @@ class BashTool:
         default_timeout_seconds: float | None = DEFAULT_TIMEOUT_SECONDS,
         default_output_budget_bytes: int = DEFAULT_OUTPUT_BUDGET_BYTES,
         ring_buffer_bytes: int = DEFAULT_RING_BUFFER_BYTES,
+        executor: ToolExecutor | None = None,
     ) -> None:
         if default_timeout_seconds is not None and default_timeout_seconds <= 0:
             raise ValueError("默认超时必须为正数或 None(不限时)")
@@ -240,6 +245,7 @@ class BashTool:
         self._default_timeout = default_timeout_seconds
         self._default_budget = default_output_budget_bytes
         self._ring_bytes = ring_buffer_bytes
+        self.executor = executor or ToolExecutor()
         self._jobs: dict[str, _Job] = {}
         # R03 统一关闭:_closed 置位后 run_command 拒绝新命令(停止派发兜底);
         # _close_result 非 None 即 aclose 已完成,二次调用短路返回同一结果。
@@ -292,37 +298,53 @@ class BashTool:
             raise ValueError("output_budget_bytes 不能为负")
 
         job_id = uuid.uuid4().hex[:12]
-        recorder = OutputRecorder(
-            self.output_dir, job_id, ring_buffer_bytes=self._ring_bytes, split=True
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-c",
-            command,
-            stdin=asyncio.subprocess.DEVNULL,  # 非交互执行面;交互需求走 WP-05 PTY
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,  # 独立进程组:kill/timeout 整组强杀,不留孤儿
-        )
-        job = _Job(
-            job_id=job_id,
-            command=command,
-            proc=proc,
-            recorder=recorder,
-            timeout_seconds=timeout,
-            budget_bytes=budget,
-            background=background,
-            started_mono=time.monotonic(),
-            started_wall=time.time(),
-        )
-        self._jobs[job_id] = job
+        try:
+            async with self.executor.generation() as epoch:
+                recorder = OutputRecorder(
+                    self.output_dir,
+                    job_id,
+                    ring_buffer_bytes=self._ring_bytes,
+                    split=True,
+                )
+                try:
+                    proc = await self.executor.spawn(
+                        ["bash", "-c", command],
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                except Exception:
+                    recorder.finalize()
+                    for path in (
+                        recorder.combined_path,
+                        recorder.stdout_path,
+                        recorder.stderr_path,
+                    ):
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    raise
+                job = _Job(
+                    job_id=job_id,
+                    command=command,
+                    proc=proc,
+                    recorder=recorder,
+                    timeout_seconds=timeout,
+                    budget_bytes=budget,
+                    background=background,
+                    started_mono=time.monotonic(),
+                    started_wall=time.time(),
+                    epoch=epoch,
+                )
+                self._jobs[job_id] = job
 
-        # R03:看管一律为独立任务,前台经 shield 等待——前台等待者被取消不再
-        # 带走看管(修复前:外部取消杀死 _supervise,子进程孤儿化、done 永不
-        # 置位、manifest 丢失,kill 路径再烧 5s 报「未能收割」假阳性)。
-        job.wait_task = asyncio.create_task(self._supervise_guarded(job))
+                # 看管独立任务;前台 shield 等待,外部取消不带走看管。
+                job.wait_task = asyncio.create_task(self._supervise_guarded(job))
+        except ExecutionPaused as exc:
+            return {"job_id": None, "status": "paused", "error": str(exc)}
         if background:
-            return {
+            result = {
                 "job_id": job_id,
                 "status": "running",
                 "exit_code": None,
@@ -340,6 +362,10 @@ class BashTool:
                 "stderr_sha256": None,
                 "timeout_seconds": timeout,
             }
+            if self.executor.boundary_id is not None:
+                result["boundary_id"] = self.executor.boundary_id
+                result["epoch"] = epoch
+            return result
         await asyncio.shield(job.wait_task)
         return self._result(job)
 
@@ -438,6 +464,7 @@ class BashTool:
         if self._close_result is not None:
             return self._close_result
         self._closed = True
+        self.executor.close()
         errors: list[str] = []
         for job in self._jobs.values():
             if job.done.is_set():
@@ -547,17 +574,29 @@ class BashTool:
         timed_out = False
         try:
             if job.timeout_seconds is None:
-                await job.proc.wait()
+                await wait_for_exit(job.proc)
             else:
-                await asyncio.wait_for(job.proc.wait(), job.timeout_seconds)
+                await asyncio.wait_for(wait_for_exit(job.proc), job.timeout_seconds)
         except TimeoutError:  # py3.11+ asyncio.TimeoutError 即内建 TimeoutError
             timed_out = True
             self._kill_group(job)
-        await job.proc.wait()  # 收割(超时路径下等 SIGKILL 落地)
-        reader_results = await asyncio.gather(*readers, return_exceptions=True)
-        for result in reader_results:
+        await wait_for_exit(job.proc)  # child watcher 收割,不等后代管道
+        done_readers, pending_readers = await asyncio.wait(
+            readers, timeout=OUTPUT_DRAIN_TIMEOUT_SECONDS
+        )
+        errors = []
+        for result in await asyncio.gather(*done_readers, return_exceptions=True):
             if isinstance(result, Exception):
-                job.error = f"输出收集异常: {result!r}"
+                errors.append(f"输出收集异常: {result!r}")
+        if pending_readers:
+            for reader in pending_readers:
+                reader.cancel()
+            await asyncio.gather(*pending_readers, return_exceptions=True)
+            # Process 无公开管道关闭入口;此时 leader 已收割,close 只关管道。
+            job.proc._transport.close()
+            errors.append("输出可能未收尽: leader 已退出,后代仍持有输出管道")
+        if errors:
+            job.error = ";".join(errors)
         if job.kill_requested:
             job.status = "killed"
         elif timed_out:
@@ -625,9 +664,8 @@ class BashTool:
             sha256=manifest.sha256,
         )
 
-    @staticmethod
-    def _result(job: _Job) -> dict[str, Any]:
-        """终态返回结构(WP-01 规格 + 三分流 optional 字段)。"""
+    def _result(self, job: _Job) -> dict[str, Any]:
+        """终态返回结构(WP-01 规格 + 三分流 optional 字段 + boundary)。"""
         m = job.manifest
         stdout_path = job.recorder.stdout_path
         stderr_path = job.recorder.stderr_path
@@ -646,6 +684,9 @@ class BashTool:
             "total_bytes": m.total_bytes if m else job.recorder.bytes_total,
             "total_lines": m.total_lines if m else job.recorder.lines_total,
         }
+        if self.executor.boundary_id is not None:
+            result["boundary_id"] = self.executor.boundary_id
+            result["epoch"] = job.epoch
         if job.error:
             result["error"] = job.error
         return result

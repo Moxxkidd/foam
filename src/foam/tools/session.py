@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .execution import ToolExecutor, wait_for_exit
 from .output import OutputManifest, OutputRecorder
 
 #: 同时存活的会话上限(含已退出未关闭的:master fd 仍占着,关了才算释放)。
@@ -43,6 +44,8 @@ DEFAULT_MAX_SESSIONS = 8
 #: aclose 收割等待的总时间上界(秒):与 bash 层同量级;单次 close 的最坏
 #: 耗时上界(R03-AC05;上界内未收割的会话如实进 remaining_resources,不粉饰)。
 CLOSE_REAP_TIMEOUT_SECONDS = 5.0
+#: leader 退出后的 PTY 排空上界;组外后代可能继续持有 slave。
+OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
 #: session_read 单次返回视图的默认原始字节预算。
 DEFAULT_READ_BUDGET_BYTES = 16 * 1024
 #: 每个会话的内存 ring 上限(传 WP-01 输出层;会话完结即释放)。
@@ -371,6 +374,7 @@ class _Session:
     last_event_offset: int = -1  # 上次提示事件触发时的总字节数(去重)
     events: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    epoch: int | None = None  # R11:创建会话时的 boundary 代际
     manifest: OutputManifest | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     data_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -387,6 +391,7 @@ class SessionTool:
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         read_budget_bytes: int = DEFAULT_READ_BUDGET_BYTES,
         ring_buffer_bytes: int = DEFAULT_RING_BUFFER_BYTES,
+        executor: ToolExecutor | None = None,
     ) -> None:
         if max_sessions <= 0:
             raise ValueError("max_sessions 必须为正")
@@ -397,6 +402,7 @@ class SessionTool:
         self._max_sessions = max_sessions
         self._read_budget = read_budget_bytes
         self._ring_bytes = ring_buffer_bytes
+        self.executor = executor or ToolExecutor()
         self._sessions: dict[str, _Session] = {}
         # R03 统一关闭:_closed 置位后 session_open 拒绝新会话(与 aclose 幂等
         # 短路配对:开了没人收的口子必须堵上);_close_result 缓存首次清理报告。
@@ -441,13 +447,13 @@ class SessionTool:
         master, slave = pty.openpty()
         _set_winsize(slave, _PTY_ROWS, _PTY_COLS)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "bash", "-c", command,
-                stdin=slave, stdout=slave, stderr=slave,
-                start_new_session=True,  # setsid,使 _acquire_ctty 可拿控制终端
+            proc = await self.executor.spawn(
+                ["bash", "-c", command],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
                 preexec_fn=_acquire_ctty,
-                env={**os.environ, "TERM": "xterm-256color"},  # 固定 TERM,清洗规则确定
-                close_fds=True,
+                term="xterm-256color",
             )
         except Exception:
             os.close(master)
@@ -497,10 +503,11 @@ class SessionTool:
             master_fd=master,
             started_mono=time.monotonic(),
             started_wall=time.time(),
+            epoch=self.executor.epoch,
         )
         self._sessions[session_id] = session
         session.reader_task = asyncio.create_task(self._reader_loop(session, reader))
-        return {
+        result = {
             "session_id": session_id,
             "status": "running",
             "pid": proc.pid,
@@ -511,6 +518,10 @@ class SessionTool:
                 "(可带 wait_pattern 等待),session_close 关闭并释放配额。"
             ),
         }
+        if self.executor.boundary_id is not None:
+            result["boundary_id"] = self.executor.boundary_id
+            result["epoch"] = session.epoch
+        return result
 
     def _get(self, session_id: str) -> tuple[_Session | None, dict[str, Any] | None]:
         session = self._sessions.get(session_id)
@@ -705,6 +716,7 @@ class SessionTool:
         if self._close_result is not None:
             return self._close_result
         self._closed = True
+        self.executor.close()
         errors: list[str] = []
         for session in self._sessions.values():
             if session.status == "running" and not session.done.is_set():
@@ -755,7 +767,15 @@ class SessionTool:
     async def _reader_loop(
         self, session: _Session, reader: asyncio.StreamReader
     ) -> None:
-        """持续收集输出:落盘 + 哈希 + 提示识别;EOF 后收割子进程并定稿账目。"""
+        """持续收集输出;leader 退出后有界排空,避免逃逸后代永久占住 slave。"""
+        async def close_after_drain_timeout() -> None:
+            await wait_for_exit(session.proc)
+            await asyncio.sleep(OUTPUT_DRAIN_TIMEOUT_SECONDS)
+            note = "输出可能未收尽: leader 已退出,后代仍持有 PTY slave"
+            session.error = f"{session.error};{note}" if session.error else note
+            session.transport.close()
+
+        drain_guard = asyncio.create_task(close_after_drain_timeout())
         try:
             while True:
                 try:
@@ -776,7 +796,9 @@ class SessionTool:
         except Exception as exc:  # 读循环不许静默死:异常记录进会话结果
             session.error = f"读取循环异常: {exc!r}"
         finally:
-            session.exit_code = await session.proc.wait()  # 输出已排空,安全收割
+            drain_guard.cancel()
+            await asyncio.gather(drain_guard, return_exceptions=True)
+            session.exit_code = await wait_for_exit(session.proc)  # leader 已收割
             if session.status == "running":
                 # 我们发起 close 杀掉的记 closed;自然退出的记 exited
                 session.status = "closed" if session.closing else "exited"
