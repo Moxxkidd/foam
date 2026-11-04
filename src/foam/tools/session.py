@@ -782,7 +782,11 @@ class SessionTool:
                     chunk = await reader.read(_READ_CHUNK_BYTES)
                 except OSError as exc:
                     if exc.errno == errno.EIO:
-                        chunk = b""  # PTY 对端全部关闭(Linux 以 EIO 报 EOF)
+                        # Linux PTY 末尾的 EIO 可能压过 StreamReader 已有缓冲;
+                        # 清异常并标 EOF,先读净缓冲,后续 read 再返回 b""。
+                        reader.set_exception(None)
+                        reader.feed_eof()
+                        chunk = await reader.read(_READ_CHUNK_BYTES)
                     else:
                         raise
                 if not chunk:

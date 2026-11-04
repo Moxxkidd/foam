@@ -282,3 +282,16 @@ def test_child_cannot_modify_boundary(
         r11_endpoints["harness"],
         "curl --noproxy '*' -sS -m 5 http://172.45.0.20:8080/control-after",
     )
+
+
+def test_r11_linux_pty_output_drain(r11_lab: Lab, r11_harness: str) -> None:
+    """在真实 Linux PTY 上复核 leader 先退出与逃逸后代两个输出边界。"""
+    rc, out = docker_exec(
+        r11_lab,
+        r11_harness,
+        "cd /opt/foam-src && python -m pytest -q "
+        "tests/test_session.py::test_fresh_process_output_is_drained_before_finalize "
+        "tests/test_session.py::test_detached_slave_fd_does_not_block_session_eof",
+        check=False,
+    )
+    assert rc == 0, out

@@ -991,9 +991,10 @@ WP-13(整合)依赖全部
   白名单 env 和 runtime boundary 清理已落地；真实工具为 UID/GID 65534、
   capability 全零、NNP=1，不能写控制 socket/scope/audit 或改 nft。
 - 验证：针对性 **158 passed + 2 skipped**；完整离线 **884 passed +
-  34 skipped**，ruff/diff 全绿；R11 真实 Linux **4 passed**，共享 harness
-  的 R10+R11 整组 **32 passed**，容器/网络/镜像及 boundary 均无残留。
-  证据与本轮六个红基线的根因见 R11 §6「R11-A 完成证据」。
+  35 skipped**，ruff/diff 全绿；R11 真实 Linux **5 passed**，共享 harness
+  的 R10+R11 整组 **33 passed**，容器/网络/镜像及 boundary 均无残留。
+  首次 CI 暴露的 Linux PTY `EIO` 压过已有缓冲问题已根修；证据与本轮红绿
+  记录见 R11 §6「R11-A 完成证据」。
 - 边界：目前仅适配器层 AC01/02/04/06 核销，CLI/TUI 尚未装配，不能从
   产品入口选择 protected；热收窄、helper 死亡、macOS/权限不足用户面
   提示仍未验收。不要把本片完成当成 R11 或 v0.2.0 完成，未打 tag/发布。
