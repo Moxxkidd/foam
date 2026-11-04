@@ -1,8 +1,9 @@
-"""R11-A 限权网络边界 helper。
+"""R11 限权网络边界 helper。
 
 此模块只在 Linux/euid=0 的 protected 路径由 root Foam 控制面启动。对外仅
 接收严格 JSON；网络与进程管理命令均由本模块生成固定 argv，不接受 shell
-或 nft 文本。真实特权验证限隔离 Linux harness。
+或 nft 文本。清理成功后保留 root 私有 cleaned 标记供重启对账。真实特权
+验证限隔离 Linux harness。
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ _MANIFEST_KEYS = {
     "helper_start",
     "generation",
 }
+_CLEANED_MANIFEST = "cleaned.json"
 
 
 class BoundaryError(RuntimeError):
@@ -1032,10 +1034,12 @@ class BoundaryHelper:
         }
         if result["cleanup_status"] == "clean":
             try:
-                self.manifest_path.unlink(missing_ok=True)
+                os.replace(
+                    self.manifest_path, self.state_dir / _CLEANED_MANIFEST
+                )
             except OSError as exc:
                 result["cleanup_status"] = "failed"
-                result["errors"].append(f"manifest 清理失败: {exc}")
+                result["errors"].append(f"cleaned 标记写入失败: {exc}")
         self._cleanup_result = result
         return dict(result)
 

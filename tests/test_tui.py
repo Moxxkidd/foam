@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from collections import deque
 from pathlib import Path
 
@@ -2933,3 +2934,29 @@ async def test_tui_protected_narrowing_failure_stops_run_without_success(
         rejected = await loop._bash.run_command("printf TESTONLY-NOT-EXECUTED")
         assert rejected["status"] == "closed"
         assert boundary.closed
+
+
+@pytest.mark.skipif(
+    sys.platform == "linux" and os.geteuid() == 0,
+    reason="真实 unsupported 验收只在 macOS 或非 root Linux 运行",
+)
+async def test_tui_actual_platform_is_unsupported_without_fallback(tmp_path):
+    config = make_config(
+        tmp_path,
+        [],
+        execution_mode="protected",
+        scope=parse_scope("127.0.0.0/8\n"),
+    )
+    Path(config.scope_source).write_text("127.0.0.0/8\n", encoding="utf-8")
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("TESTONLY unsupported")
+        await wait_for(
+            lambda: notices_containing(main, "protected 执行边界创建失败") != []
+        )
+        error = notices_containing(main, "protected 执行边界创建失败")[-1].content
+        assert "仅支持 Linux 且 euid=root" in error
+        assert "未回退 legacy" in error
+        assert app.run_handle is None
+        assert app.config.backend.chat_count == 0

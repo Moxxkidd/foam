@@ -566,6 +566,18 @@ def test_create_failure_never_returns_degraded_boundary(tmp_path):
     assert list((tmp_path / "work").iterdir()) == []
 
 
+def test_create_permission_failure_is_unsupported_and_cleans(tmp_path, monkeypatch):
+    def deny_chown(_path):
+        raise PermissionError("TESTONLY chown denied")
+
+    monkeypatch.setattr(network, "_private_workdir", deny_chown)
+    with pytest.raises(ExecutionUnsupportedError, match="权限不足"):
+        make_boundary(tmp_path)
+    assert list((tmp_path / "state").iterdir()) == []
+    assert list((tmp_path / "work").iterdir()) == []
+    assert FakeTransport.instances == []
+
+
 @pytest.mark.parametrize(
     "patch", [{"scope_digest": "sha256:WRONG"}, {"helper_pid": 0}]
 )
@@ -655,6 +667,48 @@ def test_close_is_idempotent_and_reports_cleanup(tmp_path):
 
 def test_recover_stale_empty_root_is_bounded_and_honest(tmp_path):
     assert network.recover_stale(state_root=tmp_path / "state") == []
+
+
+def test_recover_cleaned_marker_and_reject_unknown_directory(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "state"
+    cleaned_id = "fb0123456789ab"
+    unknown_id = "fbabcdefabcdef"
+    cleaned_dir = state_root / cleaned_id
+    unknown_dir = state_root / unknown_id
+    cleaned_dir.mkdir(parents=True, mode=0o700)
+    unknown_dir.mkdir(mode=0o700)
+    cleaned_dir.chmod(0o700)
+    unknown_dir.chmod(0o700)
+    network_helper.write_manifest(
+        cleaned_dir / network_helper._CLEANED_MANIFEST,
+        manifest_data(cleaned_id),
+    )
+    original_read = network_helper.read_manifest
+
+    def read_owned(path, *, expected_boundary_id):
+        return original_read(
+            path, expected_boundary_id=expected_boundary_id, owner_uid=os.getuid()
+        )
+
+    monkeypatch.setattr(network_helper, "read_manifest", read_owned)
+    monkeypatch.setattr(network, "_process_is_active", lambda _pid, _start: False)
+    results = network.recover_stale(
+        state_root=state_root, work_root=tmp_path / "work"
+    )
+    by_id = {item["boundary_id"]: item for item in results}
+    assert by_id[cleaned_id]["cleanup_status"] == "clean"
+    assert by_id[unknown_id]["cleanup_status"] == "rejected"
+    assert not cleaned_dir.exists()
+    assert unknown_dir.is_dir()
+    assert FakeTransport.instances == []
+    with pytest.raises(BoundaryError, match="拒绝新 run"):
+        NetworkBoundary.create(
+            parse_scope(""), state_root=state_root, work_root=tmp_path / "work"
+        )
+    assert unknown_dir.is_dir()
+    assert FakeTransport.instances == []
 
 
 @pytest.mark.parametrize(

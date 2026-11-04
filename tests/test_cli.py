@@ -27,6 +27,7 @@ import re
 import signal
 import stat
 import subprocess  # noqa: S403  # 仅用于 pgrep 固定参数探针(R03 测试)
+import sys
 import threading
 import time
 from collections import deque
@@ -512,6 +513,36 @@ def test_protected_run_creation_failure_never_falls_back(
     assert len(calls) == 1
     assert calls[0][1]["digest"] == hashlib.sha256(scope_file.read_bytes()).hexdigest()
     assert "TESTONLY protected unsupported" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(
+    sys.platform == "linux" and os.geteuid() == 0,
+    reason="真实 unsupported 验收只在 macOS 或非 root Linux 运行",
+)
+def test_protected_run_actual_platform_is_unsupported(tmp_path, capsys):
+    scope_file = write_scope(tmp_path, "127.0.0.0/8\n")
+    backend = FakeBackend([FINISH])
+    rc = cli_main(
+        [
+            "run",
+            "--execution-mode",
+            "protected",
+            "--scope",
+            str(scope_file),
+            "--objective",
+            "TESTONLY unsupported",
+            "--workdir",
+            str(tmp_path / "eng"),
+        ],
+        backend_factory=lambda _args: backend,
+    )
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert backend.calls == []
+    assert "仅支持 Linux 且 euid=root" in captured.err
+    assert "未回退 legacy" in captured.err
+    assert "mode=legacy" not in captured.out
+    assert "[run finished]" not in captured.out
 
 
 # ---------------------------------------------------------------------------

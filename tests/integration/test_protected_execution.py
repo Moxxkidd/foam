@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -581,3 +582,429 @@ def test_cli_protected_run_and_resume(r11_lab: Lab, r11_endpoints) -> None:
         check=False,
     )
     assert rc == 0, f"CLI boundary 残留: {residue}\n{out}"
+
+
+_CRASH_DRIVER = r"""\
+import asyncio
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from foam.guard.network import NetworkBoundary
+from foam.guard.network_helper import resource_config
+from foam.guard.scope import parse_scope
+from foam.tools.bash import BashTool
+from foam.tools.execution import ToolExecutor
+
+CHILD = r'''\
+import json
+import os
+import time
+from pathlib import Path
+
+fields = Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()
+Path("/tmp/r11-crash-child.ready").write_text(
+    json.dumps({"pid": os.getpid(), "start": fields[19]}), encoding="utf-8"
+)
+time.sleep(300)
+'''
+
+
+def process_start(pid):
+    text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    return text.rsplit(") ", 1)[1].split()[19]
+
+
+def find_child(token):
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / "comm").read_text().strip() != "python":
+                continue
+            cmdline = (entry / "cmdline").read_bytes()
+            if token.encode() not in cmdline or b"r11-crash-child.py" not in cmdline:
+                continue
+            return int(entry.name), process_start(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return None
+
+
+async def main():
+    boundary = NetworkBoundary.create(
+        parse_scope(""), digest=hashlib.sha256(b"").hexdigest()
+    )
+    executor = ToolExecutor(boundary=boundary)
+    bash = BashTool("/tmp/r11-crash-output", executor=executor)
+    Path("/tmp/r11-crash-child.py").write_text(CHILD, encoding="utf-8")
+    job = await bash.run_command(
+        f"setsid python /tmp/r11-crash-child.py {boundary.boundary_id}",
+        background=True,
+    )
+    assert job["status"] == "running", job
+    child = None
+    for _ in range(500):
+        child = find_child(boundary.boundary_id)
+        if child is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert child is not None
+    manifest = json.loads(
+        Path(
+            f"/run/foam/network/{boundary.boundary_id}/manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    config = resource_config(boundary.boundary_id)
+    state = {
+        "boundary_id": boundary.boundary_id,
+        "foam_pid": os.getpid(),
+        "foam_start": process_start(os.getpid()),
+        "helper_pid": boundary.helper_pid,
+        "helper_start": manifest["helper_start"],
+        "init_pid": boundary.init_pid,
+        "init_start": manifest["generation"]["start"],
+        "child_pid": child[0],
+        "child_start": child[1],
+        "netns": config.netns,
+        "nft_table": config.nft_table,
+        "veth": config.host_interface,
+    }
+    Path("/tmp/r11-crash-state.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+    print("CRASH_READY", flush=True)
+    await asyncio.Event().wait()
+
+
+asyncio.run(main())
+"""
+
+
+_CRASH_PROBE = r"""\
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+state = json.loads(Path("/tmp/r11-crash-state.json").read_text())
+mode = sys.argv[1]
+
+
+def alive(pid, start):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return fields[19] == start and fields[0] != "Z"
+
+
+processes = {
+    role: alive(state[f"{role}_pid"], state[f"{role}_start"])
+    for role in ("foam", "helper", "init", "child")
+}
+netns = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True)
+nft = subprocess.run(
+    ["nft", "list", "table", "inet", state["nft_table"]],
+    capture_output=True,
+)
+veth = subprocess.run(["ip", "link", "show", state["veth"]], capture_output=True)
+resources = {
+    "netns": state["netns"] in netns.stdout.split(),
+    "nft": nft.returncode == 0,
+    "veth": veth.returncode == 0,
+}
+manifest = Path(
+    f"/run/foam/network/{state['boundary_id']}/manifest.json"
+).exists()
+details = {
+    "processes": processes,
+    "resources": resources,
+    "manifest": manifest,
+}
+clean = not any(processes.values()) and not any(resources.values()) and not manifest
+if mode == "clean":
+    ok = clean
+elif mode == "orphaned":
+    ok = (
+        processes["init"]
+        and processes["child"]
+        and not processes["helper"]
+        and all(resources.values())
+        and manifest
+    )
+else:
+    state_dir = Path(f"/run/foam/network/{state['boundary_id']}")
+    workdir = Path(f"/run/foam/tool-work/{state['boundary_id']}")
+    details["directories"] = {
+        "state": state_dir.exists(),
+        "work": workdir.exists(),
+    }
+    ok = clean and not state_dir.exists() and not workdir.exists()
+print(json.dumps(details, sort_keys=True))
+raise SystemExit(0 if ok else 1)
+"""
+
+
+_CRASH_KILL = r"""\
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+
+state = json.loads(Path("/tmp/r11-crash-state.json").read_text())
+role = sys.argv[1]
+pid = state[f"{role}_pid"]
+fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+assert fields[19] == state[f"{role}_start"] and fields[0] != "Z"
+os.kill(pid, signal.SIGKILL)
+"""
+
+
+def _start_crash_case(lab: Lab, harness: str) -> dict:
+    for path, content in (
+        ("/opt/r11-crash-driver.py", _CRASH_DRIVER),
+        ("/opt/r11-crash-probe.py", _CRASH_PROBE),
+        ("/opt/r11-crash-kill.py", _CRASH_KILL),
+    ):
+        push_file(lab, harness, path, content)
+    docker_exec(
+        lab,
+        harness,
+        "rm -f /tmp/r11-crash-state.json /tmp/r11-crash-child.ready "
+        "/tmp/r11-crash.out && rm -rf /tmp/r11-crash-output",
+    )
+    lab.run(
+        [
+            "exec",
+            "-d",
+            harness,
+            "bash",
+            "-c",
+            "PYTHONUNBUFFERED=1 python /opt/r11-crash-driver.py "
+            "> /tmp/r11-crash.out 2>&1",
+        ]
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        rc, _ = docker_exec(
+            lab,
+            harness,
+            "test -s /tmp/r11-crash-state.json "
+            "&& test -s /tmp/r11-crash-child.ready",
+            check=False,
+        )
+        if rc == 0:
+            _, out = docker_exec(lab, harness, "cat /tmp/r11-crash-state.json")
+            return json.loads(out)
+        time.sleep(0.1)
+    _, out = docker_exec(lab, harness, "cat /tmp/r11-crash.out")
+    pytest.fail(f"crash driver 未就绪: {out}")
+
+
+def _wait_crash_probe(lab: Lab, harness: str, mode: str) -> str:
+    deadline = time.monotonic() + 20
+    out = ""
+    while time.monotonic() < deadline:
+        rc, out = docker_exec(
+            lab,
+            harness,
+            f"python /opt/r11-crash-probe.py {mode}",
+            check=False,
+        )
+        if rc == 0:
+            return out
+        time.sleep(0.1)
+    pytest.fail(f"crash probe {mode} 未满足: {out}")
+
+
+def _recover_crashed_boundary(lab: Lab, harness: str) -> list[dict]:
+    rc, out = docker_exec(
+        lab,
+        harness,
+        "python -c 'import json; from foam.guard.network import recover_stale; "
+        "print(json.dumps(recover_stale()))'",
+        check=False,
+    )
+    assert rc == 0, out
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def test_foam_sigkill_helper_eof_cleans_and_recovers(
+    r11_lab: Lab, r11_harness: str
+) -> None:
+    _start_crash_case(r11_lab, r11_harness)
+    try:
+        docker_exec(r11_lab, r11_harness, "python /opt/r11-crash-kill.py foam")
+        _wait_crash_probe(r11_lab, r11_harness, "clean")
+        results = _recover_crashed_boundary(r11_lab, r11_harness)
+        assert all(item["cleanup_status"] == "clean" for item in results), results
+        _wait_crash_probe(r11_lab, r11_harness, "gone")
+    finally:
+        docker_exec(
+            r11_lab,
+            r11_harness,
+            "python /opt/r11-crash-kill.py foam",
+            check=False,
+        )
+
+
+_RECOVERY_CLI_DRIVER = r"""\
+from pathlib import Path
+
+from foam.agent.backends.base import TextDelta, Usage
+from foam.cli import main
+
+
+class Backend:
+    provider = "r11-recovery-fake"
+
+    async def aclose(self):
+        return None
+
+    def chat(self, _messages, _tools=None):
+        return self._stream()
+
+    async def _stream(self):
+        yield TextDelta("done")
+        yield Usage(1, 1)
+
+
+scope = Path("/tmp/r11-recovery.scope")
+scope.write_text("", encoding="utf-8")
+rc = main(
+    [
+        "run",
+        "--execution-mode",
+        "protected",
+        "--scope",
+        str(scope),
+        "--objective",
+        "TESTONLY recovery",
+        "--workdir",
+        "/tmp/r11-recovery-eng",
+    ],
+    backend_factory=lambda _args: Backend(),
+)
+assert rc == 0, rc
+print("RECOVERY_CLI_OK")
+"""
+
+
+def test_helper_death_requires_manifest_recovery(
+    r11_lab: Lab, r11_harness: str
+) -> None:
+    _start_crash_case(r11_lab, r11_harness)
+    try:
+        docker_exec(r11_lab, r11_harness, "python /opt/r11-crash-kill.py helper")
+        _wait_crash_probe(r11_lab, r11_harness, "orphaned")
+        push_file(
+            r11_lab,
+            r11_harness,
+            "/opt/r11-recovery-cli.py",
+            _RECOVERY_CLI_DRIVER,
+        )
+        rc, out = docker_exec(
+            r11_lab,
+            r11_harness,
+            "HOME=/tmp/r11-recovery-home python /opt/r11-recovery-cli.py",
+            timeout=90,
+            check=False,
+        )
+        assert rc == 0 and "RECOVERY_CLI_OK" in out, out
+        docker_exec(r11_lab, r11_harness, "python /opt/r11-crash-kill.py foam")
+        _wait_crash_probe(r11_lab, r11_harness, "gone")
+    finally:
+        docker_exec(
+            r11_lab,
+            r11_harness,
+            "python /opt/r11-crash-kill.py foam",
+            check=False,
+        )
+
+
+_UNSUPPORTED_DRIVER = r"""\
+import sys
+from pathlib import Path
+
+from foam.cli import main
+
+
+class Backend:
+    provider = "r11-unsupported-fake"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def aclose(self):
+        return None
+
+    def chat(self, _messages, _tools=None):
+        self.calls += 1
+        raise AssertionError("protected 失败后不得进入主环")
+
+
+label = sys.argv[1]
+scope = Path(f"/tmp/r11-{label}.scope")
+scope.write_text("127.0.0.0/8\n", encoding="utf-8")
+backend = Backend()
+rc = main(
+    [
+        "run",
+        "--execution-mode",
+        "protected",
+        "--scope",
+        str(scope),
+        "--objective",
+        "TESTONLY unsupported",
+        "--workdir",
+        f"/tmp/r11-{label}-eng",
+    ],
+    backend_factory=lambda _args: backend,
+)
+assert rc == 1 and backend.calls == 0, (rc, backend.calls)
+print(f"UNSUPPORTED_OK={label}")
+"""
+
+
+def test_protected_permission_failures_are_explicit_and_clean(
+    r11_lab: Lab, r11_harness: str
+) -> None:
+    push_file(
+        r11_lab, r11_harness, "/opt/r11-unsupported.py", _UNSUPPORTED_DRIVER
+    )
+    commands = (
+        (
+            "nonroot",
+            "setpriv --reuid=65534 --regid=65534 --clear-groups "
+            "env HOME=/tmp/r11-nonroot-home "
+            "python /opt/r11-unsupported.py nonroot",
+        ),
+        (
+            "capless",
+            "setpriv --reuid=0 --regid=0 --clear-groups --bounding-set=-all "
+            "--no-new-privs env HOME=/tmp/r11-capless-home "
+            "python /opt/r11-unsupported.py capless",
+        ),
+    )
+    for label, command in commands:
+        rc, out = docker_exec(r11_lab, r11_harness, command, check=False)
+        assert rc == 0, out
+        assert f"UNSUPPORTED_OK={label}" in out, out
+        assert "protected 执行边界创建失败" in out, out
+        assert "未回退 legacy" in out, out
+        assert "[run finished]" not in out, out
+        if label == "nonroot":
+            assert "仅支持 Linux 且 euid=root" in out, out
+    rc, residue = docker_exec(
+        r11_lab,
+        r11_harness,
+        "python -c 'from pathlib import Path; "
+        "items=list(Path(\"/run/foam/network\").glob(\"fb*\")) "
+        "+ list(Path(\"/run/foam/tool-work\").glob(\"fb*\")); "
+        "print(items); raise SystemExit(bool(items))'",
+        check=False,
+    )
+    assert rc == 0, residue

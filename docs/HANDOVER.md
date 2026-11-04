@@ -1023,3 +1023,22 @@ WP-13(整合)依赖全部
 - 下一步：进入 R11-C，覆盖 Foam/helper 崩溃、权限不足、DNS/IPv6/代理及
   macOS unsupported 的跨入口用户表现；继续保持专用 Docker/linuxkit
   实验边界，不自动取得宿主 root。
+
+
+## 当前状态（2026-11-04：R11 全部关闭）
+
+- [R11](items/R11.md) A/B/C 与七项 AC 全部完成。本片补真实 Foam/helper
+  SIGKILL、自动重启对账、非 root/无 capability root 和 macOS CLI/TUI
+  unsupported 证据；protected 任何恢复/权限失败均不回落。
+- 根修：helper 清理成功原子留下 root 0600 cleaned 标记；恢复器区分
+  manifest/cleaned/未知状态，僵尸 helper 不算存活，成功对账后验证并回收
+  目录；每次 NetworkBoundary.create 先自动 recover_stale，失败拒绝新 run。
+  目录 chown 的 PermissionError 也进入统一 unsupported/清理路径。
+- 验证：完整离线 **895 passed + 40 skipped**，ruff/diff 全绿；R10+R11
+  真实 Linux 整组 **38 passed**，macOS 真实 CLI/TUI unsupported **2 passed**。
+  红基线、故障序列、实录路径和剩余边界见 R11 §6「R11-C 完成证据」。
+- 边界：helper 死亡不承诺即时清理，由下一次 protected 创建自动补偿；
+  裸 Kali、公网 IPv6、第二跳代理/隧道及宿主掉电即时清理仍未验证。R11
+  完成不等于 v0.2.0 发布；未打 tag/发布软件包。
+- 下一步：按版本清单评审并推进 R12；v0.2.0 第一条发布门槛已勾，其余
+  R12–R14、打包/安装和发布授权门槛不变。

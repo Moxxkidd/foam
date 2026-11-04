@@ -1,7 +1,7 @@
-"""R11-A per-run netns+nftables 边界的深而窄 client 接口。
+"""R11 per-run netns+nftables 边界的深而窄 client 接口。
 
-调用方只提供已确认 Scope 和显式 DNS；helper 启动、权限回读、代际 FD、
-规则更新与清理均封装在本模块。protected 失败不会回退到普通执行。
+调用方只提供已确认 Scope 和显式 DNS；创建前先对账崩溃残留，helper 启动、
+权限回读、代际 FD、规则更新与清理均封装在本模块。protected 失败不回退。
 """
 
 from __future__ import annotations
@@ -332,14 +332,21 @@ class NetworkBoundary:
         work_base = Path(work_root or "/run/foam/tool-work")
         state_dir = state_base / boundary_id
         workdir = work_base / boundary_id
-        _private_directory(state_base)
-        _private_directory(work_base)
-        _private_directory(state_dir)
-        _private_workdir(workdir)
+        try:
+            recovered = recover_stale(state_root=state_base, work_root=work_base)
+        except OSError as exc:
+            raise BoundaryError(f"历史 boundary 对账失败: {exc}") from exc
+        failed = [item for item in recovered if item["cleanup_status"] != "clean"]
+        if failed:
+            raise BoundaryError(f"历史 boundary 恢复未完成，拒绝新 run: {failed}")
         transport = None
         generation = None
         fds = []
         try:
+            _private_directory(state_base)
+            _private_directory(work_base)
+            _private_directory(state_dir)
+            _private_workdir(workdir)
             transport = _HelperTransport(boundary_id, state_dir, workdir)
             response, fds = transport.request(
                 {"op": "create", "policy": policy.as_payload()}, fd_count=2
@@ -377,6 +384,9 @@ class NetworkBoundary:
                         shutil.rmtree(path)
                     else:
                         (path / "control.sock").unlink(missing_ok=True)
+                        (
+                            path / network_helper._CLEANED_MANIFEST
+                        ).unlink(missing_ok=True)
                         path.rmdir()
                 except FileNotFoundError:
                     pass
@@ -386,6 +396,12 @@ class NetworkBoundary:
                 raise BoundaryError(
                     f"{exc}; 创建失败后的目录清理失败: {'; '.join(cleanup_errors)}"
                 ) from exc
+            if isinstance(exc, PermissionError):
+                raise ExecutionUnsupportedError(
+                    f"protected 权限不足，无法准备执行目录: {exc}"
+                ) from exc
+            if isinstance(exc, OSError):
+                raise BoundaryError(f"protected 目录准备失败: {exc}") from exc
             raise
 
     def _active_generation(self) -> _ClientGeneration:
@@ -550,6 +566,9 @@ class NetworkBoundary:
                         shutil.rmtree(path)
                     else:
                         (path / "control.sock").unlink(missing_ok=True)
+                        (
+                            path / network_helper._CLEANED_MANIFEST
+                        ).unlink(missing_ok=True)
                         path.rmdir()
                 except FileNotFoundError:
                     pass
@@ -563,10 +582,51 @@ class NetworkBoundary:
         return dict(result)
 
 
-def recover_stale(*, state_root: str | Path | None = None) -> list[dict[str, Any]]:
-    """按 root-owned manifest 重启 helper 对账；不承诺死亡后的即时清理。"""
+def _process_is_active(pid: int, start: str) -> bool:
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    fields = text.rsplit(") ", 1)[1].split()
+    return fields[19] == start and fields[0] != "Z"
+
+
+def _remove_recovered_directories(state_dir: Path, workdir: Path) -> None:
+    info = state_dir.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise BoundaryError("恢复目录所有权或权限不安全")
+    try:
+        work_info = workdir.lstat()
+    except FileNotFoundError:
+        work_info = None
+    if work_info is not None:
+        if (
+            not stat.S_ISDIR(work_info.st_mode)
+            or stat.S_ISLNK(work_info.st_mode)
+            or work_info.st_uid != 65534
+            or stat.S_IMODE(work_info.st_mode) != 0o700
+        ):
+            raise BoundaryError("工具工作目录所有权或权限不安全")
+        shutil.rmtree(workdir)
+    (state_dir / "control.sock").unlink(missing_ok=True)
+    (state_dir / network_helper._CLEANED_MANIFEST).unlink(missing_ok=True)
+    state_dir.rmdir()
+
+
+def recover_stale(
+    *,
+    state_root: str | Path | None = None,
+    work_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """按 root-owned manifest/cleaned 标记对账；不承诺死亡后即时清理。"""
     _require_supported()
     root = Path(state_root or "/run/foam/network")
+    work_base = Path(work_root or "/run/foam/tool-work")
     if not root.exists():
         return []
     results = []
@@ -576,33 +636,53 @@ def recover_stale(*, state_root: str | Path | None = None) -> list[dict[str, Any
         ):
             continue
         boundary_id = state_dir.name
-        workdir = Path("/run/foam/tool-work") / boundary_id
+        workdir = work_base / boundary_id
         try:
+            manifest_path = state_dir / "manifest.json"
+            cleaned_path = state_dir / network_helper._CLEANED_MANIFEST
+            has_manifest = manifest_path.exists()
+            has_cleaned = cleaned_path.exists()
+            if has_manifest == has_cleaned:
+                raise BoundaryError("manifest/cleaned 状态不明，拒绝 recover")
+            identity_path = cleaned_path if has_cleaned else manifest_path
             manifest = network_helper.read_manifest(
-                state_dir / "manifest.json", expected_boundary_id=boundary_id
+                identity_path, expected_boundary_id=boundary_id
             )
-            try:
-                helper_alive = (
-                    network_helper._process_start(manifest["helper_pid"])
-                    == manifest["helper_start"]
-                )
-            except FileNotFoundError:
-                helper_alive = False
-            if helper_alive:
+            if _process_is_active(manifest["helper_pid"], manifest["helper_start"]):
                 raise BoundaryError("manifest 对应 helper 仍存活，拒绝并发 recover")
-            transport = _HelperTransport(boundary_id, state_dir, workdir, recover=True)
-            try:
-                response, _ = transport.request({"op": "recover"})
-                results.append(
-                    {
+            if has_cleaned:
+                result = {
+                    "boundary_id": boundary_id,
+                    "cleanup_status": "clean",
+                    "remaining_resources": [],
+                    "errors": [],
+                }
+            else:
+                transport = _HelperTransport(
+                    boundary_id, state_dir, workdir, recover=True
+                )
+                try:
+                    response, _ = transport.request({"op": "recover"})
+                    result = {
                         "boundary_id": boundary_id,
                         "cleanup_status": response.get("cleanup_status", "unknown"),
-                        "remaining_resources": response.get("remaining_resources", []),
-                        "errors": response.get("errors", []),
+                        "remaining_resources": list(
+                            response.get("remaining_resources", [])
+                        ),
+                        "errors": list(response.get("errors", [])),
                     }
-                )
-            finally:
-                transport.close()
+                finally:
+                    transport.close()
+            if result["cleanup_status"] == "clean":
+                try:
+                    _remove_recovered_directories(state_dir, workdir)
+                except (BoundaryError, OSError) as exc:
+                    result["cleanup_status"] = "failed"
+                    result["errors"].append(f"恢复目录清理失败: {exc}")
+                    for path in (state_dir, workdir):
+                        if path.exists():
+                            result["remaining_resources"].append(f"directory:{path}")
+            results.append(result)
         except (BoundaryError, OSError) as exc:
             results.append(
                 {
