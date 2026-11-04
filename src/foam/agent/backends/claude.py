@@ -24,6 +24,7 @@ import httpx
 
 from foam.agent.backends.base import (
     BackendEvent,
+    IncompleteResponseError,
     LLMBackend,
     Message,
     ModerationError,
@@ -204,8 +205,10 @@ class ClaudeBackend(LLMBackend):
         self, response: httpx.Response
     ) -> AsyncIterator[BackendEvent]:
         builders: dict[int, _ToolUseBuilder] = {}
-        input_tokens = 0
-        output_tokens = 0
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+        saw_terminal_marker = False
+        stop_reason: str | None = None
         async for data in iter_sse_data(response):
             try:
                 event = json.loads(data)
@@ -219,8 +222,10 @@ class ClaudeBackend(LLMBackend):
             event_type = event.get("type")
             if event_type == "message_start":
                 start_usage = (event.get("message") or {}).get("usage") or {}
-                input_tokens = int(start_usage.get("input_tokens") or 0)
-                output_tokens = int(start_usage.get("output_tokens") or 0)
+                if "input_tokens" in start_usage:
+                    input_tokens = int(start_usage["input_tokens"])
+                if "output_tokens" in start_usage:
+                    output_tokens = int(start_usage["output_tokens"])
             elif event_type == "content_block_start":
                 block = event.get("content_block") or {}
                 if block.get("type") == "tool_use":
@@ -246,19 +251,31 @@ class ClaudeBackend(LLMBackend):
                     yield builder.build(provider=self.provider)
             elif event_type == "message_delta":
                 delta = event.get("delta") or {}
-                if delta.get("stop_reason") == "refusal":
+                stop_reason = delta.get("stop_reason") or stop_reason
+                if stop_reason == "refusal":
                     raise ModerationError(
                         f"[{self.provider}] provider 拒绝生成: stop_reason=refusal",
                         provider=self.provider,
                     )
                 delta_usage = event.get("usage") or {}
-                if delta_usage:
-                    output_tokens = int(delta_usage.get("output_tokens") or 0)
+                if "output_tokens" in delta_usage:
+                    output_tokens = int(delta_usage["output_tokens"])
+            elif event_type == "message_stop":
+                saw_terminal_marker = True
             elif event_type == "error":
                 self._raise_stream_error(event.get("error") or {})
-            # ping / message_stop / 未知类型:忽略
 
         yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+        if stop_reason == "max_tokens":
+            raise IncompleteResponseError(
+                f"[{self.provider}] 响应因 stop_reason=max_tokens 而不完整",
+                provider=self.provider,
+            )
+        if not saw_terminal_marker:
+            raise StreamError(
+                f"[{self.provider}] 流在 message_stop 前结束，响应截断",
+                provider=self.provider,
+            )
 
     def _block_index(self, event: Any) -> int:
         """content_block_* 事件的 index;缺失/非法属 provider 数据坏。"""

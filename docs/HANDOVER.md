@@ -1042,3 +1042,24 @@ WP-13(整合)依赖全部
   完成不等于 v0.2.0 发布；未打 tag/发布软件包。
 - 下一步：按版本清单评审并推进 R12；v0.2.0 第一条发布门槛已勾，其余
   R12–R14、打包/安装和发布授权门槛不变。
+
+
+## 当前状态（2026-11-04：R12 全部关闭）
+
+- [R12](items/R12.md) A/B/C 与 AC01–AC07 全部完成。统一账本覆盖主环、
+  scope 编译、失败/取消、重试、连续对话和 resume；实测/估算/unknown 分列，
+  费用无定价表时始终 unknown，不实现精确美元硬上限。
+- context、累计 tokens、累计 rounds 和墙钟在模型/工具/重试派发前统一检查；
+  压缩后仍超限或有限额度遇 unknown 均停止后续派发，在途用量如实入账。
+  普通插话与 plain resume 不重置/扩大限额；CLI 参数与 TUI `/budget` 的显式
+  变化均写 operator 审计。
+- 预算停止为 `stopped + goal_status=unfinished`，不 `mark_closed`，CLI/TUI
+  非零退出；仍走 `_finish → close_run → write_manifest`，manifest/结项页含
+  停止原因、目标状态和 closing 总账。TUI 停止后由 CLI resume 显式扩容恢复。
+- 验证：macOS arm64 / Python 3.12.14，六文件 **338 passed in 146.55s**；
+  最终完整离线 **923 passed, 40 skipped in 174.06s**，ruff/diff 全绿。
+  40 个 skip 为既有环境/opt-in 面，R12 新增用例未跳过。fake HTTP、真实
+  CLI/TUI 驱动与本地进程清理已验；真实外部 provider 未调用，不把本轮写成
+  live 后端实证。交付 SHA 与远端 CI 记录见 R12 §8 的关闭后回填。
+- 下一步：仅在后续明确授权下评审 R13；R14、打包/安装和发布门槛未动。
+  本次未打 tag、未发布软件包。

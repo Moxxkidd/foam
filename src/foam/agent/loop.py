@@ -21,7 +21,7 @@
 - WP-09 更正当(2026-08-24,声明见 docs/dev-logs/WP-09.md 更正当节):
   构造参数 ``wait_on_finish=True`` 时,无工具调用的终答不收尾——置
   ``idle`` 待命、阻塞在插话队列,插话唤醒作为新 user 消息续段;
-  rounds/token 累计延续,``max_rounds`` 按待命段重新计;待命不写
+  R12 起 rounds/token 均按整个 run 累计,普通插话不重置预算;待命不写
   run_finished,kill 走既有清理面。默认 False,headless 语义不变。
 
 审计事件:复用 WP-02 的 scope_loaded/exec_request/exec_denied/exec_result_meta/
@@ -59,6 +59,11 @@ from foam.agent.backends.base import (
     ToolSpec,
     Usage,
 )
+from foam.agent.budget import (
+    DEFAULT_CONTEXT_TOKEN_LIMIT,
+    BudgetLedger,
+    BudgetLimits,
+)
 from foam.agent.prompts import (
     ENGAGEMENT_FILENAME,
     build_engagement_message,
@@ -94,7 +99,7 @@ from foam.tools.session import SessionTool
 FIRST_EVENT_TIMEOUT_SECONDS = 30.0
 #: context 预算默认值(token,字符数/4 粗估)。保守取 120k,给主流长上下文
 #: 模型留足余量;CLI 可调。
-DEFAULT_MAX_CONTEXT_TOKENS = 120_000
+DEFAULT_MAX_CONTEXT_TOKENS = DEFAULT_CONTEXT_TOKEN_LIMIT
 #: 压缩时保留的最近消息条数(不参与压缩的尾部窗口)。
 DEFAULT_KEEP_RECENT_MESSAGES = 6
 #: 可重试后端错误(网络/超时/限流/5xx)的最大重试次数。
@@ -129,6 +134,8 @@ KIND_RUN_FINISHED = "run_finished"
 KIND_LOOP_CORRECTION = "loop_correction"
 KIND_LLM_RETRY = "llm_retry"
 KIND_CONTEXT_COMPRESSED = "context_compressed"
+KIND_BUDGET_LIMIT_CHANGED = "budget_limit_changed"
+KIND_BUDGET_WARNING = "budget_warning"
 
 #: 幻觉执行(K3 实测 A4:声称「已记录」却不发 tool_call)的动作声明特征。
 #: 宁宽勿严:误报只多一轮纠正(有上限),漏报会污染 engagement 记录。
@@ -316,7 +323,8 @@ class ToolRegistry:
 class LoopObserver:
     """主环事件钩子。CLI 打印、WP-09 TUI 渲染都实现本接口。"""
 
-    def on_status(self, status: str) -> None:  # running/paused/killed/finished/error
+    def on_status(self, status: str) -> None:
+        # running/paused/stopped/killed/finished/error
         pass
 
     def on_text_delta(self, text: str) -> None:
@@ -356,12 +364,7 @@ class LoopObserver:
 
 @dataclass(frozen=True)
 class RunResult:
-    """一次 run 的结局。status: finished / killed / error / cancelled。
-
-    ``cancelled``(R03 新增):外部取消(asyncio CancelledError,非 kill
-    switch)——loop 收割并落 run_finished 后如实向上重抛,RunResult 本身
-    不返回给调用方,仅用于终态记录载荷。
-    """
+    """一次 run 的结局；stopped 表示预算停止，目标仍未完成。"""
 
     status: str
     summary: str
@@ -369,6 +372,14 @@ class RunResult:
     input_tokens: int
     output_tokens: int
     error: str | None = None
+    budget: dict[str, Any] | None = None
+    stop_reason: str | None = None
+
+
+class _BudgetStop(Exception):
+    def __init__(self, stop: dict[str, Any]) -> None:
+        super().__init__(stop["reason"])
+        self.stop = stop
 
 
 @dataclass
@@ -423,13 +434,25 @@ class AgentLoop:
         keep_recent_messages: int = DEFAULT_KEEP_RECENT_MESSAGES,
         first_event_timeout: float = FIRST_EVENT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        max_rounds: int = 0,  # 0 = 不限;headless 兜底阀,正常靠 finish/kill
-        wait_on_finish: bool = False,  # True:终答不返回,idle 待命等插话续段
+        max_rounds: int = 0,
+        max_total_tokens: int = 0,
+        max_wall_time: float = 0.0,
+        wait_on_finish: bool = False,
+        budget: BudgetLedger | None = None,
     ) -> None:
         if first_event_timeout <= 0:
             raise ValueError("首事件超时必须为正(默认 30s,见 K3 实测)")
-        if max_context_tokens <= 0:
-            raise ValueError("context 预算必须为正")
+        if budget is None:
+            budget = BudgetLedger(
+                BudgetLimits(
+                    context_tokens=max_context_tokens,
+                    total_tokens=max_total_tokens or None,
+                    rounds=max_rounds or None,
+                    wall_time_seconds=max_wall_time or None,
+                )
+            )
+        self._budget = budget
+        self._max_context_tokens = budget.limits.context_tokens
         self._backend = backend
         self._bash = bash
         self._scope = scope
@@ -450,7 +473,6 @@ class AgentLoop:
         self._index = index
         self._operator = operator
         self._last_phase: str | None = None  # 已对外通知的阶段(WP-09)
-        self._max_context_tokens = max_context_tokens
         self._keep_recent = max(0, keep_recent_messages)
         self._first_event_timeout = first_event_timeout
         self._max_retries = max_retries
@@ -484,9 +506,9 @@ class AgentLoop:
         self._run_task: asyncio.Task[None] | None = None
         self._status = "idle"
         self._rounds = 0
-        self._segment_rounds = 0  # max_rounds 按待命段计(WP-09 更正当)
         self._total_input = 0
         self._total_output = 0
+        self._budget_guidance_emitted = False
         # tool_call_id → (output_path, sha256):压缩占位要用的落盘线索
         self._result_hints: dict[str, tuple[str, str]] = {}
         # R06:run 标识(决策 5)——run_started 与 job_exit 审计载荷携带(纯追加)。
@@ -528,6 +550,23 @@ class AgentLoop:
         self._pause_requested = False
         self._wake.set()
 
+    def expand_budget(self, dimension: str, value: Any) -> dict[str, Any] | None:
+        change = self._budget.change_limit(
+            dimension, value, operator=self._operator or "operator"
+        )
+        if change is None:
+            return None
+        self._max_context_tokens = self._budget.limits.context_tokens
+        self._write_budget_limit_changes()
+        return change
+
+    def _write_budget_limit_changes(self) -> None:
+        for change in self._budget.pop_limit_changes():
+            self._audit.append(
+                KIND_BUDGET_LIMIT_CHANGED,
+                {**change, "run_id": self._run_id},
+            )
+
     def kill(self, reason: str = "") -> None:
         """kill switch:立即 cancel 当前 turn;清理路径杀活动 job、写审计。"""
         if self._kill_requested:
@@ -543,7 +582,7 @@ class AgentLoop:
         self, scope: Scope, *, digest: str = "", dns: str | None = None
     ) -> None:
         """legacy 原子换引用；protected 停派发、杀旧代际并换新边界。"""
-        if self._status in ("finished", "killed", "error", "cancelled"):
+        if self._status in ("finished", "stopped", "killed", "error", "cancelled"):
             raise RuntimeError("run 已终态,不可更换 scope(D2)")
         async with self._scope_change_lock:
             boundary = (
@@ -609,6 +648,8 @@ class AgentLoop:
             Message.system(build_engagement_message(self._read_engagement())),
             Message.user(objective),
         ]
+        self._write_budget_limit_changes()
+        self._max_context_tokens = self._budget.limits.context_tokens
         self._audit.append(
             KIND_RUN_STARTED,
             {
@@ -616,8 +657,10 @@ class AgentLoop:
                 "provider": self._backend.provider,
                 "workdir": str(self._workdir),
                 "run_id": self._run_id,  # R06 决策 5:纯追加字段,重放兼容
+                "budget_opening": self._budget.snapshot(),
             },
         )
+        self._budget.start_run()
         try:
             result = await self._main()
         except asyncio.CancelledError:
@@ -637,6 +680,8 @@ class AgentLoop:
                 raise asyncio.CancelledError from None
             else:
                 result = await self._finalize_killed()
+        except _BudgetStop as exc:
+            result = self._finalize_stopped(exc.stop)
         except BackendError as exc:
             result = self._finalize_error(str(exc))
         except Exception as exc:  # 非预期异常:如实记 error,不炸 headless
@@ -646,7 +691,7 @@ class AgentLoop:
     async def _finish(self, result: RunResult) -> RunResult:
         """统一终态面(R03 D6):停止派发 → 收割 → 排空(R06) → run_finished → 置状态。
 
-        任何终态路径(finished/error/max_rounds/killed/外部取消)都先收割本
+        任何终态路径(finished/stopped/error/killed/外部取消)都先收割本
         run 进程资源再落终态记录;收割报告进 run_finished 载荷(D2,kind
         不变)。收割经 shield 兜底:外部取消后再被取消(二次 kill/Ctrl-C)
         清理仍跑完。kill 路径的 kill_switch 记录由 _finalize_killed 先落
@@ -659,10 +704,21 @@ class AgentLoop:
         if cleanup is None:
             cleanup = await self._reap_shielded()
         drain_report = await self._drain_job_exits_shielded()  # R06-C 排空
+        self._budget.finish_run()
+        result = dataclasses.replace(
+            result,
+            budget=self._budget.snapshot(
+                context_tokens=estimate_tokens(self._messages)
+            ),
+        )
         self._audit.append(
             KIND_RUN_FINISHED,
             {
                 "status": result.status,
+                "stop_reason": result.stop_reason,
+                "goal_status": (
+                    "unfinished" if result.status == "stopped" else "unknown"
+                ),
                 "rounds": result.rounds,
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
@@ -674,6 +730,7 @@ class AgentLoop:
                 "cleanup": cleanup,
                 "run_id": self._run_id,  # R06 决策 5:纯追加字段
                 "job_exit_drain": drain_report,  # R06-C:AC06 登记证据
+                "budget": result.budget,
             },
         )
         self._set_status(result.status)
@@ -696,10 +753,8 @@ class AgentLoop:
             self._refresh_engagement_message()
             self._maybe_emit_phase()
             self._maybe_compress()
-            if self._max_rounds and self._segment_rounds >= self._max_rounds:
-                return self._finalize_error(
-                    f"达到最大轮数上限 {self._max_rounds},run 终止(可调 --max-rounds)"
-                )
+            self._maybe_guide_budget()
+            self._raise_budget_stop(context=True)
 
             outcome = await self._llm_round_with_retry()
             if outcome.malformed is None:
@@ -750,7 +805,6 @@ class AgentLoop:
                     await self._idle_wait()
                     if self._kill_requested:
                         return await self._finalize_killed()
-                    self._segment_rounds = 0  # max_rounds 按待命段重新计
                     continue
                 return RunResult(
                     status="finished",
@@ -794,7 +848,7 @@ class AgentLoop:
         attempt = 0
         while True:
             try:
-                return await self._collect_round()
+                return await self._collect_round(attempt=attempt)
             except MalformedToolCallError:  # pragma: no cover - 防御,正常进不来
                 raise
             except TimeoutError as exc:
@@ -808,6 +862,7 @@ class AgentLoop:
                 if not exc.retryable:
                     raise
                 error = exc
+            self._raise_budget_stop()
             attempt += 1
             if attempt > self._max_retries:
                 raise error
@@ -820,20 +875,22 @@ class AgentLoop:
             delay = retry_after if retry_after else min(2 ** (attempt - 1), 8)
             await asyncio.sleep(delay)
 
-    async def _collect_round(self) -> _RoundOutcome:
-        agen = self._backend.chat(self._messages, self._registry.specs())
+    async def _collect_round(self, *, attempt: int = 0) -> _RoundOutcome:
+        request_id = f"req-{uuid.uuid4().hex}"
+        agen = None
         text_parts: list[str] = []
-        reasoning_parts: list[str] = []  # WP-09:思考增量,审计只记哈希
+        reasoning_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         usage = Usage()
         malformed: MalformedToolCallError | None = None
+        outcome = "completed"
         try:
+            agen = self._backend.chat(self._messages, self._registry.specs())
             iterator = agen.__aiter__()
             first = True
             while True:
                 try:
                     if first:
-                        # 首事件超时(K3 实测 max 16.24s → 默认 30s)
                         event = await asyncio.wait_for(
                             iterator.__anext__(), timeout=self._first_event_timeout
                         )
@@ -843,58 +900,89 @@ class AgentLoop:
                 except StopAsyncIteration:
                     break
                 except MalformedToolCallError as exc:
-                    malformed = exc  # 已收集的文本/工具调用保留,回灌纠正
+                    malformed = exc
+                    outcome = "malformed"
                     break
                 if isinstance(event, TextDelta):
                     text_parts.append(event.text)
                     self._observer.on_text_delta(event.text)
                 elif isinstance(event, ReasoningDelta):
-                    # WP-09:思考与正文分离,透传给 observer(TUI 折叠展示)
                     reasoning_parts.append(event.text)
                     self._observer.on_reasoning_delta(event.text)
                 elif isinstance(event, ToolCall):
                     tool_calls.append(event)
                 elif isinstance(event, Usage):
                     usage = event
+        except BaseException as exc:
+            outcome = (
+                "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+            )
+            raise
         finally:
-            await agen.aclose()
+            try:
+                if agen is not None:
+                    await agen.aclose()
+            except BaseException as exc:
+                outcome = (
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+                )
+                raise
+            finally:
+                self._budget.record_usage(
+                    usage,
+                    request_id=request_id,
+                    phase="main",
+                    provider=self._backend.provider,
+                    attempt=attempt,
+                    outcome=outcome,
+                )
+                self._total_input += usage.input_tokens or 0
+                self._total_output += usage.output_tokens or 0
+                text = "".join(text_parts)
+                response_repr: dict[str, Any] = {
+                    "text": text,
+                    "tool_calls": [
+                        {"id": c.id, "name": c.name, "arguments": c.arguments}
+                        for c in tool_calls
+                    ],
+                }
+                if malformed is not None:
+                    response_repr["malformed_raw_arguments"] = (
+                        malformed.raw_arguments
+                    )
+                payload = llm_meta(
+                    json.dumps(
+                        [message_to_dict(m) for m in self._messages],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    json.dumps(response_repr, ensure_ascii=False, sort_keys=True),
+                    prompt_tokens=usage.input_tokens,
+                    response_tokens=usage.output_tokens,
+                )
+                payload.update(
+                    {
+                        "request_id": request_id,
+                        "phase": "main",
+                        "provider": self._backend.provider,
+                        "attempt": attempt,
+                        "outcome": outcome,
+                        "measurement_status": usage.measurement_status,
+                    }
+                )
+                if outcome in ("completed", "malformed"):
+                    payload["round"] = self._rounds + 1
+                reasoning = "".join(reasoning_parts)
+                if reasoning:
+                    payload["reasoning_sha256"] = hashlib.sha256(
+                        reasoning.encode("utf-8")
+                    ).hexdigest()
+                    payload["reasoning_chars"] = len(reasoning)
+                self._audit.append(KIND_LLM_EXCHANGE_META, payload)
 
         self._rounds += 1
-        self._segment_rounds += 1  # 待命段内轮数(WP-09 更正当)
-        self._total_input += usage.input_tokens
-        self._total_output += usage.output_tokens
-        text = "".join(text_parts)
-        response_repr: dict[str, Any] = {
-            "text": text,
-            "tool_calls": [
-                {"id": c.id, "name": c.name, "arguments": c.arguments}
-                for c in tool_calls
-            ],
-        }
-        if malformed is not None:
-            response_repr["malformed_raw_arguments"] = malformed.raw_arguments
-        payload = llm_meta(
-            json.dumps(
-                [message_to_dict(m) for m in self._messages],
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            json.dumps(response_repr, ensure_ascii=False, sort_keys=True),
-            prompt_tokens=usage.input_tokens or None,
-            response_tokens=usage.output_tokens or None,
-        )
-        reasoning = "".join(reasoning_parts)
-        if reasoning:
-            # WP-09 定案 Q6:思考内容审计只记哈希与长度,不落原文
-            payload["reasoning_sha256"] = hashlib.sha256(
-                reasoning.encode("utf-8")
-            ).hexdigest()
-            payload["reasoning_chars"] = len(reasoning)
-        self._audit.append(KIND_LLM_EXCHANGE_META, payload)
         refusal_patterns = refusal_detect(text)
         if refusal_patterns:
-            # WP-14d(Q7):拒答纯观测——只记哈希与命中模式,不记全文,不改
-            # 任何控制流;只测正文 text,reasoning 通道(ReasoningDelta)不测。
             self._audit.append(
                 KIND_REFUSAL_DETECTED,
                 {
@@ -915,6 +1003,7 @@ class AgentLoop:
         # 工具层 aclose 拒绝是兜底)。不开卡不上屏:调用从未发生。
         if self._dispatch_stopped:
             return {"error": "run 已收尾,派发已停止;该工具调用未执行(R03)"}
+        self._raise_budget_stop()
         self._observer.on_tool_call(call)
         if call.name == "run_command":
             command = call.arguments.get("command")
@@ -1454,6 +1543,83 @@ class AgentLoop:
             input_tokens=self._total_input,
             output_tokens=self._total_output,
             error=self._kill_reason or None,
+        )
+
+    def _maybe_guide_budget(self) -> None:
+        if self._budget_guidance_emitted:
+            return
+        context_tokens = estimate_tokens(self._messages)
+        dimensions = self._budget.approaching(context_tokens=context_tokens)
+        if not dimensions:
+            return
+        self._budget_guidance_emitted = True
+        snapshot = self._budget.snapshot(context_tokens=context_tokens)
+        self._audit.append(
+            KIND_BUDGET_WARNING,
+            {"dimensions": dimensions, "budget": snapshot, "run_id": self._run_id},
+        )
+        self._messages.append(
+            Message.user(
+                "【预算提醒】当前用量接近上限（"
+                + ", ".join(dimensions)
+                + "）。请优先保存进展并收敛到现有发现，不要扩大动作；"
+                "如需继续但无法完成，请明确说明剩余项。"
+            )
+        )
+
+    def _raise_budget_stop(self, *, context: bool = False) -> None:
+        stop = self._budget.exhaustion(
+            context_tokens=estimate_tokens(self._messages) if context else None
+        )
+        if stop is not None:
+            raise _BudgetStop(stop)
+
+    def _finalize_stopped(self, stop: dict[str, Any]) -> RunResult:
+        snapshot = stop["snapshot"]
+        limits = snapshot["limits"]
+        reason = stop["reason"]
+        if reason == "context_still_too_large":
+            error = (
+                "上下文压缩后仍超过容量 "
+                f"{snapshot['context_tokens_estimated']}/{limits['context_tokens']}；"
+                "未发送新模型请求。请显式提高 --max-context-tokens 后 resume"
+            )
+        elif reason == "token_usage_unknown":
+            error = (
+                "累计 token 含 unknown，无法核对有限上限；已停止新模型与工具派发。"
+                "如需继续，请显式将 --max-total-tokens 设为 0（不限）后 resume"
+            )
+        elif reason == "total_tokens":
+            error = (
+                "累计 token 达到或超过上限 "
+                f"{snapshot['total_tokens']}/{limits['total_tokens']}"
+                "（在途响应已入账）；已停止新模型与工具派发，"
+                "请显式提高 --max-total-tokens 后 resume"
+            )
+        elif reason == "rounds":
+            error = (
+                f"累计轮数达到上限 {snapshot['rounds']}/{limits['rounds']}；"
+                "已停止新模型与工具派发，请显式提高 --max-rounds 后 resume"
+            )
+        elif reason == "wall_time_unknown":
+            error = (
+                "历史墙钟时长 unknown，无法核对有限上限；如需继续，"
+                "请显式将 --max-wall-time 设为 0（不限）后 resume"
+            )
+        else:
+            error = (
+                "累计墙钟达到或超过上限 "
+                f"{snapshot['wall_time_seconds']:.1f}/{limits['wall_time_seconds']}s；"
+                "已停止新模型与工具派发，请显式提高 --max-wall-time 后 resume"
+            )
+        return RunResult(
+            status="stopped",
+            summary="",
+            rounds=self._rounds,
+            input_tokens=self._total_input,
+            output_tokens=self._total_output,
+            error=error,
+            stop_reason=reason,
         )
 
     def _finalize_error(self, error: str) -> RunResult:

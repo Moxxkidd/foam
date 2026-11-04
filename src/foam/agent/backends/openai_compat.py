@@ -7,7 +7,7 @@ API key 只从环境变量读取(默认 `FOAM_LLM_API_KEY`)。
 要点:
 - `stream_options.include_usage` 默认开启以取回流末 usage;个别端点不认
   该字段时可构造时传 `include_usage=False` 关闭(Usage 事件仍会产出,
-  字段为 0)。
+  缺失字段保留 None/unknown)。
 - assistant 历史消息的 `content` 在携带 tool_calls 时按 OpenAI 惯例置
   null;`extra_body` 可附加 provider 特有参数(如 temperature)。
 - 思考型模型(K3 等)流式 delta 里的 `reasoning_content` 解析为
@@ -24,6 +24,7 @@ import httpx
 
 from foam.agent.backends.base import (
     BackendEvent,
+    IncompleteResponseError,
     LLMBackend,
     Message,
     ModerationError,
@@ -200,8 +201,11 @@ class OpenAICompatBackend(LLMBackend):
         builders: dict[int, _ToolCallBuilder] = {}
         order: list[int] = []
         usage = Usage()
+        saw_terminal_marker = False
+        token_limit_stop = False
         async for data in iter_sse_data(response):
             if data == "[DONE]":
+                saw_terminal_marker = True
                 break
             try:
                 chunk = json.loads(data)
@@ -233,7 +237,10 @@ class OpenAICompatBackend(LLMBackend):
                         builder = builders[index] = _ToolCallBuilder()
                         order.append(index)
                     builder.feed(fragment)
-                if choice.get("finish_reason") == "content_filter":
+                finish_reason = choice.get("finish_reason")
+                if finish_reason == "length":
+                    token_limit_stop = True
+                elif finish_reason == "content_filter":
                     raise ModerationError(
                         f"[{self.provider}] provider 审核拦截:"
                         " finish_reason=content_filter",
@@ -242,15 +249,32 @@ class OpenAICompatBackend(LLMBackend):
 
             chunk_usage = chunk.get("usage")
             if chunk_usage:
+                prompt_tokens = chunk_usage.get("prompt_tokens")
+                completion_tokens = chunk_usage.get("completion_tokens")
                 usage = Usage(
-                    input_tokens=int(chunk_usage.get("prompt_tokens") or 0),
-                    output_tokens=int(chunk_usage.get("completion_tokens") or 0),
+                    input_tokens=(
+                        int(prompt_tokens) if prompt_tokens is not None else None
+                    ),
+                    output_tokens=(
+                        int(completion_tokens)
+                        if completion_tokens is not None
+                        else None
+                    ),
                 )
 
-        # 工具调用片段无单独完成信号,统一在流末按 index 顺序产出完整帧
         for index in order:
             yield builders[index].build(provider=self.provider)
         yield usage
+        if token_limit_stop:
+            raise IncompleteResponseError(
+                f"[{self.provider}] 响应因 finish_reason=length 而不完整",
+                provider=self.provider,
+            )
+        if not saw_terminal_marker:
+            raise StreamError(
+                f"[{self.provider}] 流在 [DONE] 前结束，响应截断",
+                provider=self.provider,
+            )
 
     def _raise_stream_error(self, error: Any) -> None:
         text = (

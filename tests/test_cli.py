@@ -1192,8 +1192,7 @@ def test_run_finished_reaps_leftover_background_job(tmp_path):
 
 
 def test_run_max_rounds_reaps_background_job_e04(tmp_path):
-    """R03-AC01(E04 原位回归):fake 模型起后台长跑,max_rounds=1 → error
-    收尾后本 run 无活动进程(评估复现原为 sleep 30,测试用唯一时长防误配)。"""
+    """R03 清理在 R12 预算 stopped 终态下仍完整执行，退出码保持 1。"""
     backend = FakeBackend(
         [
             [
@@ -1202,6 +1201,10 @@ def test_run_max_rounds_reaps_background_job_e04(tmp_path):
                     "run_command",
                     {"command": "sleep 31339", "background": True},
                 ),
+                Usage(1, 1),
+            ],
+            [
+                ToolCall("tc-blocked", "run_command", {"command": "echo NO"}),
                 Usage(1, 1),
             ],
         ]
@@ -1218,17 +1221,17 @@ def test_run_max_rounds_reaps_background_job_e04(tmp_path):
             "--workdir",
             str(workdir),
             "--max-rounds",
-            "1",
+            "2",
         ],
         backend_factory=lambda _args: backend,
     )
-    assert rc == 1  # error 退出码契约不变
+    assert rc == 1  # stopped 沿用既有非零退出码
     assert _test_sleeps_alive() == []
     meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
-    assert meta["status"] == "active"  # R02 边界:killed/error 保持 active
+    assert meta["status"] == "active"  # stopped 保持可恢复，不冒充 closed
     records = audit_records(workdir)
     finished = [r for r in records if r["kind"] == "run_finished"]
-    assert finished[0]["payload"]["status"] == "error"
+    assert finished[0]["payload"]["status"] == "stopped"
     assert finished[0]["payload"]["cleanup"]["cleanup_status"] == "ok"
     assert verify(workdir / "audit.jsonl")
 
@@ -1581,4 +1584,119 @@ def test_resume_legacy_engagement_without_evidence_dir(tmp_path):
         backend_factory=lambda _a: FakeBackend([FINISH]),
     )
     assert rc == 0
+    assert verify(workdir / "audit.jsonl")
+
+
+def test_r12_cli_budget_includes_nl_compile(tmp_path, capsys):
+    workdir = tmp_path / "eng"
+    backend = FakeBackend(
+        [
+            [TextDelta('{"rules": ["127.0.0.1"]}'), Usage(3, 1)],
+            FINISH,
+        ]
+    )
+    rc = cli_main(
+        [
+            "run",
+            *LEGACY,
+            "--scope-text",
+            "只授权 127.0.0.1",
+            "--objective",
+            "核对编译预算",
+            "--workdir",
+            str(workdir),
+        ],
+        backend_factory=lambda _a: backend,
+    )
+    assert rc == 0
+    records = audit_records(workdir)
+    exchanges = [r["payload"] for r in records if r["kind"] == "llm_exchange_meta"]
+    assert [p["phase"] for p in exchanges] == ["scope_compile", "main"]
+    started = next(r["payload"] for r in records if r["kind"] == "run_started")
+    finished = next(r["payload"] for r in records if r["kind"] == "run_finished")
+    assert started["budget_opening"]["measured_total_tokens"] == 4
+    assert finished["budget"]["measured_total_tokens"] == 8
+    assert "tokens 8/不限" in capsys.readouterr().out
+    assert verify(workdir / "audit.jsonl")
+
+
+def test_r12_budget_stop_resume_expand_and_evidence(tmp_path, capsys):
+    scope_file = write_scope(tmp_path)
+    workdir = tmp_path / "eng"
+    rc = cli_main(
+        [
+            "run",
+            *LEGACY,
+            "--scope",
+            str(scope_file),
+            "--objective",
+            "预算停止恢复",
+            "--workdir",
+            str(workdir),
+            "--max-total-tokens",
+            "10",
+        ],
+        backend_factory=lambda _a: FakeBackend(
+            [
+                [
+                    ToolCall("tc-stop", "run_command", {"command": "echo NO"}),
+                    Usage(6, 4),
+                ]
+            ]
+        ),
+    )
+    assert rc == 1
+    assert "run stopped" in capsys.readouterr().out
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "active"
+    records = audit_records(workdir)
+    finished = records[-1]["payload"]
+    assert finished["status"] == "stopped"
+    assert finished["goal_status"] == "unfinished"
+    assert finished["stop_reason"] == "total_tokens"
+    assert finished["cleanup"]["cleanup_status"] == "ok"
+    assert not any(r["kind"] == "exec_request" for r in records)
+    manifests = sorted((workdir / "evidence").glob("manifest-*.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["end_reason"]["goal_status"] == "unfinished"
+    assert manifest["end_reason"]["stop_reason"] == "total_tokens"
+    assert manifest["budget"]["total_tokens"] == 10
+    summary_path = manifests[0].with_name(
+        manifests[0].name.replace("manifest-", "summary-")
+    ).with_suffix(".md")
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "目标状态:unfinished" in summary
+    assert "停止原因:total_tokens" in summary
+
+    resumed = FakeBackend([FINISH])
+    rc = cli_main(
+        ["resume", *LEGACY, str(workdir)],
+        backend_factory=lambda _a: resumed,
+    )
+    assert rc == 1
+    assert resumed.calls == []
+    assert audit_records(workdir)[-1]["payload"]["status"] == "stopped"
+
+    expanded = FakeBackend([FINISH])
+    rc = cli_main(
+        [
+            "resume",
+            *LEGACY,
+            str(workdir),
+            "--max-total-tokens",
+            "20",
+        ],
+        backend_factory=lambda _a: expanded,
+    )
+    assert rc == 0
+    records = audit_records(workdir)
+    change = next(
+        r["payload"] for r in records if r["kind"] == "budget_limit_changed"
+    )
+    assert change["old_limit"] == 10
+    assert change["new_limit"] == 20
+    assert change["operator"] == "cli"
+    assert records[-1]["payload"]["budget"]["total_tokens"] == 14
+    assert json.loads((workdir / "engagement.json").read_text())["status"] == "closed"
     assert verify(workdir / "audit.jsonl")

@@ -597,6 +597,7 @@ _STATUS_STYLES: dict[str, tuple[str, str]] = {
     "idle": ("○ 待命", "dim"),
     "running": ("● 运行中", "green"),
     "paused": ("⏸ 已暂停", "yellow"),
+    "stopped": ("■ 预算停止", "yellow"),
     "killed": ("■ 已 kill", "red"),
     "finished": ("✓ 已完成", "cyan"),
     "error": ("✗ 出错", "red"),
@@ -801,7 +802,7 @@ class ScopeConfirmCard(Vertical):
 # 输入坞:斜杠命令补全 + 输入框(Q4 双通道)
 # ---------------------------------------------------------------------------
 
-#: v0 斜杠命令表(定案 Q4);描述进补全候选与 /help。WP-14c 增 /scope。
+#: 斜杠命令表;描述进补全候选与 /help。
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/help", "命令与快捷键帮助"),
     ("/pause", "暂停 agent(turn 边界生效)"),
@@ -810,6 +811,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/jobs", "列出后台 job"),
     ("/sessions", "列出 PTY 会话"),
     ("/status", "run 状态与索引摘要"),
+    ("/budget", "查看/显式修改总预算"),
     ("/scope", "查看/修改授权 scope(确认仪式)"),
 ]
 

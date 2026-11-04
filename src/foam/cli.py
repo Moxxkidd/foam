@@ -13,8 +13,8 @@
   ``foam.tui.app:main(args)``(args 含 --scope/--backend/--model/--base-url/
   --workdir;objective 由 TUI 主界面输入框首条消息提供,见 WP-09 定案 Q1)。
 
-退出码:0 = finished/成功;130 = killed(含 Ctrl-C);1 = error(含审计链
-校验未通过);2 = 参数/配置/前置条件错误(缺文件、TUI 依赖缺失等)。
+退出码:0 = finished/成功;130 = killed(含 Ctrl-C);1 = error/stopped(含审计链
+校验未通过;预算停止不冒充目标成功);2 = 参数/配置/前置条件错误(缺文件、TUI 依赖缺失等)。
 编译失败(--scope-text,含后端错误包装)归 2——scope 输入前置条件,
 operator 修正声明后重跑(W14b-4);freeze 落盘 OSError 归 1(写盘故障)。
 密钥只走环境变量(各后端自己的 env key);本文件不接触 key 本体。
@@ -71,8 +71,8 @@ R02-B(2026-10-06,CLI 持久恢复):
   第二写者中文报错 + 退出码 2(AC07);所有退出路径(含 KeyboardInterrupt)
   finally 释放;只读命令(replay/report)不取锁。
 - **状态生命周期**:start/resume 经 mark_active 置 active;finished 经
-  mark_closed 置 closed(re-finish 刷新 closed_at);killed/crash 保持
-  active + 锁随进程释放 = 中断可恢复(文档化边界,资源收口归 R03)。
+  mark_closed 置 closed(re-finish 刷新 closed_at);stopped/killed/crash 保持
+  active + 锁随进程释放 = 停止/中断可恢复(资源收口归 R03)。
 
 R03(2026-10-06,统一运行时资源关闭,E04 收口):
 
@@ -94,7 +94,7 @@ R09(2026-10-12,verify 与终态证据):
   evidence.py);退出码 0/1/2/3(新增 EXIT_UNKNOWN=3,fail 优先于
   unknown);--json 时 stdout 纯 JSON([config] .env 注记对 verify 改道
   stderr)。
-- run 终态(finished/killed/error/cancelled)在 close_run 之后生成
+- run 终态(finished/stopped/killed/error/cancelled)在 close_run 之后生成
   证据 manifest 与结项页(``_write_terminal_evidence``;失败只 stderr
   警告,不反转 run 退出码),TUI ``_run_to_end`` 同构接线。
 
@@ -130,6 +130,7 @@ from foam import __app_name__, __version__
 from foam.agent.backends.base import ConfigError, LLMBackend, ToolCall
 from foam.agent.backends.claude import DEFAULT_BASE_URL, ClaudeBackend
 from foam.agent.backends.openai_compat import OpenAICompatBackend
+from foam.agent.budget import BudgetLedger, BudgetLimits, format_budget
 from foam.agent.loop import AgentLoop, LoopObserver, RunResult, ToolRegistry
 from foam.agent.prompts import build_system_prompt, render_scope_section
 from foam.agent.scope_compiler import (
@@ -322,13 +323,25 @@ def _add_loop_args(parser: argparse.ArgumentParser) -> None:
         "--max-context-tokens",
         type=int,
         default=None,
-        help="context 压缩预算(token 粗估,默认 120000)",
+        help="context 压缩预算(token 粗估,默认 120000;resume 缺省继承)",
+    )
+    parser.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help="累计 token 上限(含编译/重试/恢复;0 为不限,缺省继承)",
     )
     parser.add_argument(
         "--max-rounds",
         type=int,
-        default=0,
-        help="LLM 轮数上限,0 为不限(默认 0;headless 兜底阀)",
+        default=None,
+        help="累计 LLM 轮数上限,0 为不限(缺省不限;resume 缺省继承)",
+    )
+    parser.add_argument(
+        "--max-wall-time",
+        type=float,
+        default=None,
+        help="累计运行墙钟秒数上限(不含进程外间隔;0 为不限,缺省继承)",
     )
     parser.add_argument(
         "--first-event-timeout",
@@ -692,6 +705,30 @@ def _write_terminal_evidence(runtime: _Runtime) -> None:
     )
 
 
+def _budget_from_args(
+    args: argparse.Namespace, records: Sequence[dict[str, Any]] | None = None
+) -> BudgetLedger:
+    names = {
+        "context": "max_context_tokens",
+        "total_tokens": "max_total_tokens",
+        "rounds": "max_rounds",
+        "wall_time": "max_wall_time",
+    }
+    if records is not None:
+        overrides = {
+            dimension: getattr(args, arg_name)
+            for dimension, arg_name in names.items()
+            if getattr(args, arg_name, None) is not None
+        }
+        return BudgetLedger.from_records(records, overrides=overrides, operator="cli")
+    limits: dict[str, Any] = {}
+    for dimension, arg_name in names.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            limits[BudgetLedger.limit_field(dimension)] = value or None
+    return BudgetLedger(BudgetLimits(**limits))
+
+
 def _assemble_runtime(
     args: argparse.Namespace,
     *,
@@ -701,6 +738,7 @@ def _assemble_runtime(
     scope_digest: str,
     backend: LLMBackend,
     observer: LoopObserver,
+    budget: BudgetLedger | None = None,
 ) -> _Runtime:
     """engagement 布局 + 三组工具 + 主环的一次性装配(WP-10 接线点①③)。
 
@@ -752,7 +790,8 @@ def _assemble_runtime(
         session=session,
         engagement=engagement,
         index=state.index,  # WP-11:解析层 facts 与 state 工具共用同一连接
-        max_rounds=args.max_rounds,
+        max_rounds=args.max_rounds or 0,
+        budget=budget or _budget_from_args(args),
         **loop_kwargs,
     )
     runtime.loop = loop
@@ -820,9 +859,13 @@ async def _drive(
         # R09:终态证据 manifest(close_run 之后,纯读源;不反转退出码)
         _write_terminal_evidence(runtime)
 
+    budget_text = (
+        format_budget(result.budget)
+        if result.budget is not None
+        else f"tokens 输入 {result.input_tokens} / 输出 {result.output_tokens}"
+    )
     print(
-        f"\n[run {result.status}] {result.rounds} 轮,"
-        f"tokens 输入 {result.input_tokens} / 输出 {result.output_tokens}",
+        f"\n[run {result.status}] {result.rounds} 轮\n[budget] {budget_text}",
         flush=True,
     )
     if result.error:
@@ -1040,9 +1083,12 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
                 file=sys.stderr,
             )
             return EXIT_USAGE
+        budget = _budget_from_args(args)
         audit = AuditLog(engagement.paths.audit_jsonl)
         try:
-            compilation = await compile_scope(args.scope_text, backend, audit=audit)
+            compilation = await compile_scope(
+                args.scope_text, backend, audit=audit, budget=budget
+            )
         except ScopeCompileError as exc:
             print(f"[错误] scope 编译失败: {exc}", file=sys.stderr)
             audit.close()
@@ -1083,6 +1129,7 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
                 scope_digest=scope_digest,
                 backend=backend,
                 observer=_CliObserver(),
+                budget=budget,
             )
         except BoundaryError as exc:
             print(
@@ -1325,10 +1372,12 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
             return EXIT_USAGE
         runtime.backend = backend
 
+        records = read_records(engagement.paths.audit_jsonl)
+        budget = _budget_from_args(args, records)
         print(
             f"[resume] engagement={engagement.paths.root} backend={args.backend} "
             f"(历史 {record_count} 条审计记录,链完整;简报取最近 "
-            f"{args.recent_rounds} 轮)",
+            f"{args.recent_rounds} 轮;{format_budget(budget.snapshot())})",
             flush=True,
         )
         try:
@@ -1340,6 +1389,7 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
                 scope_digest=scope_digest,
                 backend=backend,
                 observer=_CliObserver(),
+                budget=budget,
             )
         except BoundaryError as exc:
             print(

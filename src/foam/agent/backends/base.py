@@ -69,10 +69,30 @@ class ToolCall:
 
 @dataclass(frozen=True)
 class Usage:
-    """token 用量;provider 未上报的字段为 0。"""
+    """token 用量；provider 未上报任一端即保留 unknown，不伪装成 0。"""
 
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    measurement_status: str = ""
+
+    def __post_init__(self) -> None:
+        for value in (self.input_tokens, self.output_tokens):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError("token 用量必须是非负整数或 None")
+        status = self.measurement_status
+        if not status:
+            status = (
+                "measured"
+                if self.input_tokens is not None and self.output_tokens is not None
+                else "unknown"
+            )
+        if status not in ("measured", "estimated", "unknown"):
+            raise ValueError(f"未知 measurement_status: {status!r}")
+        if self.input_tokens is None or self.output_tokens is None:
+            status = "unknown"
+        object.__setattr__(self, "measurement_status", status)
 
 
 BackendEvent = TextDelta | ReasoningDelta | ToolCall | Usage
@@ -96,6 +116,7 @@ def event_to_dict(event: BackendEvent) -> dict[str, Any]:
             "type": "usage",
             "input_tokens": event.input_tokens,
             "output_tokens": event.output_tokens,
+            "measurement_status": event.measurement_status,
         }
     raise TypeError(f"未知事件类型: {type(event)!r}")
 
@@ -218,6 +239,10 @@ class ModerationError(BackendError):
 
 class InvalidRequestError(BackendError):
     """其它 4xx(请求本身不合法:模型名错、参数错等)。"""
+
+
+class IncompleteResponseError(BackendError):
+    """provider 因 token 上限结束响应；不得把部分文本当作完成摘要。"""
 
 
 class StreamError(BackendError):

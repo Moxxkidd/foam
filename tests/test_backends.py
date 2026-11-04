@@ -19,6 +19,7 @@ from foam.agent.backends import claude, openai_compat
 from foam.agent.backends.base import (
     AuthError,
     ConfigError,
+    IncompleteResponseError,
     MalformedToolCallError,
     Message,
     ModerationError,
@@ -494,8 +495,34 @@ def _noargs_claude_payloads() -> list:
     ]
 
 
+def _length_openai_payloads() -> list:
+    payloads = _happy_openai_payloads()
+    for payload in payloads:
+        if isinstance(payload, dict):
+            for choice in payload.get("choices") or []:
+                if choice.get("finish_reason"):
+                    choice["finish_reason"] = "length"
+    return payloads
+
+
+def _length_claude_payloads() -> list:
+    payloads = _happy_claude_payloads()
+    for payload in payloads:
+        if payload.get("type") == "message_delta":
+            payload["delta"]["stop_reason"] = "max_tokens"
+    return payloads
+
+
 _STREAM_SCENARIOS = {
     "happy": {"openai": _happy_openai_payloads, "claude": _happy_claude_payloads},
+    "m-length": {
+        "openai": _length_openai_payloads,
+        "claude": _length_claude_payloads,
+    },
+    "m-truncated": {
+        "openai": lambda: _happy_openai_payloads()[:-1],
+        "claude": lambda: _happy_claude_payloads()[:-1],
+    },
     "m-filter-finish": {
         "openai": _filter_finish_openai_payloads,
         "claude": _filter_finish_claude_payloads,
@@ -685,7 +712,52 @@ async def test_usage_emitted_once_when_provider_omits_it(harness: Harness):
     claude_events = await collect(harness.make("claude", model="m-nousage"))
     assert canonical(openai_events) == canonical(claude_events)
     usages = [e for e in openai_events if isinstance(e, Usage)]
-    assert usages == [Usage(input_tokens=0, output_tokens=0)]
+    assert usages == [Usage()]
+    assert usages[0].measurement_status == "unknown"
+
+
+@pytest.mark.parametrize("kind", ["openai", "claude"])
+async def test_partial_usage_keeps_missing_side_unknown(harness: Harness, kind: str):
+    def partial_usage(_request: httpx.Request) -> httpx.Response:
+        if kind == "openai":
+            payloads = [
+                {"choices": [], "usage": {"prompt_tokens": 42}},
+                "[DONE]",
+            ]
+        else:
+            payloads = [
+                {"type": "message_start", "message": {"usage": {"input_tokens": 42}}},
+                {"type": "message_stop"},
+            ]
+        return _sse(payloads)
+
+    backend = harness.make(
+        kind, model="m-partial-usage", transport=httpx.MockTransport(partial_usage)
+    )
+    events = await collect(backend)
+    assert [event for event in events if isinstance(event, Usage)] == [
+        Usage(input_tokens=42, output_tokens=None)
+    ]
+
+
+@pytest.mark.parametrize("kind", ["openai", "claude"])
+async def test_token_limit_stop_reason_is_incomplete_error(
+    harness: Harness, kind: str
+):
+    backend = harness.make(kind, model="m-length")
+    with pytest.raises(IncompleteResponseError, match="length|max_tokens") as caught:
+        await collect(backend)
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("kind", ["openai", "claude"])
+async def test_missing_terminal_marker_is_truncated_stream(
+    harness: Harness, kind: str
+):
+    backend = harness.make(kind, model="m-truncated")
+    with pytest.raises(StreamError, match="截断|前结束") as caught:
+        await collect(backend)
+    assert caught.value.retryable is True
 
 
 EXPECTED_TWO_TOOLS = [

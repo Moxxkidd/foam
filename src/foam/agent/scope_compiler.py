@@ -29,10 +29,12 @@ round-trip 门禁(Q2):归一化 → ``render_canonical_rules`` 渲染 canonical 
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 import unicodedata
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -46,6 +48,7 @@ from foam.agent.backends.base import (
     TextDelta,
     Usage,
 )
+from foam.agent.budget import BudgetLedger
 from foam.agent.loop import message_to_dict
 from foam.guard.audit import (
     KIND_LLM_EXCHANGE_META,
@@ -254,25 +257,39 @@ def _roundtrip(rules: tuple[str, ...]) -> ScopeCompilation:
 
 
 def _append_compile_audit(
-    audit: AuditLog | None, messages: Sequence[Message], text: str, usage: Usage
+    audit: AuditLog | None,
+    messages: Sequence[Message],
+    text: str,
+    usage: Usage,
+    *,
+    request_id: str,
+    provider: str,
+    attempt: int,
+    outcome: str,
 ) -> None:
-    """D7:每次编译调用落一条 llm_exchange_meta(口径对齐 loop.py:729-737:
-    prompt=消息序列 JSON、response=响应 JSON;只有哈希与 token,不记全文)。"""
     if audit is None:
         return
-    audit.append(
-        KIND_LLM_EXCHANGE_META,
-        llm_meta(
-            json.dumps(
-                [message_to_dict(m) for m in messages],
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            json.dumps({"text": text}, ensure_ascii=False, sort_keys=True),
-            prompt_tokens=usage.input_tokens or None,
-            response_tokens=usage.output_tokens or None,
+    payload = llm_meta(
+        json.dumps(
+            [message_to_dict(m) for m in messages],
+            ensure_ascii=False,
+            sort_keys=True,
         ),
+        json.dumps({"text": text}, ensure_ascii=False, sort_keys=True),
+        prompt_tokens=usage.input_tokens,
+        response_tokens=usage.output_tokens,
     )
+    payload.update(
+        {
+            "request_id": request_id,
+            "phase": "scope_compile",
+            "provider": provider,
+            "attempt": attempt,
+            "outcome": outcome,
+            "measurement_status": usage.measurement_status,
+        }
+    )
+    audit.append(KIND_LLM_EXCHANGE_META, payload)
 
 
 async def compile_scope(
@@ -282,16 +299,12 @@ async def compile_scope(
     corrections: Sequence[str] = (),
     current: Sequence[str] | None = None,
     audit: AuditLog | None = None,
+    budget: BudgetLedger | None = None,
+    attempt: int = 0,
 ) -> ScopeCompilation:
     """把自然语言授权范围编译为护栏规则(一次性 LLM 调用,无工具、无流式)。
 
-    - ``corrections``:operator 历轮修正意见(逐条编号追加进编译上下文);
-    - ``current``:/scope 中途改时的现规则列表(编译始终输出全量新规则,
-      替换语义);
-    - ``audit``:提供时每次调用(含失败路径)落 llm_exchange_meta(D7),
-      调用侧不得重复落。
-
-    失败抛 ``ScopeCompileError``(三类来源见类 docstring)。
+    每次调用的成功、失败或取消都在 finally 中落入同一总账和审计链。
     """
     messages = [
         Message.system(_SYSTEM_PROMPT),
@@ -301,6 +314,8 @@ async def compile_scope(
     usage = Usage()
     backend_error: BackendError | None = None
     agen = None
+    request_id = f"req-{uuid.uuid4().hex}"
+    outcome = "completed"
     try:
         agen = backend.chat(messages, tools=None)
         async for event in agen:
@@ -308,23 +323,47 @@ async def compile_scope(
                 text_parts.append(event.text)
             elif isinstance(event, Usage):
                 usage = event
-            # ReasoningDelta 忽略(不入编译输出,不单独记审计);
-            # tools=None 下不应出现 ToolCall,出现也不进编译输出。
     except BackendError as exc:
         backend_error = exc
+        outcome = "error"
+    except BaseException as exc:
+        outcome = (
+            "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+        )
+        raise
     finally:
-        if agen is not None:
-            try:
-                await agen.aclose()
-            except BackendError as exc:
-                # aclose 阶段的 BackendError 同属「编译调用失败」,且不得跳过审计
-                if backend_error is None:
-                    backend_error = exc
-        # D7:每次编译调用(含失败路径)落 llm_exchange_meta——放进 finally:
-        # 即使非 BackendError 的内部异常逃逸,审计也先于传播落盘;每次调用
-        # 恰一条,调用侧不得重复落。
-        text = "".join(text_parts)
-        _append_compile_audit(audit, messages, text, usage)
+        try:
+            if agen is not None:
+                try:
+                    await agen.aclose()
+                except BackendError as exc:
+                    if backend_error is None:
+                        backend_error = exc
+                    outcome = "error"
+                except BaseException:
+                    outcome = "error"
+                    raise
+        finally:
+            if budget is not None:
+                budget.record_usage(
+                    usage,
+                    request_id=request_id,
+                    phase="scope_compile",
+                    provider=backend.provider,
+                    attempt=attempt,
+                    outcome=outcome,
+                )
+            text = "".join(text_parts)
+            _append_compile_audit(
+                audit,
+                messages,
+                text,
+                usage,
+                request_id=request_id,
+                provider=backend.provider,
+                attempt=attempt,
+                outcome=outcome,
+            )
 
     if backend_error is not None:
         raise ScopeCompileError(

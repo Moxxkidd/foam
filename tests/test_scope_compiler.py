@@ -8,6 +8,7 @@ TextDelta/Usage 事件序列与 BackendError 注入。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -18,6 +19,7 @@ import pytest
 
 from foam.agent import prompts
 from foam.agent.backends.base import NetworkError, TextDelta, Usage
+from foam.agent.budget import BudgetLedger
 from foam.agent.scope_compiler import (
     ScopeCompilation,
     ScopeCompileError,
@@ -523,6 +525,55 @@ async def test_compile_audit_on_success_and_failure(tmp_path):
             "response_chars",
         }
     assert NL_TEXT not in (tmp_path / "audit.jsonl").read_text("utf-8")
+
+
+async def test_compile_failure_and_cancellation_remain_in_budget(tmp_path):
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    budget = BudgetLedger()
+    failing = FakeBackend([NetworkError("[fake] 编译失败")])
+    with pytest.raises(ScopeCompileError):
+        await compile_scope(NL_TEXT, failing, audit=audit, budget=budget)
+
+    class BlockingBackend:
+        provider = "fake"
+
+        def __init__(self):
+            self.started = asyncio.Event()
+
+        def chat(self, _messages, tools=None):
+            assert tools is None
+            return self._stream()
+
+        async def _stream(self):
+            self.started.set()
+            yield Usage(4, 2)
+            await asyncio.Future()
+
+    blocking = BlockingBackend()
+    task = asyncio.create_task(
+        compile_scope(NL_TEXT, blocking, audit=audit, budget=budget)
+    )
+    await blocking.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    audit.close()
+
+    snapshot = budget.snapshot()
+    assert snapshot["request_count"] == 2
+    assert snapshot["phase_request_counts"] == {"scope_compile": 2}
+    assert snapshot["measured_total_tokens"] == 6
+    assert snapshot["unknown_usage_requests"] == 1
+    assert snapshot["total_tokens"] is None
+    metas = [
+        r["payload"]
+        for r in read_records(tmp_path / "audit.jsonl")
+        if r["kind"] == KIND_LLM_EXCHANGE_META
+    ]
+    assert [p["outcome"] for p in metas] == ["error", "cancelled"]
+    assert [p["phase"] for p in metas] == ["scope_compile", "scope_compile"]
+    assert metas[1]["prompt_tokens"] == 4
+    assert metas[1]["response_tokens"] == 2
 
 
 def test_freeze_validates_source_and_nl_text(engagement):

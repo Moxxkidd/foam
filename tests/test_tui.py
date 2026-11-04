@@ -858,10 +858,10 @@ async def test_slash_commands_and_completion_popup(tmp_path):
         dock = main.query_one("#inputdock", InputDock)
         popup = dock.popup
 
-        # 输入 "/" → 弹层出 8 条候选(WP-14c 增 /scope,7→8 有意变更)
+        # 输入 "/" → 弹层出 9 条候选(R12 增 /budget,8→9 有意变更)
         await pilot.press("/")
         await wait_for(lambda: dock.popup_visible)
-        assert len(popup.children) == 8
+        assert len(popup.children) == 9
         # 继续输入 "sta" → 过滤到 /status;Enter 接受高亮(不直接提交)
         await pilot.press("s", "t", "a")
         await wait_for(lambda: len(popup.children) == 1)
@@ -1752,6 +1752,14 @@ async def test_scope_predeclare_then_first_message_starts_run(tmp_path):
         assert records[0]["kind"] == KIND_SCOPE_LOADED
         assert records[0]["payload"]["cidrs"] == ["192.0.2.0/24"]
         assert records[0]["payload"]["source"] == app.config.scope_source
+        opening = next(
+            r["payload"]["budget_opening"]
+            for r in records
+            if r["kind"] == "run_started"
+        )
+        assert opening["measured_total_tokens"] == 7
+        assert opening["phase_request_counts"] == {"scope_compile": 1}
+        assert app._final_result.budget["measured_total_tokens"] == 9
         # 评审 B 回归:NL 冻结来源不错标——run 链上无 source="file" 补写
         assert not any(r["kind"] == KIND_SCOPE_CONFIRMED for r in records)
         # 评审 H 回归:run 的 ENGAGEMENT.md 动态段已同步为冻结规则(非占位)
@@ -2960,3 +2968,83 @@ async def test_tui_actual_platform_is_unsupported_without_fallback(tmp_path):
         assert "未回退 legacy" in error
         assert app.run_handle is None
         assert app.config.backend.chat_count == 0
+
+
+async def test_r12_tui_budget_expansion_is_explicit(tmp_path):
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [
+                [TextDelta("第一段。"), Usage(1, 1)],
+                [TextDelta("扩容后的第二段。"), Usage(1, 1)],
+            ],
+            wait_on_finish=True,
+            max_rounds=1,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("TESTONLY budget")
+        await wait_for(lambda: app.run_handle is not None)
+        loop = app.run_handle.loop
+        await wait_for(lambda: loop.status == "idle" and loop._rounds == 1)
+        assert loop._budget.limits.rounds == 1
+
+        main.execute_command("/budget rounds 3")
+        assert loop._budget.limits.rounds == 3
+        changes = [
+            r["payload"]
+            for r in audit_records(app)
+            if r["kind"] == "budget_limit_changed"
+        ]
+        assert len(changes) == 1
+        assert changes[0]["old_limit"] == 1
+        assert changes[0]["new_limit"] == 3
+        assert changes[0]["operator"] == "nightowl"
+        await wait_for(
+            lambda: notices_containing(main, "预算 rounds") != []
+        )
+
+        app.submit_text("continue")
+        await wait_for(lambda: loop.status == "idle" and loop._rounds == 2)
+        assert loop._budget.snapshot()["rounds"] == 2
+        loop.kill("TESTONLY cleanup")
+        await wait_for(lambda: app._final_result is not None)
+        assert app._final_result.status == "killed"
+
+
+async def test_r12_tui_budget_stop_is_not_success(tmp_path):
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [
+                [
+                    ToolCall(
+                        "tc-stopped", "run_command", {"command": "echo SHOULD_NOT_RUN"}
+                    ),
+                    Usage(1, 1),
+                ]
+            ],
+            wait_on_finish=False,
+            max_rounds=1,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("TESTONLY stop at budget")
+        await wait_for(
+            lambda: notices_containing(main, "预算停止(目标未完成)") != []
+        )
+        result = app._final_result
+        assert result is not None and result.status == "stopped"
+        assert result.stop_reason == "rounds"
+        assert app.active_loop is None
+        assert app._exit_code() == 1
+        assert app.engagement.metadata()["status"] == "active"
+        final = notices_containing(main, "预算停止(目标未完成)")[-1].content
+        assert "tokens 2/不限" in final
+        assert "预算停止" in str(main.query_one("#sb-right").render())
+        records = audit_records(app)
+        assert records[-1]["kind"] == "run_finished"
+        assert records[-1]["payload"]["goal_status"] == "unfinished"
+        assert not any(r["kind"] == "exec_request" for r in records)

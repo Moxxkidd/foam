@@ -15,7 +15,7 @@
 - 连续对话(WP-09 更正当 2026-08-24):``TUIConfig.wait_on_finish`` 默认
   True——模型终答后 loop 转 idle 待命(不收尾、不写 run_finished),
   输入框普通文本经 ``loop.interject`` 唤醒续段;顶栏显「待命」,
-  placeholder 随之切换。真终态(killed/error)的「run 已结束」提示
+  placeholder 随之切换。真终态(stopped/killed/error)的「run 已结束」提示
   只发一次,placeholder 更新在一处。
 - WP-14c scope 确认仪式(定案 Q5/D8/D9):``config.scope is None`` 时首条
   消息承载 objective+NL scope → 仪式 worker 两段结构(编译 → 确认卡 →
@@ -35,9 +35,10 @@
 - R03-C(2026-10-06,统一运行时资源关闭,E04 收口):``_run_to_end`` /
   ``action_quit`` / ``_cleanup_resources`` 收敛到 ``foam.runtime.close_run``
   (幂等;真实 run 终态才收口,idle-wake 待命结构性地不收割);finished 置
-  mark_closed(D4,与 CLI 对齐);StateTool 的 Index 连接随 run 收口(此前
-  永不关闭);cleanup_pending 上叙述流(D2);审计句柄仍在 run 收尾关闭,
-  仪式重开补偿(WP-14c 第二轮对抗审查)保留为文档化例外。
+  mark_closed(D4,与 CLI 对齐),stopped 保持 active 且不冒充目标成功;
+  StateTool 的 Index 连接随 run 收口(此前永不关闭);cleanup_pending 上
+  叙述流(D2);审计句柄仍在 run 收尾关闭,仪式重开补偿(WP-14c 第二轮
+  对抗审查)保留为文档化例外。
 - R09(2026-10-12,终态证据):``_run_to_end`` 在 close_run 之后生成
   证据 manifest/结项页(``evidence/manifest-<run_id>.json`` 与
   ``summary-<run_id>.md``,foam.evidence);idle 待命期 run 未终态不产生
@@ -68,6 +69,7 @@ from textual.worker import Worker
 
 from foam import __app_name__, __version__
 from foam.agent.backends.base import ConfigError, LLMBackend
+from foam.agent.budget import BudgetLedger, BudgetLimits, format_budget
 from foam.agent.loop import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     FIRST_EVENT_TIMEOUT_SECONDS,
@@ -143,7 +145,7 @@ PANEL_REFRESH_SECONDS = 2.0
 _PLACEHOLDER_RUNNING = "插话进队列,或 / 命令"
 #: idle 待命(连续对话:输入即插话唤醒续段)。
 _PLACEHOLDER_IDLE = "待命;输入继续,/status 回顾,Ctrl-X kill"
-#: 真终态(killed/error;wait_on_finish 下 finished 不经过此处)。
+#: 真终态(stopped/killed/error;wait_on_finish 下 finished 不经过此处)。
 _PLACEHOLDER_ENDED = "run 已结束;/status 回顾,Ctrl-Q 退出"
 
 #: 主环纠正原因的中文标签(叙述流警告块用)。
@@ -162,13 +164,15 @@ _HELP_TEXT = """斜杠命令(输入 / 有补全):
   /jobs     列出后台 job
   /sessions 列出 PTY 会话(只读;干预请插话,由 agent 经 session_send 操作)
   /status   run 状态与索引摘要
+  /budget   裸命令=查看总预算;/budget <维度> <N> 显式变更(0=累计不限)
+            维度:context / tokens / rounds / wall-time(秒)
   /scope    裸命令=查看当前授权 scope;/scope <描述> 经确认仪式修改
 快捷键:
   Ctrl-X / Ctrl-C  kill(二次确认,Esc 取消)
   Ctrl-P           暂停/继续切换
   F2               侧栏显隐(终端 <110 列时自动隐藏)
   Enter            提交;聚焦卡片/思考块时展开/折叠
-普通文本 = 插话(首条消息为 objective,发出后 loop 启动)。"""
+普通文本 = 插话(首条消息为 objective,发出后 loop 启动),不重置预算。"""
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +213,8 @@ class TUIConfig:
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     first_event_timeout: float = FIRST_EVENT_TIMEOUT_SECONDS
     max_rounds: int = 0
+    max_total_tokens: int = 0
+    max_wall_time: float = 0.0
     wait_on_finish: bool = True
     loop_factory: LoopFactory | None = None
     config_home: str | Path | None = None
@@ -229,6 +235,7 @@ class RunContext:
     audit: AuditLog
     observer: LoopObserver
     config: TUIConfig
+    budget: BudgetLedger
 
 
 @dataclass
@@ -295,6 +302,7 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
             first_event_timeout=config.first_event_timeout,
             max_rounds=config.max_rounds,
             wait_on_finish=config.wait_on_finish,
+            budget=ctx.budget,
         )
         return RunHandle(
             loop=loop,
@@ -591,13 +599,19 @@ class MainScreen(Screen):
     def on_run_finished_msg(self, msg: RunFinishedMsg) -> None:
         if msg.result is not None:
             result = msg.result
-            label = {"finished": "已完成", "killed": "已 kill", "error": "出错"}.get(
-                result.status, result.status
+            label = {
+                "finished": "已完成",
+                "stopped": "预算停止(目标未完成)",
+                "killed": "已 kill",
+                "error": "出错",
+            }.get(result.status, result.status)
+            usage = (
+                format_budget(result.budget)
+                if result.budget is not None
+                else f"tokens 输入 {result.input_tokens} / 输出 {result.output_tokens}"
             )
             self.narrative.add_notice(
-                "final",
-                f"run {label} · {result.rounds} 轮 · tokens 输入 "
-                f"{result.input_tokens} / 输出 {result.output_tokens}",
+                "final", f"run {label} · {result.rounds} 轮 · {usage}"
             )
             if result.error:
                 self.narrative.add_notice("error", f"run 结束原因:{result.error}")
@@ -613,7 +627,7 @@ class MainScreen(Screen):
         self.tui.submit_text(msg.text)
 
     def execute_command(self, raw: str) -> None:
-        """斜杠命令分派(v0 八条;未知命令如实报错,不静默)。"""
+        """斜杠命令分派(未知命令如实报错,不静默)。"""
         command = raw.split(maxsplit=1)[0].lower()
         loop = self.tui.active_loop
         if command == "/help":
@@ -638,6 +652,47 @@ class MainScreen(Screen):
             self.run_worker(self._show_sessions())
         elif command == "/status":
             self._show_status()
+        elif command == "/budget":
+            parts = raw.split()
+            if len(parts) == 1:
+                handle = self.tui.run_handle
+                used = None
+                if handle is not None:
+                    used = estimate_tokens(handle.loop.messages)
+                snapshot = self.tui._budget.snapshot(context_tokens=used)
+                self.narrative.add_notice("info", "预算 " + format_budget(snapshot))
+            elif loop is None:
+                self.narrative.add_notice(
+                    "info", "当前无活动 run;预算停止后请用 CLI resume 显式扩容"
+                )
+            elif len(parts) != 3:
+                self.narrative.add_notice(
+                    "error",
+                    "用法:/budget context|tokens|rounds|wall-time N(累计维度 0=不限)",
+                )
+            else:
+                dimension = parts[1].lower().replace("-", "_")
+                try:
+                    value = (
+                        float(parts[2]) if dimension == "wall_time" else int(parts[2])
+                    )
+                    change = loop.expand_budget(dimension, value)
+                except ValueError as exc:
+                    self.narrative.add_notice("error", f"预算参数无效:{exc}")
+                    return
+                if change is None:
+                    self.narrative.add_notice("info", "预算上限未变化")
+                else:
+
+                    def shown(limit: int | float | None) -> str:
+                        return "不限" if limit is None else str(limit)
+
+                    self.narrative.add_notice(
+                        "success",
+                        f"预算 {change['dimension']} 上限:"
+                        f"{shown(change['old_limit'])} → {shown(change['new_limit'])}"
+                        "(已写 operator 审计)",
+                    )
         elif command == "/scope":
             parts = raw.split(maxsplit=1)
             argument = parts[1].strip() if len(parts) > 1 else ""
@@ -768,11 +823,12 @@ class MainScreen(Screen):
             f"呼号 {app.operator} · 后端 {app.backend_label}",
             f"状态 {self.statusbar.status}",
         ]
+        used = None
         if handle is not None:
             loop = handle.loop
             used = estimate_tokens(loop.messages)
             lines.append(
-                f"context 估算 {used}/{app.config.max_context_tokens} tokens"
+                f"context 估算 {used}/{app._budget.limits.context_tokens} tokens"
             )
             engagement = handle.engagement or app.engagement
             if engagement is not None:
@@ -794,6 +850,7 @@ class MainScreen(Screen):
                     )
         else:
             lines.append("run 未开始(首条消息为 objective)")
+        lines.append("预算 " + format_budget(app._budget.snapshot(context_tokens=used)))
         self.narrative.add_notice("info", "\n".join(lines))
 
     # ---------- 侧栏显隐(D3) ----------
@@ -892,7 +949,7 @@ class MainScreen(Screen):
                 pass
         try:
             used = estimate_tokens(handle.loop.messages)
-            self.sidebar.set_budget(used, app.config.max_context_tokens)
+            self.sidebar.set_budget(used, app._budget.limits.context_tokens)
         except (TypeError, ValueError):
             pass
 
@@ -915,6 +972,14 @@ class TuiApp(App[None]):
     def __init__(self, config: TUIConfig) -> None:
         super().__init__()
         self.config = config
+        self._budget = BudgetLedger(
+            BudgetLimits(
+                context_tokens=config.max_context_tokens,
+                total_tokens=config.max_total_tokens or None,
+                rounds=config.max_rounds or None,
+                wall_time_seconds=config.max_wall_time or None,
+            )
+        )
         self.operator = ""
         self.engagement: Engagement | None = None
         self.run_handle: RunHandle | None = None
@@ -955,7 +1020,13 @@ class TuiApp(App[None]):
         handle = self.run_handle
         if handle is None:
             return None
-        if handle.loop.status in ("finished", "killed", "error", "cancelled"):
+        if handle.loop.status in (
+            "finished",
+            "stopped",
+            "killed",
+            "error",
+            "cancelled",
+        ):
             return None
         return handle.loop
 
@@ -1396,6 +1467,8 @@ class TuiApp(App[None]):
                             else None
                         ),
                         audit=audit,
+                        budget=self._budget,
+                        attempt=attempts,
                     )
                     attempts += 1
                     card.update_compilation(compilation, attempts)
@@ -1576,6 +1649,7 @@ class TuiApp(App[None]):
             audit=audit,
             observer=TuiObserver(main),
             config=self.config,
+            budget=self._budget,
         )
         factory = self.config.loop_factory or default_loop_factory
         try:
@@ -1634,7 +1708,7 @@ class TuiApp(App[None]):
         self._final_result = result
         self._fatal = fatal
         # R03 真实 run 终态才收口(结构边界:idle-wake 待命不到这里,不收割):
-        # D4 finished 置 closed(与 CLI 对齐;killed/error 保持 active)→
+        # D4 finished 置 closed(与 CLI 对齐;stopped/killed/error 保持 active)→
         # 统一 close_run(收割已在 loop 终态面完成,此处幂等空转 + 关索引/
         # 审计/后端)→ cleanup_pending 上屏(D2,不粉饰「全部完成」)。
         if (
@@ -1710,7 +1784,7 @@ class TuiApp(App[None]):
             pass
 
     def _exit_code(self) -> int:
-        """与 headless 对齐:finished/未开始 0,killed 130,error 1。"""
+        """与 headless 对齐:finished/未开始 0,killed 130,stopped/error 1。"""
         if self._final_result is not None:
             return {"finished": 0, "killed": 130, "error": 1}.get(
                 self._final_result.status, 1
@@ -1773,6 +1847,8 @@ def main(args) -> int:
         execution_mode=args.execution_mode,
         engagements_dir=args.workdir or DEFAULT_ENGAGEMENTS_DIR,
         max_rounds=getattr(args, "max_rounds", 0) or 0,
+        max_total_tokens=getattr(args, "max_total_tokens", 0) or 0,
+        max_wall_time=getattr(args, "max_wall_time", 0) or 0,
         scope_bytes=scope_bytes,
         **kwargs,
     )

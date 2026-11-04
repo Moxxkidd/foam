@@ -9,7 +9,7 @@
 
 消息与钩子的对应(命名即契约,fake loop 契约测试直接投递这些消息):
 
-- ``on_status`` → :class:`StatusMsg`(running/paused/killed/finished/error)
+- ``on_status`` → :class:`StatusMsg`(running/paused/stopped/killed/finished/error)
 - ``on_text_delta`` → :class:`NarrativeMsg`(正文增量)
 - ``on_reasoning_delta`` → :class:`ThinkingMsg`(思考增量,折叠块)
 - ``on_tool_call`` → :class:`ToolCallMsg`(开卡)
@@ -36,7 +36,7 @@ from foam.tools.session import mask_call_arguments
 
 
 class StatusMsg(Message):
-    """loop 状态变化:running / paused / killed / finished / error。"""
+    """loop 状态变化:running / paused / stopped / killed / finished / error。"""
 
     def __init__(self, status: str) -> None:
         super().__init__()

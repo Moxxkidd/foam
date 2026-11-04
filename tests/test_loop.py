@@ -23,14 +23,17 @@ from types import SimpleNamespace
 import pytest
 
 from foam.agent.backends.base import (
+    IncompleteResponseError,
     LLMBackend,
     MalformedToolCallError,
     Message,
     ModerationError,
+    ServerError,
     TextDelta,
     ToolCall,
     Usage,
 )
+from foam.agent.budget import BudgetLedger, format_budget
 from foam.agent.loop import (
     FIRST_EVENT_TIMEOUT_SECONDS,
     AgentLoop,
@@ -363,7 +366,7 @@ async def test_compression_triggers_in_e2e(tmp_path):
             [TextDelta("B" * 600), ToolCall("tc-3", "run_command", big), Usage(5, 5)],
             [TextDelta("输出确认,无进一步动作。"), Usage(5, 5)],
         ],
-        loop_kw={"max_context_tokens": 2200, "keep_recent_messages": 4},
+        loop_kw={"max_context_tokens": 3000, "keep_recent_messages": 4},
     )
     result = await env.loop.run("压测上下文")
     assert result.status == "finished"
@@ -855,7 +858,7 @@ async def test_registry_appendable(tmp_path):
 
 
 async def test_max_rounds_reaps_background_jobs(tmp_path):
-    """R03-AC01(E04 形状):轮数耗尽 error 收尾,后台 job 被收割,终态记录带清理报告。"""
+    """R12 累计轮数 stopped 后仍执行 R03 收割并保留清理证据。"""
     env = make_loop(
         tmp_path,
         [
@@ -867,12 +870,16 @@ async def test_max_rounds_reaps_background_jobs(tmp_path):
                 ),
                 Usage(1, 1),
             ],
+            [
+                ToolCall("tc-blocked", "run_command", {"command": "echo NO"}),
+                Usage(1, 1),
+            ],
         ],
-        loop_kw={"max_rounds": 1},
+        loop_kw={"max_rounds": 2},
     )
     result = await env.loop.run("长跑")
-    assert result.status == "error"
-    assert "最大轮数" in result.error
+    assert result.status == "stopped"
+    assert "累计轮数" in result.error
 
     [job] = env.bash._jobs.values()
     assert job.done.is_set()
@@ -884,7 +891,7 @@ async def test_max_rounds_reaps_background_jobs(tmp_path):
     kinds = [r["kind"] for r in records]
     assert kinds[-1] == "run_finished"
     finished = records[-1]["payload"]
-    assert finished["status"] == "error"
+    assert finished["status"] == "stopped"
     # 终态记录携带收割报告(D2):收割完成才落 run_finished(顺序证据)
     assert finished["cleanup"]["cleanup_status"] == "ok"
     assert finished["cleanup"]["remaining_resources"] == []
@@ -1776,3 +1783,425 @@ async def test_session_audit_no_password_plaintext(tmp_path):
     assert masked in display
     assert holder["sid"] in display
     assert verify(env.audit_path)
+
+
+# ---------------------------------------------------------------------------
+# R12-A:跨编译、重试、连续恢复的统一用量账本
+# ---------------------------------------------------------------------------
+
+
+async def test_budget_includes_compile_retry_resume(tmp_path, monkeypatch):
+    from foam.agent.scope_compiler import compile_scope
+
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    budget = BudgetLedger()
+    env = make_loop(
+        tmp_path,
+        [
+            (
+                [Usage(5, 2)],
+                ServerError("synthetic retry", provider="fake"),
+            ),
+            [TextDelta("主环完成。"), Usage(7, 4)],
+        ],
+        loop_kw={"budget": budget, "max_retries": 1},
+    )
+    compile_backend = FakeBackend(
+        [[TextDelta('{"rules": ["127.0.0.1"]}'), Usage(11, 3)]]
+    )
+    compilation = await compile_scope(
+        "授权 127.0.0.1", compile_backend, audit=env.audit, budget=budget
+    )
+    assert compilation.rules == ("127.0.0.1",)
+
+    result = await env.loop.run("核对总账")
+    assert result.status == "finished"
+    assert result.budget is not None
+    assert result.budget["measured_total_tokens"] == 32
+    assert result.budget["total_tokens"] == 32
+    assert result.budget["request_count"] == 3
+    assert result.budget["phase_request_counts"] == {"main": 2, "scope_compile": 1}
+    assert result.budget["rounds"] == 1
+
+    exchanges = [
+        r["payload"]
+        for r in audit_records(env)
+        if r["kind"] == "llm_exchange_meta"
+    ]
+    assert [p["phase"] for p in exchanges] == ["scope_compile", "main", "main"]
+    assert [p["outcome"] for p in exchanges] == ["completed", "error", "completed"]
+    assert len({p["request_id"] for p in exchanges}) == 3
+    assert all(p["provider"] == "fake" for p in exchanges)
+    assert all(p["measurement_status"] == "measured" for p in exchanges)
+
+    restored = BudgetLedger.from_records(audit_records(env))
+    assert restored.snapshot()["measured_total_tokens"] == 32
+    resumed = make_loop(
+        tmp_path,
+        [[TextDelta("恢复后继续完成。"), Usage(2, 1)]],
+        loop_kw={"budget": restored},
+    )
+    resumed_result = await resumed.loop.run("核对总账")
+    assert resumed_result.status == "finished"
+    assert resumed_result.budget["measured_total_tokens"] == 35
+    assert resumed_result.budget["rounds"] == 2
+    assert BudgetLedger.from_records(audit_records(env)).snapshot()[
+        "measured_total_tokens"
+    ] == 35
+
+
+async def test_budget_missing_usage_is_unknown_not_zero(tmp_path):
+    env = make_loop(
+        tmp_path,
+        [[TextDelta("provider 没有返回 usage。"), Usage()]],
+    )
+    result = await env.loop.run("缺失用量")
+    assert result.status == "finished"
+    snapshot = result.budget
+    assert snapshot["total_tokens"] is None
+    assert snapshot["measured_total_tokens"] == 0
+    assert snapshot["unknown_usage_requests"] == 1
+    assert snapshot["token_status"] == "unknown"
+    assert snapshot["estimated_cost"] is None
+    assert snapshot["cost_status"] == "unknown"
+    assert "tokens unknown" in format_budget(snapshot)
+    assert "费用 unknown" in format_budget(snapshot)
+
+    exchange = next(
+        r["payload"]
+        for r in audit_records(env)
+        if r["kind"] == "llm_exchange_meta"
+    )
+    assert exchange["prompt_tokens"] is None
+    assert exchange["response_tokens"] is None
+    assert exchange["measurement_status"] == "unknown"
+
+    legacy = BudgetLedger.from_records(
+        [
+            {
+                "seq": 1,
+                "kind": "llm_exchange_meta",
+                "payload": {
+                    "prompt_tokens": None,
+                    "response_tokens": 3,
+                },
+            }
+        ]
+    ).snapshot()
+    assert legacy["total_tokens"] is None
+    assert legacy["measured_total_tokens"] == 0
+    assert legacy["unknown_usage_requests"] == 1
+
+
+def test_budget_estimates_are_separate_from_measurements():
+    ledger = BudgetLedger()
+    ledger.record_usage(
+        Usage(2, 3), request_id="req-measured", phase="main", provider="fake"
+    )
+    ledger.record_usage(
+        Usage(4, 1, measurement_status="estimated"),
+        request_id="req-estimated",
+        phase="scope_compile",
+        provider="fake",
+    )
+    snapshot = ledger.snapshot()
+    assert snapshot["measured_total_tokens"] == 5
+    assert snapshot["estimated_total_tokens"] == 5
+    assert snapshot["total_tokens"] == 10
+    assert snapshot["token_status"] == "estimated"
+    assert snapshot["estimated_cost"] is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_budget_rejects_non_finite_wall_limit(value):
+    with pytest.raises(ValueError):
+        BudgetLedger().change_limit("wall_time", value)
+
+
+def test_budget_context_limit_is_compression_single_source(tmp_path):
+    budget = BudgetLedger()
+    budget.change_limit("context", 777)
+    env = make_loop(tmp_path, [], loop_kw={"budget": budget})
+    assert env.loop._max_context_tokens == 777
+
+
+def test_budget_restores_complete_wall_segments_and_marks_crash_unknown():
+    records = [
+        {
+            "kind": "run_started",
+            "ts": "2026-11-04T00:00:00+00:00",
+            "payload": {},
+        },
+        {
+            "kind": "run_finished",
+            "ts": "2026-11-04T00:00:12.500000+00:00",
+            "payload": {"rounds": 1},
+        },
+        {
+            "kind": "run_started",
+            "ts": "2026-11-04T00:01:00+00:00",
+            "payload": {"run_id": "crashed"},
+        },
+    ]
+    restored = BudgetLedger.from_records(records)
+    restored.change_limit("wall_time", 60)
+    snapshot = restored.snapshot()
+    assert snapshot["wall_time_seconds"] == 12.5
+    assert snapshot["wall_time_status"] == "unknown"
+    assert restored.exhaustion()["reason"] == "wall_time_unknown"
+
+
+# ---------------------------------------------------------------------------
+# R12-B:模型/工具/重试派发前约束
+# ---------------------------------------------------------------------------
+
+
+async def test_context_still_too_large(tmp_path):
+    env = make_loop(
+        tmp_path,
+        [[TextDelta("不应请求。"), Usage(1, 1)]],
+        loop_kw={"max_context_tokens": 50, "keep_recent_messages": 2},
+    )
+    result = await env.loop.run("X" * 400)
+    assert result.status == "stopped"
+    assert env.backend.chat_count == 0
+    compressed = next(
+        r["payload"]
+        for r in audit_records(env)
+        if r["kind"] == "context_compressed"
+    )
+    assert compressed["still_over_budget"] is True
+    assert result.budget["context_tokens_estimated"] > 50
+
+
+async def test_total_budget_blocks_tool_and_records_inflight_overrun(tmp_path):
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall("tc-over", "run_command", {"command": "echo SHOULD_NOT_RUN"}),
+                Usage(8, 8),
+            ]
+        ],
+        loop_kw={"max_total_tokens": 10},
+    )
+    result = await env.loop.run("在途超额")
+    assert result.status == "stopped"
+    assert result.budget["total_tokens"] == 16
+    assert result.budget["measured_total_tokens"] == 16
+    assert env.backend.chat_count == 1
+    assert not (env.outputs / "tc-over").exists()
+    assert not any(
+        r["kind"] in ("exec_request", "exec_result_meta")
+        for r in audit_records(env)
+    )
+    assert "累计 token" in result.error
+
+
+async def test_unknown_usage_with_finite_limit_stops_tool_dispatch(tmp_path):
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall("tc-unknown", "run_command", {"command": "echo NO"}),
+                Usage(),
+            ]
+        ],
+        loop_kw={"max_total_tokens": 100},
+    )
+    result = await env.loop.run("未知用量")
+    assert result.status == "stopped"
+    assert result.budget["total_tokens"] is None
+    assert result.budget["unknown_usage_requests"] == 1
+    assert not any(r["kind"] == "exec_request" for r in audit_records(env))
+    assert "unknown" in result.error
+
+
+async def test_total_budget_blocks_retry(tmp_path, monkeypatch):
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    env = make_loop(
+        tmp_path,
+        [
+            ([Usage(6, 4)], ServerError("synthetic", provider="fake")),
+            [TextDelta("不应重试。"), Usage(1, 1)],
+        ],
+        loop_kw={"max_total_tokens": 10, "max_retries": 1},
+    )
+    result = await env.loop.run("重试预算")
+    assert result.status == "stopped"
+    assert env.backend.chat_count == 1
+    assert result.budget["total_tokens"] == 10
+    assert not any(r["kind"] == "llm_retry" for r in audit_records(env))
+
+
+async def test_wall_time_budget_blocks_tool_with_monotonic_clock(tmp_path):
+    now = [0.0]
+    budget = BudgetLedger(monotonic=lambda: now[0])
+    budget.change_limit("wall_time", 5)
+
+    async def respond(_messages):
+        now[0] = 6.0
+        return [
+            ToolCall("tc-time", "run_command", {"command": "echo NO"}),
+            Usage(1, 1),
+        ]
+
+    env = make_loop(tmp_path, [respond], loop_kw={"budget": budget})
+    result = await env.loop.run("墙钟预算")
+    assert result.status == "stopped"
+    assert result.budget["wall_time_seconds"] == 6
+    assert not any(r["kind"] == "exec_request" for r in audit_records(env))
+    assert "墙钟" in result.error
+
+
+async def test_token_limit_response_is_error_not_completed_summary(tmp_path):
+    env = make_loop(
+        tmp_path,
+        [
+            (
+                [TextDelta("不完整的末尾"), Usage(4, 2)],
+                IncompleteResponseError(
+                    "synthetic finish_reason=length", provider="fake"
+                ),
+            )
+        ],
+    )
+    result = await env.loop.run("不完整响应")
+    assert result.status == "error"
+    assert result.summary == ""
+    assert result.budget["measured_total_tokens"] == 6
+    finished = audit_records(env)[-1]
+    assert finished["kind"] == "run_finished"
+    assert finished["payload"]["status"] == "error"
+    assert "length" in finished["payload"]["error"]
+
+
+# ---------------------------------------------------------------------------
+# R12-C:连续对话、可恢复停止与显式扩容
+# ---------------------------------------------------------------------------
+
+
+async def test_interjection_does_not_reset_budget(tmp_path):
+    env = make_loop(
+        tmp_path,
+        [
+            [TextDelta("第一段完成。"), Usage(2, 1)],
+            [TextDelta("第二段完成。"), Usage(2, 1)],
+            [TextDelta("不应继续请求。"), Usage(1, 1)],
+        ],
+        loop_kw={"wait_on_finish": True, "max_rounds": 2},
+    )
+    task = asyncio.create_task(env.loop.run("连续对话"))
+
+    async def wait_idle(rounds):
+        for _ in range(100):
+            at_round = env.loop._budget.snapshot()["rounds"] == rounds
+            if env.loop.status == "idle" and at_round:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"未进入第 {rounds} 轮后的 idle")
+
+    await wait_idle(1)
+    env.loop.interject("普通插话继续")
+    await wait_idle(2)
+    assert env.loop._budget.limits.rounds == 2
+    env.loop.interject("仍不扩容")
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result.status == "stopped"
+    assert result.stop_reason == "rounds"
+    assert result.budget["rounds"] == 2
+    assert result.budget["limits"]["rounds"] == 2
+    assert env.backend.chat_count == 2
+    assert not any(
+        r["kind"] == "budget_limit_changed" for r in audit_records(env)
+    )
+
+
+async def test_resume_preserves_limit_until_explicit_expansion(tmp_path):
+    first = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall("tc-first", "run_command", {"command": "echo NO"}),
+                Usage(1, 1),
+            ]
+        ],
+        loop_kw={"max_rounds": 1},
+    )
+    first_result = await first.loop.run("预算恢复")
+    assert first_result.status == "stopped"
+    assert audit_records(first)[-1]["payload"]["goal_status"] == "unfinished"
+
+    restored = BudgetLedger.from_records(audit_records(first))
+    second = make_loop(
+        tmp_path,
+        [[TextDelta("不应请求。"), Usage(1, 1)]],
+        loop_kw={"budget": restored},
+    )
+    second_result = await second.loop.run("预算恢复")
+    assert second_result.status == "stopped"
+    assert second.backend.chat_count == 0
+    assert second_result.budget["limits"]["rounds"] == 1
+
+    expanded = BudgetLedger.from_records(
+        audit_records(first), overrides={"rounds": 3}, operator="tester"
+    )
+    third = make_loop(
+        tmp_path,
+        [[TextDelta("扩容后完成。"), Usage(1, 1)]],
+        loop_kw={"budget": expanded},
+    )
+    third_result = await third.loop.run("预算恢复")
+    assert third_result.status == "finished"
+    assert third_result.budget["rounds"] == 2
+    change = next(
+        r["payload"]
+        for r in audit_records(first)
+        if r["kind"] == "budget_limit_changed"
+    )
+    assert change["dimension"] == "rounds"
+    assert change["old_limit"] == 1
+    assert change["new_limit"] == 3
+    assert change["change"] == "expanded"
+    assert change["operator"] == "tester"
+
+
+async def test_near_budget_guides_wrap_up_without_expanding(tmp_path):
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall("tc-1", "run_command", {"command": "echo one"}),
+                Usage(8, 2),
+            ],
+            [
+                ToolCall("tc-2", "run_command", {"command": "echo two"}),
+                Usage(4, 2),
+            ],
+            [TextDelta("收尾完成。"), Usage(1, 1)],
+        ],
+        loop_kw={"max_total_tokens": 20},
+    )
+    result = await env.loop.run("接近预算")
+    assert result.status == "finished"
+    assert result.budget["limits"]["total_tokens"] == 20
+    warnings = [
+        r["payload"]
+        for r in audit_records(env)
+        if r["kind"] == "budget_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["dimensions"] == ["total_tokens"]
+    assert any(
+        m.role == "user" and "预算提醒" in m.content
+        for m in env.backend.calls[-1]
+    )
+    assert not any(
+        r["kind"] == "budget_limit_changed" for r in audit_records(env)
+    )

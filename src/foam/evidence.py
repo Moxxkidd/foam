@@ -475,7 +475,10 @@ def build_manifest(
             "status": finished_payload.get("status"),
             "error": finished_payload.get("error"),
             "kill_reason": kill_reason,
+            "stop_reason": finished_payload.get("stop_reason"),
+            "goal_status": finished_payload.get("goal_status") or "unknown",
         },
+        "budget": finished_payload.get("budget"),
         "generated_at": generated_at,
         "scope": {
             "path": scope_meta.get("path"),
@@ -519,7 +522,10 @@ def render_summary_md(manifest: dict[str, Any]) -> str:
         "",
         f"- 生成时间:{manifest['generated_at']}",
         f"- 终态:{end.get('status')}{error_note}",
+        f"- 目标状态:{end.get('goal_status') or 'unknown'}",
     ]
+    if end.get("stop_reason"):
+        lines.append(f"- 停止原因:{end['stop_reason']}")
     if end.get("kill_reason"):
         lines.append(f"- kill 理由:{end['kill_reason']}")
     lines.append(f"- 外部锚定:{EXTERNAL_ANCHOR_NOTE}")
