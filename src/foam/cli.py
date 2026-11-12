@@ -149,6 +149,7 @@ from foam.config import (
     sanitize_url,
     validate_profile_name,
 )
+from foam.diagnostics import collect_doctor, collect_status
 from foam.evidence import (
     render_human,
     result_to_dict,
@@ -442,6 +443,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="机读 JSON 输出(stdout 仅承载 JSON;[config] 注记改道 stderr)",
     )
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="只读诊断 Python、本项目版本与依赖(R13-A;默认零网络)",
+    )
+    doctor.add_argument("--json", action="store_true", help="机读 JSON 输出")
+
+    status = sub.add_parser(
+        "status",
+        help="只读显示 engagement 静态状态(R13-A;不取锁、不验链)",
+    )
+    status.add_argument("engagement_dir", help="engagement 目录路径")
+    status.add_argument("--json", action="store_true", help="机读 JSON 输出")
 
     tui = sub.add_parser(
         "tui",
@@ -1464,6 +1478,37 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    result = collect_doctor()
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(result.render_human(), end="")
+    return result.exit_code
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    root = Path(args.engagement_dir)
+    if not root.is_dir():
+        print(f"[错误] engagement 目录不存在:{root}", file=sys.stderr)
+        return EXIT_USAGE
+    if not (root / "engagement.json").is_file() and not (
+        root / "audit.jsonl"
+    ).is_file():
+        print(
+            f"[错误] {root} 不是 engagement 目录"
+            "(缺 engagement.json 与 audit.jsonl)",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    result = collect_status(root)
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(result.render_human(), end="")
+    return result.exit_code
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     """R09:只读核验 engagement 证据完整性(chain/files/references/coverage)。
 
@@ -1593,15 +1638,17 @@ def main(
     args = parser.parse_args(argv)
     # P1-1:只读加载 ./.env(永不写它,红线)。只上屏键名,值绝不上屏;
     # 畸形行中文警告(带行号)走 stderr;文件不存在静默。
-    # R09(决策 7):verify 的 stdout 预留给核验结果(--json 时必须是纯
-    # JSON),[config] 注入注记对 verify 改道 stderr;其余命令形态不变。
+    # R09/R13:verify/doctor/status 的 stdout 预留给结果(--json 时必须纯
+    # JSON),[config] 注入注记改道 stderr;其余命令形态不变。
     injected, dotenv_warnings = load_dotenv(Path.cwd() / ".env")
     for warning in dotenv_warnings:
         print(f"[config] .env {warning}", file=sys.stderr)
     if injected:
         print(
             f"[config] .env 注入 {len(injected)} 个变量:{', '.join(injected)}",
-            file=sys.stderr if args.command == "verify" else sys.stdout,
+            file=sys.stderr
+            if args.command in ("verify", "doctor", "status")
+            else sys.stdout,
             flush=True,
         )
     factory = backend_factory or _build_backend
@@ -1618,6 +1665,10 @@ def main(
         return _cmd_report(args)
     if args.command == "verify":
         return _cmd_verify(args)
+    if args.command == "doctor":
+        return _cmd_doctor(args)
+    if args.command == "status":
+        return _cmd_status(args)
     if args.command == "tui":
         return _cmd_tui(args)
     parser.print_help()

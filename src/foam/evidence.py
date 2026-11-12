@@ -61,7 +61,7 @@ def _sha256_file(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _open_index_ro(db_path: Path) -> sqlite3.Connection | None:
+def open_index_ro(db_path: Path) -> sqlite3.Connection | None:
     """``mode=ro`` URI 只读连接:无 journal、无迁移、无 chmod。
 
     库缺失/无法只读打开返回 None——调用方按「该来源不可用」降级
@@ -84,6 +84,10 @@ def _open_index_ro(db_path: Path) -> sqlite3.Connection | None:
         return None
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _open_index_ro(db_path: Path) -> sqlite3.Connection | None:
+    return open_index_ro(db_path)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

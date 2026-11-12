@@ -1157,3 +1157,22 @@ WP-13(整合)依赖全部
   也未验证 root venv/wheel/sudo，本片不宣称真实 Kali 验收。
 - 下一步：按授权序列进入 [R13](items/R13.md)；R29-B 待 R13-B 与真实 Kali
   环境后验收。提交/推送待父代理，未打 tag、未发布；根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-12：R13-A 只读骨架完成）
+
+- [R13-A](items/R13.md) 已交付真实 `foam doctor` / `foam status <dir>` 的人读与
+  `--json` 同源结果、schema/generated_at 和指定退出码。doctor 仅 Python/Foam/
+  deps；status 仅静态 meta、64 KiB 链尾、manifest 存在性与 `mode=ro` 索引计数。
+  无心跳为 none，存在但本片未判读为 unknown；不接 heartbeat，不取锁、不写/
+  迁移/chmod、不发网络。
+- 公开回归使用禁网子进程、临时 HOME/cwd 与文件树快照；临时 `Engagement.open`
+  故障对照真实检出 0555→0700 并已还原。红基线 **6 failed in 0.89s**，实现后
+  **6 passed in 1.61s**；必要现有回归最终 **216 passed in 6.09s**。
+- 最终基线由父代理于 2026-11-12 在 macOS arm64 / Python 3.12.14 验证：
+  `.venv/bin/python -m pytest -q` = **947 passed, 40 skipped in 203.97s (0:03:23)**，
+  `.venv/bin/ruff check .` = **All checks passed!**，`git diff --check` 无输出。
+  40 个 skip 为既有环境/opt-in 面，本片无 skip。
+- 父 R13 保持进行中：B 的配置/后端/脱敏/online/protected 诊断与 C 心跳活性
+  均未实施；无真实 Linux/Kali 证据。下一步仅在授权范围内进入 R13-B；提交/
+  推送待父代理，未打 tag、未发布，根目录调试 zip 继续排除。
