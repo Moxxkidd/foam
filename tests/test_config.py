@@ -1053,3 +1053,79 @@ def test_version_consistency_pyproject_matches_package():
     with open(repo_root / "pyproject.toml", "rb") as f:
         project_version = tomllib.load(f)["project"]["version"]
     assert project_version == foam.__version__
+
+
+# ---------------------------------------------------------------------------
+# R29-A:protected 安装与迁移/回退公开文档契约
+# ---------------------------------------------------------------------------
+
+
+def _document_section(text: str, heading: str) -> str:
+    marker = f"## {heading}\n"
+    assert marker in text
+    return text.split(marker, 1)[1].split("\n## ", 1)[0]
+
+
+def _bash_blocks(text: str) -> list[str]:
+    return [part.split("```", 1)[0] for part in text.split("```bash")[1:]]
+
+
+def test_r29_readme_protected_install_public_contract():
+    """R29-AC05:root venv、sudo 白名单与私有产物约定进入公开安装文档。"""
+    repo_root = Path(__file__).resolve().parent.parent
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    section = _document_section(readme, "protected 安装")
+    for expected in (
+        "sudo python3 -m venv /opt/foam",
+        "/opt/foam/bin/pip install",
+        ".whl",
+        "sudo --preserve-env=FOAM_LLM_API_KEY,FOAM_ANTHROPIC_API_KEY,"
+        "FOAM_LLM_MODEL,FOAM_LLM_BASE_URL",
+        "--execution-mode protected",
+        "root 所有、0700",
+        "不 chown",
+        "sudo /opt/foam/bin/foam report",
+        "sudo /opt/foam/bin/foam verify",
+        "当前工作目录的 `.env`",
+        "HOME",
+        "真实 Kali",
+        "R13",
+    ):
+        assert expected in section
+    assert "pipx 仅用于 legacy" in readme
+    for block in _bash_blocks(readme):
+        assert "sudo -E" not in block
+        assert "--break-system-packages" not in block
+        assert "chmod 777" not in block
+        assert "chown " not in block
+
+
+def test_r29_release_migration_rollback_public_contract():
+    """R29-AC05:发布草案明确 pipx 边界、迁移/回退及尚未实测的 sudo 配置。"""
+    repo_root = Path(__file__).resolve().parent.parent
+    release = (repo_root / "docs/releases/v0.2.0.md").read_text(encoding="utf-8")
+    section = _document_section(release, "迁移与回退草案（R29-A）")
+    for expected in (
+        "pipx",
+        "legacy",
+        "/opt/foam",
+        "wheel",
+        "sudo --preserve-env=FOAM_LLM_API_KEY,FOAM_ANTHROPIC_API_KEY,"
+        "FOAM_LLM_MODEL,FOAM_LLM_BASE_URL",
+        "root 所有、0700",
+        "不 chown",
+        "report",
+        "verify",
+        "当前工作目录的 `.env`",
+        "HOME",
+        "真实 Kali",
+        "status",
+        "doctor",
+        "R13",
+    ):
+        assert expected in section
+    for block in _bash_blocks(release):
+        assert "sudo -E" not in block
+        assert "--break-system-packages" not in block
+        assert "chmod 777" not in block
+        assert "chown " not in block

@@ -1136,3 +1136,24 @@ WP-13(整合)依赖全部
   能力边界。提交/推送及真实 SHA 待父代理回填；未打 tag、未发布软件包。
 - 下一步：进入 [R29-A](items/R29.md)，保持既定 R29-A → R13 → R29-B → R14
   序列；R29-B 仍需真实 Kali，不以容器结果替代。
+
+
+## 当前状态（2026-11-12：R29-A 文档分片完成）
+
+- [R29-A](items/R29.md) 已交付 README 独立「protected 安装」与 v0.2.0
+  迁移/回退草案：root `/opt/foam` venv + 发布 wheel、sudo 四变量白名单、
+  pipx 仅 legacy、engagement root 0700 不 chown、report/verify 经 sudo。
+  `.env` 明确从 cwd 读取；sudo 后 HOME/profile 仍待真实 Kali 实测，示例不依赖
+  profile。`status`/`doctor` 尚待 R13，未写成当前可用能力。
+- 两个公开文档静态契约先红 **2 failed, 56 deselected in 0.58s**，后绿
+  **2 passed, 56 deselected in 0.09s**；完整 `test_config.py`
+  **58 passed in 1.19s**，针对文件 ruff 全绿、diff 检查无输出。
+- 最终基线由父代理于 2026-11-12 在 macOS arm64 / Python 3.12.14 验证：
+  `.venv/bin/python -m pytest -q` = **941 passed, 40 skipped in 204.55s (0:03:24)**，
+  `.venv/bin/ruff check .` = **All checks passed!**，`git diff --check` 无输出。
+  40 个 skip 为既有环境/opt-in 面，本片两项未 skip。
+- 仅核销 R29-AC05；AC01–AC04、父 R29 和真实 Kali 发布门槛保持未完成。
+  静态复核未改 `_trusted_source` 或权限；既有 Docker/linuxkit 不是 Kali，
+  也未验证 root venv/wheel/sudo，本片不宣称真实 Kali 验收。
+- 下一步：按授权序列进入 [R13](items/R13.md)；R29-B 待 R13-B 与真实 Kali
+  环境后验收。提交/推送待父代理，未打 tag、未发布；根目录调试 zip 继续排除。

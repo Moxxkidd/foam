@@ -57,7 +57,7 @@ httpx / rich / textual(均在 Kali 官方源)。LLM 密钥只走环境变量。
 
 ```bash
 git clone https://github.com/Moxxkidd/foam && cd foam
-pipx install .          # 也可 python3 -m venv 安装
+pipx install .          # pipx 仅用于 legacy;protected 见下文
 
 # 1. 配置后端(openai_compat 万能适配;实弹使用 Kimi K3 系)
 export FOAM_LLM_API_KEY=... FOAM_LLM_BASE_URL=... FOAM_LLM_MODEL=...
@@ -100,6 +100,51 @@ foam run --execution-mode legacy \
 全屏 TUI 也接受 `foam tui --execution-mode legacy --scope my.scope`
 (文件流零仪式照旧);TUI 内 objective 即首条消息,支持随时插话;
 Ctrl-C 触发 kill switch,回收全部活动任务与会话。
+
+## protected 安装
+
+pipx 仅用于 legacy;用户目录中的解释器或 helper 源可被普通用户修改,
+不满足 protected 的受信启动路径要求。protected 的受支持安装约定是由 root
+在 `/opt/foam` 创建 venv 并安装发布 wheel,不要用 pipx、`sudo pip` 直接写系统
+Python 或源码目录代替:
+
+```bash
+sudo python3 -m venv /opt/foam
+sudo /opt/foam/bin/pip install /path/to/foam-0.2.0-py3-none-any.whl
+```
+
+`/opt`、`/opt/foam`、venv 解释器的解析路径以及安装后的 helper 源路径必须
+逐级 root 所有且非组/他人可写;Foam 启动 helper 前仍会逐项检查,不信任
+文档或目录名本身。禁止用 `sudo -E`、`--break-system-packages`、chmod/chown
+或其他放宽权限的办法绕过拒绝。
+
+启动时只用 sudo 白名单传递四个变量,不把整个调用者环境带入 root 控制面:
+
+```bash
+export FOAM_LLM_API_KEY=... FOAM_LLM_BASE_URL=... FOAM_LLM_MODEL=...
+sudo --preserve-env=FOAM_LLM_API_KEY,FOAM_ANTHROPIC_API_KEY,FOAM_LLM_MODEL,FOAM_LLM_BASE_URL \
+  /opt/foam/bin/foam tui --execution-mode protected
+```
+
+这些密钥只进入 Foam 控制面;R11 的工具最小环境保证不把它们传给工具进程。
+protected 产生的 engagement 保持 root 所有、0700,不 chown 给调用用户,
+以免 root 后续 tmp+rename 写入引入符号链接/TOCTOU 提权面。读取报告与只读
+核验也使用同一安装路径经 sudo 执行:
+
+```bash
+sudo /opt/foam/bin/foam report engagements/<id> --out report.md
+sudo /opt/foam/bin/foam verify engagements/<id>
+```
+
+`.env` 的查找位置是当前工作目录的 `.env`,不是 `HOME` 或 `/opt/foam`;
+它在 Foam 启动后只读注入缺省环境变量,不覆盖已有同名变量。sudo 后的
+`HOME` 以及 profile(`~/.foam/config.json`)实际指向 root 还是调用用户,
+取决于系统/sudoers 配置,**尚未在真实 Kali 实测**;上述示例不依赖 profile,
+不要预设 sudo 后仍能读到调用用户的配置。
+
+`status`/`doctor` 属于尚待实施的 R13,当前不可当作已交付命令;其可信安装
+诊断和无权限处置由 R13 验收。本小节是 R29-A 公开安装约定与文档草案,
+尚未完成真实 Kali 的干净系统安装、sudo、wheel 与 protected run 验证。
 
 ## 配置持久化
 
