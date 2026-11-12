@@ -101,7 +101,9 @@ from foam.runtime import RunRuntime, cleanup_warning_text, close_run
 from foam.state.files import (
     DEFAULT_ENGAGEMENTS_DIR,
     Engagement,
+    EngagementLockedError,
     _default_engagement_id,
+    acquire_engagement_lock,
 )
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 from foam.tools.execution import ToolExecutor
@@ -984,8 +986,8 @@ class TuiApp(App[None]):
         self.engagement: Engagement | None = None
         self.run_handle: RunHandle | None = None
         self._audit: AuditLog | None = None
-        # R03:统一关闭句柄集(start_run 装配;_run_to_end/action_quit 共用
-        # close_run,幂等;lock=None——TUI 未接单写者锁,R02 文档化边界 D3)。
+        self._engagement_lock = None
+        # R03/R28:正式 run 的锁由 close_run 最后释放;预备/仪式未启动时直接释放。
         self._runtime: RunRuntime | None = None
         self._run_task: asyncio.Task[None] | None = None
         self._final_result: RunResult | None = None
@@ -1093,6 +1095,62 @@ class TuiApp(App[None]):
         self._main = MainScreen()
         await self.switch_screen(self._main)
 
+    def _open_engagement_locked(
+        self,
+        objective: str,
+        *,
+        engagement_id: str | None = None,
+        scope_path: str | Path | None = None,
+        scope_bytes: bytes | None = None,
+        create: bool = False,
+    ) -> Engagement:
+        """打开/创建目录并在后续审计或修订写入前取得同一单写者锁。"""
+        root = Path(self.config.engagements_dir) / (
+            engagement_id or _default_engagement_id(objective)
+        )
+        held = self._engagement_lock
+        if held is not None and held.path.parent.resolve() != root.resolve():
+            raise RuntimeError("TUI 当前持有另一个 engagement 的写者锁")
+        if create:
+            engagement = Engagement.create(
+                self.config.engagements_dir,
+                objective,
+                scope_path=scope_path,
+                engagement_id=engagement_id,
+                scope_bytes=scope_bytes,
+            )
+        elif (root / "engagement.json").exists():
+            engagement = Engagement.open(root)
+        else:
+            engagement = Engagement.create(
+                self.config.engagements_dir,
+                objective,
+                scope_path=scope_path,
+                engagement_id=engagement_id,
+                scope_bytes=scope_bytes,
+            )
+        if held is not None:
+            return engagement
+        try:
+            self._engagement_lock = acquire_engagement_lock(root)
+        except Exception:
+            engagement.close()
+            raise
+        return engagement
+
+    def _release_engagement_lock(self) -> None:
+        lock = self._engagement_lock
+        self._engagement_lock = None
+        if lock is not None:
+            lock.release()
+
+    def _report_lock_failure(self, exc: EngagementLockedError) -> None:
+        if self._main is not None:
+            self._main.narrative.add_notice(
+                "error",
+                f"{exc};已拒绝启动。请更换 --workdir 或等待对方结束",
+            )
+
     # ---------- 输入分派(Q4) ----------
 
     def submit_text(self, text: str) -> None:
@@ -1127,14 +1185,14 @@ class TuiApp(App[None]):
                 # 动态段),再 start_run 幂等复开——生产 eager_task_factory
                 # 下 create_task 同步开跑,开跑后再写段首轮上下文只剩占位
                 # (第二轮对抗审查修复)。
-                self._prepare_nl_run_engagement(text)
+                prepared = self._prepare_nl_run_engagement(text)
             else:
                 # R02-C(E07 收口):file 流同样在 start_run 前同一同步块备好
                 # engagement + 动态段,首轮上下文即含真实规则
-                self._prepare_file_run_engagement(text)
+                prepared = self._prepare_file_run_engagement(text)
+            if prepared is False:
+                return
             self.start_run(text)
-            if not self._scope_frozen_via_nl:
-                self._append_file_scope_confirm()
             return
         loop = self.active_loop
         if loop is None:
@@ -1150,11 +1208,11 @@ class TuiApp(App[None]):
         )
 
     def _append_file_scope_confirm(self) -> None:
-        """Q8:file 流补写 ``scope_confirmed(source="file")``(``start_run``
-        返回后、``scope_loaded`` 相邻之后;start_run 失败则 ``_audit`` 未就绪,
-        不补)。payload 经 14a ``scope_event_payload`` 单源构造,语义对齐 14b
-        W14b-2:``path`` = as-given 原串、``canonical_sha256`` = scope 文件字节
-        sha256(取刚写入的 engagement.json meta,免二次读盘的 TOCTOU)。
+        """Q8:file 流在 ``start_run`` 内、run task 创建前且仍持锁时补写
+        ``scope_confirmed(source="file")``。payload 经 14a
+        ``scope_event_payload`` 单源构造,语义对齐 14b W14b-2:``path`` =
+        as-given 原串、``canonical_sha256`` = scope 文件字节 sha256(取刚写入的
+        engagement.json meta,免二次读盘的 TOCTOU)。
 
         scope 由 NL 仪式冻结(``_scope_frozen_via_nl``)时不补:确认事实已在
         仪式 engagement 链上以 ``source="nl"`` 落账,此处补 ``source="file"``
@@ -1174,22 +1232,12 @@ class TuiApp(App[None]):
             path=self.config.scope_source,
             canonical_sha256=file_sha256,
         )
-        try:
-            self._audit.append(KIND_SCOPE_CONFIRMED, payload)
-        except ValueError:
-            # 第二轮对抗审查修复:生产 eager_task_factory 下,同步完结的 run
-            # 可能在 start_run 返回前已收尾并关闭共享句柄;链已封口即无
-            # 竞态写者,重开补写(AuditLog 重开恢复尾序 seq/prev_hash)。
-            audit = AuditLog(self.engagement.paths.audit_jsonl)
-            try:
-                audit.append(KIND_SCOPE_CONFIRMED, payload)
-            finally:
-                audit.close()
+        self._audit.append(KIND_SCOPE_CONFIRMED, payload)
 
-    def _prepare_nl_run_engagement(self, text: str) -> None:
+    def _prepare_nl_run_engagement(self, text: str) -> bool | None:
         """NL 冻结(predeclare/重新声明)后首条消息开跑前的 run engagement
-        预备(第二轮对抗审查修复;两段结构 D9 的预声明变体,start_run 本体
-        一字不动,其后的幂等复开因本预备而同参通过):
+        预备(第二轮对抗审查修复;两段结构 D9 的预声明变体;start_run 随后的
+        幂等复开因本预备而同参通过):
 
         - 目录不存在:按当前冻结 scope 创建(meta.scope 随 create 一步写齐)
           + 动态段写入——loop 首轮读到的即是已确认规则(生产 eager 调度下
@@ -1211,11 +1259,14 @@ class TuiApp(App[None]):
         if scope is None or main is None:
             return
         root = Path(self.config.engagements_dir) / _default_engagement_id(text)
+        existed = (root / "engagement.json").exists()
         engagement: Engagement
         sha256 = ""
         try:
-            if (root / "engagement.json").exists():
-                engagement = Engagement.open(root)
+            engagement = self._open_engagement_locked(
+                text, scope_path=self.config.scope_source
+            )
+            if existed:
                 old_scope_meta = engagement.metadata().get("scope") or {}
                 new_scope_meta = engagement.update_scope_metadata(
                     self.config.scope_source
@@ -1239,14 +1290,12 @@ class TuiApp(App[None]):
                     finally:
                         audit.close()
             else:
-                engagement = Engagement.create(
-                    self.config.engagements_dir,
-                    text,
-                    scope_path=self.config.scope_source,
-                )
                 sha256 = (engagement.metadata().get("scope") or {}).get(
                     "sha256", ""
                 )
+        except EngagementLockedError as exc:
+            self._report_lock_failure(exc)
+            return False
         except (OSError, ValueError):
             return  # start_run 同参重试 create 时给出自己的报错指引
         try:
@@ -1261,10 +1310,10 @@ class TuiApp(App[None]):
         except OSError as exc:
             main.narrative.add_notice("error", f"scope 动态段写入失败:{exc}")
 
-    def _prepare_file_run_engagement(self, text: str) -> None:
+    def _prepare_file_run_engagement(self, text: str) -> bool | None:
         """file 流开跑前 engagement 预备(R02-C,E07 收口;与 NL 侧
-        ``_prepare_nl_run_engagement`` 对称;``start_run`` 本体一字不动,
-        其后的幂等复开因本预备而同参通过):
+        ``_prepare_nl_run_engagement`` 对称;start_run 随后的幂等复开因本预备
+        而同参通过):
 
         - ``start_run`` 前同一同步块建/开 engagement 并写动态段——生产
           eager_task_factory 下 create_task 同步开跑,首轮 messages[1]
@@ -1306,9 +1355,12 @@ class TuiApp(App[None]):
         # config.scope_source as-given——meta_path 只是局部变量,不回写 config
         meta_path = str(Path(self.config.scope_source).resolve())
         root = Path(self.config.engagements_dir) / _default_engagement_id(text)
+        existed = (root / "engagement.json").exists()
         try:
-            if (root / "engagement.json").exists():
-                engagement = Engagement.open(root)
+            engagement = self._open_engagement_locked(
+                text, scope_path=meta_path, scope_bytes=data
+            )
+            if existed:
                 old_scope_meta = engagement.metadata().get("scope") or {}
                 new_scope_meta = engagement.update_scope_metadata_bytes(
                     meta_path, data
@@ -1332,13 +1384,9 @@ class TuiApp(App[None]):
                         )
                     finally:
                         audit.close()
-            else:
-                engagement = Engagement.create(
-                    self.config.engagements_dir,
-                    text,
-                    scope_path=meta_path,
-                    scope_bytes=data,
-                )
+        except EngagementLockedError as exc:
+            self._report_lock_failure(exc)
+            return False
         except (OSError, ValueError):
             return  # start_run 同参重试 create 时给出自己的报错指引
         try:
@@ -1394,18 +1442,13 @@ class TuiApp(App[None]):
             if predeclare
             else None
         )
-        root = Path(self.config.engagements_dir) / (
-            engagement_id or _default_engagement_id(text)
-        )
         try:
-            if (root / "engagement.json").exists():
-                return Engagement.open(root)
-            return Engagement.create(
-                self.config.engagements_dir,
-                text,
-                scope_path=None,
-                engagement_id=engagement_id,
+            return self._open_engagement_locked(
+                text, engagement_id=engagement_id, scope_path=None
             )
+        except EngagementLockedError as exc:
+            self._report_lock_failure(exc)
+            return None
         except (OSError, ValueError) as exc:
             if self._main is not None:
                 self._main.narrative.add_notice(
@@ -1571,8 +1614,8 @@ class TuiApp(App[None]):
             )
             if mode == "startup":
                 main.narrative.add_notice("success", summary)
-                # D9 两段结构:冻结完成后才调既有 start_run(其方法体不动;
-                # 幂等复开同参目录——objective/scope meta 已由冻结写齐)。
+                # D9 两段结构:冻结完成后才调 start_run;幂等复开同参目录
+                # (objective/scope meta 已由冻结写齐),仪式锁移交正式 run。
                 self.start_run(text)
             elif mode == "update":
                 loop = self.active_loop
@@ -1594,7 +1637,14 @@ class TuiApp(App[None]):
             main.narrative.add_notice("error", f"scope 仪式异常:{exc!r}")
         finally:
             if own_audit and audit is not None:
-                audit.close()
+                try:
+                    audit.close()
+                except Exception as exc:
+                    main.narrative.add_notice(
+                        "error", f"scope 仪式审计关闭异常:{exc!r}"
+                    )
+            if mode != "update" and self.run_handle is None:
+                self._release_engagement_lock()
             if card_mounted:
                 await card.remove()
             if not guard_released:
@@ -1623,53 +1673,70 @@ class TuiApp(App[None]):
     # ---------- run 生命周期(Q1:首条消息才启动) ----------
 
     def start_run(self, objective: str) -> None:
-        """首条消息触发:建 engagement → 审计链 → 装配 loop → 异步开跑。"""
+        """首条消息触发:建 engagement → 单写者锁 → 审计链 → 装配 loop。"""
         if self.run_handle is not None or self._main is None:
             return  # 单 run 会话:重复触发直接忽略
         main = self._main
         try:
-            engagement = Engagement.create(
-                self.config.engagements_dir,
-                objective,
-                scope_path=self.config.scope_source,
+            engagement = self._open_engagement_locked(
+                objective, scope_path=self.config.scope_source, create=True
             )
+        except EngagementLockedError as exc:
+            self._report_lock_failure(exc)
+            return
         except (OSError, ValueError) as exc:
+            self._release_engagement_lock()
             main.narrative.add_notice("error", f"engagement 创建失败:{exc}")
             return
-        engagement.set_operator(self.operator)
-        audit = AuditLog(engagement.paths.audit_jsonl)
-        audit.append(
-            KIND_SCOPE_LOADED,
-            scope_payload(self.config.scope, self.config.scope_source),
-        )
-        ctx = RunContext(
-            objective=objective,
-            operator=self.operator,
-            engagement=engagement,
-            audit=audit,
-            observer=TuiObserver(main),
-            config=self.config,
-            budget=self._budget,
-        )
-        factory = self.config.loop_factory or default_loop_factory
+        lock = self._engagement_lock
+        audit: AuditLog | None = None
         try:
-            handle = factory(ctx)
-        except BoundaryError as exc:
-            audit.close()
-            engagement.close()
-            main.narrative.add_notice(
-                "error", f"protected 执行边界创建失败:{exc};未回退 legacy"
+            engagement.set_operator(self.operator)
+            audit = AuditLog(engagement.paths.audit_jsonl)
+            audit.append(
+                KIND_SCOPE_LOADED,
+                scope_payload(self.config.scope, self.config.scope_source),
             )
-            return
+            ctx = RunContext(
+                objective=objective,
+                operator=self.operator,
+                engagement=engagement,
+                audit=audit,
+                observer=TuiObserver(main),
+                config=self.config,
+                budget=self._budget,
+            )
+            factory = self.config.loop_factory or default_loop_factory
+            handle = factory(ctx)
         except Exception as exc:  # 装配失败:如实呈现并收口资源
-            audit.close()
-            engagement.close()
-            main.narrative.add_notice("error", f"loop 装配失败:{exc!r}")
+            cleanup_errors: list[str] = []
+            try:
+                if audit is not None:
+                    audit.close()
+            except Exception as close_exc:
+                cleanup_errors.append(f"audit 关闭异常:{close_exc!r}")
+            try:
+                engagement.close()
+            except Exception as close_exc:
+                cleanup_errors.append(f"engagement 关闭异常:{close_exc!r}")
+            finally:
+                self._release_engagement_lock()
+            cleanup_detail = (
+                ";".join(cleanup_errors) if cleanup_errors else ""
+            )
+            if isinstance(exc, BoundaryError):
+                main.narrative.add_notice(
+                    "error",
+                    f"protected 执行边界创建失败:{exc};未回退 legacy;{cleanup_detail}",
+                )
+            else:
+                main.narrative.add_notice(
+                    "error", f"loop 装配失败:{exc!r};{cleanup_detail}"
+                )
             return
         self.engagement = engagement
         self._audit = audit
         self.run_handle = handle
-        # R03:统一关闭句柄集(close_run 的输入;lock=None 见 __init__ 注)
         self._runtime = RunRuntime(
             bash=handle.bash,
             session=handle.sessions,
@@ -1677,23 +1744,33 @@ class TuiApp(App[None]):
             engagement=engagement,
             audit=audit,
             backend=self.config.backend,
-            lock=None,
+            lock=lock,
             loop=handle.loop,
             boundary=handle.boundary,
         )
-        main.statusbar.set_engagement(engagement.paths.root.name, self.operator)
-        main.input_dock.input_box.placeholder = _PLACEHOLDER_RUNNING
-        if handle.boundary is None:
-            execution = (
-                "执行模式:legacy;仅 Bash 参数级护栏,无网络强制,"
-                "继承完整环境,已有连接不随 scope 撤销"
+        try:
+            if not self._scope_frozen_via_nl:
+                self._append_file_scope_confirm()
+            main.statusbar.set_engagement(engagement.paths.root.name, self.operator)
+            main.input_dock.input_box.placeholder = _PLACEHOLDER_RUNNING
+            if handle.boundary is None:
+                execution = (
+                    "执行模式:legacy;仅 Bash 参数级护栏,无网络强制,"
+                    "继承完整环境,已有连接不随 scope 撤销"
+                )
+            else:
+                execution = (
+                    f"执行模式:protected boundary={handle.boundary.boundary_id} "
+                    f"epoch={handle.boundary.epoch}"
+                )
+            main.narrative.add_notice("info", execution)
+        except Exception as exc:
+            self.run_handle = None
+            self._run_task = asyncio.create_task(
+                self._cleanup_resources(reason="装配失败")
             )
-        else:
-            execution = (
-                f"执行模式:protected boundary={handle.boundary.boundary_id} "
-                f"epoch={handle.boundary.epoch}"
-            )
-        main.narrative.add_notice("info", execution)
+            main.narrative.add_notice("error", f"loop 装配失败:{exc!r}")
+            return
         self._run_task = asyncio.create_task(self._run_to_end(handle, objective))
 
     async def _run_to_end(self, handle: RunHandle, objective: str) -> None:
@@ -1764,19 +1841,21 @@ class TuiApp(App[None]):
         await self._cleanup_resources()
         self.exit(self._exit_code())
 
-    async def _cleanup_resources(self) -> None:
-        """R03:统一关闭面(close_run 幂等;_run_to_end 已收口时此处空转)。
+    async def _cleanup_resources(self, *, reason: str = "退出 TUI") -> None:
+        """R03/R28:退出及 run 装配失败的统一关闭面(close_run 幂等)。
 
-        退出前仍有 cleanup_pending 时补一次上屏(D2;audit 关闭后补写不进链,
+        仍有 cleanup_pending 时补一次上屏(D2;audit 关闭后补写不进链,
         叙述流是退出前最后的可见面)。
         """
         if self._runtime is not None:
-            report = await close_run(self._runtime, run_id="tui", reason="退出 TUI")
+            report = await close_run(self._runtime, run_id="tui", reason=reason)
             warning = cleanup_warning_text(report)
             if warning and self._main is not None:
                 self._main.narrative.add_notice("error", warning)
             self._audit = None
+            self._engagement_lock = None
             return
+        self._release_engagement_lock()
         # 未开跑(迎宾即退):runtime 未建,其余句柄不存在,只关后端
         try:
             await self.config.backend.aclose()

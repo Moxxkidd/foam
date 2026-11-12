@@ -67,7 +67,12 @@ from foam.guard.audit import (
 )
 from foam.guard.scope import parse_scope, scope_payload
 from foam.replay import read_records, summarize_recent_rounds
-from foam.state.files import SCOPE_SECTION_BEGIN, SCOPE_SECTION_END
+from foam.state.files import (
+    SCOPE_SECTION_BEGIN,
+    SCOPE_SECTION_END,
+    Engagement,
+    acquire_engagement_lock,
+)
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 from foam.tui import TuiApp, TUIConfig, default_loop_factory
 from foam.tui.app import load_operator, save_operator
@@ -1835,10 +1840,8 @@ async def test_file_flow_zero_ceremony_and_scope_confirmed(tmp_path):
     payload 按 W14b-2(path=as-given 原串、canonical_sha256=文件字节 sha256
     = engagement.json meta sha256);其余行为逐字节回归。
 
-    注(第二轮对抗审查裁定):规格钉「scope_loaded 之后有」;本测试环境的
-    kinds[1] 相邻位次是 run_test 不设 eager_task_factory 的确定性时序——
-    生产 eager 下调度语义允许 run_started 先落链(run_started 先于首个
-    网络 await),位次不属规格契约,记录存在性与 payload 才是。"""
+    R28 起确认记录在 run task 创建前、仍持锁时落链,普通/eager 调度均保持
+    scope_loaded 与 scope_confirmed 相邻。"""
     script = [[TextDelta("done"), Usage(1, 1)]]
     app = TuiApp(make_config(tmp_path, script))
     async with app.run_test(headless=True, size=(140, 40)) as pilot:
@@ -2257,29 +2260,49 @@ async def test_scope_update_compile_in_flight_when_run_ends(tmp_path):
         assert verify(root / "audit.jsonl")
 
 
-async def test_file_scope_confirm_reopens_closed_audit(tmp_path):
-    """评审 R2-7 回归(T1 面):Q8 补写时共享审计句柄已关闭(生产 eager
-    下同步完结的 run 会在 start_run 返回前收尾关句柄;测试环境直关句柄
-    模拟)→ 重开链补写落账,链完整可验,不炸 submit_text。"""
-    app = TuiApp(make_config(tmp_path, [[TextDelta("done"), Usage(1, 1)]]))
+async def test_file_scope_confirm_precedes_eager_run_while_locked(tmp_path):
+    """R28:eager run 首次落链前 file 确认已写入,且 engagement 锁仍持有。"""
+    from foam.state.files import EngagementLockedError
+
+    config = make_config(tmp_path, [[TextDelta("done"), Usage(1, 1)]])
+    observed = {}
+
+    def observing_factory(ctx):
+        handle = default_loop_factory(ctx)
+        original_run = handle.loop.run
+
+        async def observed_run(objective):
+            records = read_records(ctx.engagement.paths.audit_jsonl)
+            observed["confirmed"] = any(
+                r["kind"] == KIND_SCOPE_CONFIRMED for r in records
+            )
+            try:
+                lock = acquire_engagement_lock(ctx.engagement.paths.root)
+            except EngagementLockedError:
+                observed["locked"] = True
+            else:
+                observed["locked"] = False
+                lock.release()
+            return await original_run(objective)
+
+        handle.loop.run = observed_run
+        return handle
+
+    config.loop_factory = observing_factory
+    app = TuiApp(config)
     async with app.run_test(headless=True, size=(140, 40)) as pilot:
-        await pilot.pause(0.2)
         await enter_main(app, pilot)
-        await start_run_and_wait(app, pilot)
+        running_loop = asyncio.get_running_loop()
+        running_loop.set_task_factory(asyncio.eager_task_factory)
+        try:
+            app.submit_text("eager recon")
+        finally:
+            running_loop.set_task_factory(None)
+        await wait_for(lambda: app._final_result is not None)
         assert app._final_result.status == "finished"
+        assert observed == {"confirmed": True, "locked": True}
         records = audit_records(app)
-        assert (
-            sum(1 for r in records if r["kind"] == KIND_SCOPE_CONFIRMED) == 1
-        )
-        # run 收尾已关句柄(wait_on_finish=False);再触发一次补写 → 重开路径
-        app._append_file_scope_confirm()
-        records = audit_records(app)
-        confirmed = [r for r in records if r["kind"] == KIND_SCOPE_CONFIRMED]
-        assert len(confirmed) == 2
-        assert confirmed[1]["payload"]["source"] == "file"
-        assert confirmed[1]["payload"]["canonical_sha256"] == (
-            confirmed[0]["payload"]["canonical_sha256"]
-        )
+        assert sum(r["kind"] == KIND_SCOPE_CONFIRMED for r in records) == 1
         assert verify(app.engagement.paths.audit_jsonl)
 
 
@@ -2486,6 +2509,8 @@ async def test_file_scope_changed_during_welcome_refuses_start(tmp_path):
         assert app.run_handle is None  # 未启动
         assert app.config.scope is not None
         assert app.config.scope.rules == ("127.0.0.0/8", "localhost")  # 内存不动
+        acquired = acquire_engagement_lock(only_engagement_root(tmp_path))
+        acquired.release()  # R28:预备已持锁后的 create 对账失败也须放锁
 
 
 async def test_file_scope_modified_after_start_run_unaffected_and_resume_refuses(
@@ -3048,3 +3073,532 @@ async def test_r12_tui_budget_stop_is_not_success(tmp_path):
         assert records[-1]["kind"] == "run_finished"
         assert records[-1]["payload"]["goal_status"] == "unfinished"
         assert not any(r["kind"] == "exec_request" for r in records)
+
+
+# ---------------------------------------------------------------------------
+# R28:TUI 与 CLI 共用单写者锁
+# ---------------------------------------------------------------------------
+
+
+_CLI_RESUME_SCRIPT = """
+import sys
+from foam.agent.backends.base import LLMBackend, TextDelta, Usage
+from foam.cli import main
+
+class Backend(LLMBackend):
+    provider = "fake"
+    async def aclose(self):
+        pass
+    def chat(self, messages, tools=None):
+        async def stream():
+            yield TextDelta("resumed")
+            yield Usage(1, 1)
+        return stream()
+
+raise SystemExit(main(
+    ["resume", "--execution-mode", "legacy", sys.argv[1]],
+    backend_factory=lambda _args: Backend(),
+))
+"""
+
+
+async def spawn_cli_resume(root: Path):
+    """在独立进程运行真实 CLI resume;fake 后端不访问网络。"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _CLI_RESUME_SCRIPT,
+        str(root),
+        cwd=root.parent,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+async def test_tui_run_rejects_cli_resume_without_audit_write(tmp_path):
+    """R28-AC01:TUI idle 仍是写者;同目录 CLI resume 必须拒绝且链字节不变。"""
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [[TextDelta("ready"), Usage(1, 1)]],
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        await wait_for(lambda: app.run_handle is not None)
+        loop = app.run_handle.loop
+        await wait_for(lambda: loop.status == "idle")
+        root = app.engagement.paths.root
+        await wait_for(lambda: len(read_records(root / "audit.jsonl")) == 4)
+        before = (root / "audit.jsonl").read_bytes()
+
+        proc = await spawn_cli_resume(root)
+        _stdout, stderr = await proc.communicate()
+
+        assert proc.returncode == 2
+        assert "另一个运行中的写者" in stderr.decode()
+        assert (root / "audit.jsonl").read_bytes() == before
+        loop.kill("TESTONLY cleanup")
+        await wait_for(lambda: app._final_result is not None)
+
+
+async def test_cli_writer_rejects_tui_before_audit_or_boundary(tmp_path):
+    """R28-AC02:CLI 持锁时 TUI 在装配边界前拒绝,且不追加审计。"""
+    from foam.state.files import EngagementLockedError
+
+    config = make_config(tmp_path, [], execution_mode="protected")
+    root = Engagement.create(
+        config.engagements_dir,
+        "recon lab",
+        scope_path=config.scope_source,
+    ).paths.root
+    before = (root / "audit.jsonl").read_bytes()
+    lock = acquire_engagement_lock(root)
+    factory_calls = []
+
+    def forbidden_factory(_ctx):
+        factory_calls.append(True)
+        raise AssertionError("锁拒绝后不得装配 loop/boundary")
+
+    config.loop_factory = forbidden_factory
+    app = TuiApp(config)
+    try:
+        async with app.run_test(headless=True, size=(140, 40)) as pilot:
+            main = await enter_main(app, pilot)
+            app.submit_text("recon lab")
+            await wait_for(
+                lambda: notices_containing(main, "另一个运行中的写者") != []
+            )
+            assert app.run_handle is None
+            assert factory_calls == []
+            assert (root / "audit.jsonl").read_bytes() == before
+            with pytest.raises(EngagementLockedError):
+                acquire_engagement_lock(root)
+    finally:
+        lock.release()
+
+
+async def test_second_tui_same_engagement_is_refused(tmp_path):
+    """R28-AC03:第一个 TUI 的 idle 写者仍排斥第二个 TUI。"""
+    app1 = TuiApp(
+        make_config(
+            tmp_path,
+            [[TextDelta("ready"), Usage(1, 1)]],
+            wait_on_finish=True,
+        )
+    )
+    async with app1.run_test(headless=True, size=(140, 40)) as pilot1:
+        await enter_main(app1, pilot1)
+        app1.submit_text("recon lab")
+        await wait_for(lambda: app1.run_handle is not None)
+        loop1 = app1.run_handle.loop
+        await wait_for(lambda: loop1.status == "idle")
+        root = app1.engagement.paths.root
+        await wait_for(lambda: len(read_records(root / "audit.jsonl")) == 4)
+        before = (root / "audit.jsonl").read_bytes()
+
+        app2 = TuiApp(make_config(tmp_path, []))
+        async with app2.run_test(headless=True, size=(140, 40)) as pilot2:
+            main2 = await enter_main(app2, pilot2)
+            app2.submit_text("recon lab")
+            await wait_for(
+                lambda: notices_containing(main2, "另一个运行中的写者") != []
+            )
+            assert app2.run_handle is None
+            assert (root / "audit.jsonl").read_bytes() == before
+
+        loop1.kill("TESTONLY cleanup")
+        await wait_for(lambda: app1._final_result is not None)
+
+
+async def test_nl_ceremony_lock_cancel_and_reacquire(tmp_path):
+    """R28-AC04:确认卡等待期已持锁;取消释放,重发可再次获取。"""
+    from foam.state.files import EngagementLockedError
+
+    script = [
+        [TextDelta('{"rules": ["192.0.2.0/24"]}'), Usage(5, 2)],
+        [TextDelta('{"rules": ["198.51.100.0/24"]}'), Usage(5, 2)],
+        [TextDelta("done"), Usage(1, 1)],
+    ]
+    app = TuiApp(make_nl_config(tmp_path, script))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        card = await wait_scope_card(main)
+        root = only_engagement_root(tmp_path)
+        with pytest.raises(EngagementLockedError):
+            acquire_engagement_lock(root)
+
+        press_card(card, "scope-cancel")
+        await wait_for(lambda: notices_containing(main, "已取消") != [])
+        released = acquire_engagement_lock(root)
+        released.release()
+
+        app.submit_text("recon   lab")
+        card = await wait_scope_card(main)
+        with pytest.raises(EngagementLockedError):
+            acquire_engagement_lock(root)
+        press_card(card, "scope-confirm")
+        await wait_for(lambda: app._final_result is not None)
+        assert app._final_result.status == "finished"
+
+
+_TUI_HOLD_SCRIPT = """
+import asyncio
+import sys
+from pathlib import Path
+from foam.agent.backends.base import LLMBackend, TextDelta, Usage
+from foam.guard.scope import parse_scope
+from foam.tui import TuiApp, TUIConfig
+
+class Backend(LLMBackend):
+    provider = "fake"
+    def __init__(self):
+        self.aclose_calls = 0
+    async def aclose(self):
+        self.aclose_calls += 1
+    def chat(self, messages, tools=None):
+        async def stream():
+            yield TextDelta("ready")
+            yield Usage(1, 1)
+        return stream()
+
+async def hold():
+    base = Path(sys.argv[1])
+    scope_path = base / "lab.scope"
+    scope_path.write_text("127.0.0.0/8\\nlocalhost\\n", encoding="utf-8")
+    app = TuiApp(TUIConfig(
+        scope=parse_scope(scope_path.read_text(encoding="utf-8")),
+        scope_source=str(scope_path),
+        backend=Backend(),
+        engagements_dir=base / "engagements",
+        config_home=base / "home",
+        wait_on_finish=True,
+    ))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await pilot.pause(0.2)
+        await app.confirm_operator("nightowl")
+        await pilot.pause(0.2)
+        app.submit_text("recon lab")
+        for _ in range(200):
+            if app.run_handle is not None and app.run_handle.loop.status == "idle":
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise RuntimeError("TUI run did not become idle")
+        print(app.engagement.paths.root, file=sys.__stdout__, flush=True)
+        await asyncio.Event().wait()
+
+asyncio.run(hold())
+"""
+
+
+async def test_tui_sigkill_releases_lock_for_real_cli_resume(tmp_path):
+    """R28-AC05:真实 TUI 进程 SIGKILL 后内核释放锁,独立 CLI 可对账恢复。"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _TUI_HOLD_SCRIPT,
+        str(tmp_path),
+        cwd=tmp_path,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+        except TimeoutError as exc:
+            proc.kill()
+            _stdout, stderr = await proc.communicate()
+            raise AssertionError(f"TUI 子进程未进入 idle: {stderr.decode()}") from exc
+        assert line, "TUI 子进程未进入 idle"
+        root = Path(line.decode().strip())
+        proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=5)
+
+        resumed = await spawn_cli_resume(root)
+        _stdout, stderr = await asyncio.wait_for(resumed.communicate(), timeout=15)
+        assert resumed.returncode == 0, stderr.decode()
+        assert verify(root / "audit.jsonl")
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
+async def test_tui_normal_and_factory_error_release_lock(tmp_path):
+    """R28-AC06:正常收尾与装配错误后,另一写者均可取锁。"""
+    app = TuiApp(make_config(tmp_path, [[TextDelta("done"), Usage(1, 1)]]))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        root = app.engagement.paths.root
+        assert app._runtime.close_result["cleanup_status"] == "ok"
+        acquired = acquire_engagement_lock(root)
+        acquired.release()
+
+    other = tmp_path / "factory-error"
+    other.mkdir()
+    config = make_config(other, [])
+
+    def fail_factory(_ctx):
+        raise RuntimeError("TESTONLY factory failure")
+
+    config.loop_factory = fail_factory
+    failed = TuiApp(config)
+    async with failed.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(failed, pilot)
+        failed.submit_text("recon lab")
+        await wait_for(lambda: notices_containing(main, "loop 装配失败") != [])
+        root = failed._engagement_lock.path.parent if failed._engagement_lock else None
+        assert root is None
+        root = only_engagement_root(other)
+        acquired = acquire_engagement_lock(root)
+        acquired.release()
+
+
+async def test_tui_partial_cleanup_still_releases_lock(tmp_path, monkeypatch):
+    """R28-AC06:bash 收割异常使 close_run=partial,也不能跳过锁释放。"""
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [[TextDelta("ready"), Usage(1, 1)]],
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        await wait_for(lambda: app.run_handle is not None)
+        handle = app.run_handle
+        await wait_for(lambda: handle.loop.status == "idle")
+
+        async def fail_close():
+            raise OSError("TESTONLY close failure")
+
+        monkeypatch.setattr(handle.bash, "aclose", fail_close)
+        handle.loop.kill("TESTONLY cleanup")
+        await wait_for(lambda: app._final_result is not None)
+        report = app._runtime.close_result
+        assert report["cleanup_status"] == "partial"
+        assert any("bash 收割异常" in error for error in report["errors"])
+        acquired = acquire_engagement_lock(app.engagement.paths.root)
+        acquired.release()
+
+
+async def test_tui_early_assembly_error_releases_lock(tmp_path, monkeypatch):
+    """R28-AC06:set_operator 在 loop_factory 前失败,未启动 run 也须放锁。"""
+    def fail_set_operator(_self, _operator):
+        raise OSError("TESTONLY set_operator failure")
+
+    monkeypatch.setattr(Engagement, "set_operator", fail_set_operator)
+    app = TuiApp(make_config(tmp_path, []))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        assert notices_containing(main, "loop 装配失败") != []
+        assert app.run_handle is None
+        acquired = acquire_engagement_lock(only_engagement_root(tmp_path))
+        acquired.release()
+
+
+@pytest.mark.parametrize("resource", ["audit", "engagement"])
+async def test_tui_factory_error_releases_lock_when_close_fails(
+    tmp_path, monkeypatch, resource
+):
+    """R28-AC06:factory 失败后的句柄关闭异常不得跳过锁释放。"""
+    other = tmp_path / resource
+    other.mkdir()
+    config = make_config(other, [])
+
+    def fail_factory(_ctx):
+        raise RuntimeError("TESTONLY factory failure")
+
+    def fail_close(_self):
+        raise OSError(f"TESTONLY {resource} close failure")
+
+    config.loop_factory = fail_factory
+    monkeypatch.setattr(
+        AuditLog if resource == "audit" else Engagement, "close", fail_close
+    )
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        assert notices_containing(main, "loop 装配失败") != []
+        acquired = acquire_engagement_lock(only_engagement_root(other))
+        acquired.release()
+
+
+async def test_tui_second_root_rejected_before_create_or_open(tmp_path):
+    """R28:持有仪式 A 锁时,start_run(B) 不得先创建/打开 B 目录。"""
+    from foam.state.files import EngagementLockedError
+
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [[TextDelta('{"rules": ["192.0.2.0/24"]}'), Usage(5, 2)]],
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.start_scope_ceremony("scope A", mode="predeclare")
+        card = await wait_scope_card(main)
+        root_a = only_engagement_root(tmp_path)
+        with pytest.raises(RuntimeError, match="另一个 engagement"):
+            app.start_run("objective B")
+        assert only_engagement_root(tmp_path) == root_a
+        with pytest.raises(EngagementLockedError):
+            acquire_engagement_lock(root_a)
+        press_card(card, "scope-cancel")
+        await wait_for(lambda: notices_containing(main, "已取消") != [])
+        acquired = acquire_engagement_lock(root_a)
+        acquired.release()
+
+
+async def test_nl_ceremony_audit_close_error_still_releases_lock(
+    tmp_path, monkeypatch
+):
+    """R28-AC04/06:取消仪式的 audit.close 异常不得扣留 engagement 锁。"""
+    app = TuiApp(
+        make_nl_config(
+            tmp_path,
+            [[TextDelta('{"rules": ["192.0.2.0/24"]}'), Usage(5, 2)]],
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        await wait_scope_card(main)
+        root = only_engagement_root(tmp_path)
+
+        def fail_close(_self):
+            raise OSError("TESTONLY ceremony audit close failure")
+
+        monkeypatch.setattr(AuditLog, "close", fail_close)
+        press_card(scope_card(main), "scope-cancel")
+        await wait_for(lambda: notices_containing(main, "已取消") != [])
+        acquired = acquire_engagement_lock(root)
+        acquired.release()
+
+
+async def test_nl_predeclare_releases_then_formal_run_owns_lock(tmp_path):
+    """R28-AC04:predeclare 确认后放锁;正式 run 在不同 root 持锁至收尾。"""
+    from foam.state.files import EngagementLockedError
+
+    app = TuiApp(
+        make_nl_config(
+            tmp_path,
+            [
+                [TextDelta('{"rules": ["192.0.2.0/24"]}'), Usage(5, 2)],
+                [TextDelta("ready"), Usage(1, 1)],
+            ],
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("/scope only 192.0.2.0/24")
+        card = await wait_scope_card(main)
+        predeclare_root = only_engagement_root(tmp_path)
+        with pytest.raises(EngagementLockedError):
+            acquire_engagement_lock(predeclare_root)
+
+        press_card(card, "scope-confirm")
+        await wait_for(
+            lambda: notices_containing(main, "发送首条消息启动 run") != []
+        )
+        acquired = acquire_engagement_lock(predeclare_root)
+        acquired.release()
+
+        app.submit_text("recon the lab")
+        await wait_for(lambda: app.run_handle is not None)
+        loop = app.run_handle.loop
+        await wait_for(lambda: loop.status == "idle")
+        run_root = app.engagement.paths.root
+        assert run_root != predeclare_root
+        with pytest.raises(EngagementLockedError):
+            acquire_engagement_lock(run_root)
+        acquired = acquire_engagement_lock(predeclare_root)
+        acquired.release()
+
+        loop.kill("TESTONLY cleanup")
+        await wait_for(lambda: app._final_result is not None)
+        for root in (predeclare_root, run_root):
+            acquired = acquire_engagement_lock(root)
+            acquired.release()
+
+
+async def test_tui_run_error_releases_lock(tmp_path):
+    """R28-AC06:真实 AgentLoop 返回 error 后,另一写者可立即取锁。"""
+    async def fail_round(_messages):
+        raise RuntimeError("TESTONLY run failure")
+
+    app = TuiApp(make_config(tmp_path, [fail_round]))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        await wait_for(lambda: app._final_result is not None)
+        assert app._final_result.status == "error"
+        acquired = acquire_engagement_lock(app.engagement.paths.root)
+        acquired.release()
+
+
+@pytest.mark.parametrize("failure_point", ["scope_confirm", "ui"])
+async def test_tui_post_runtime_assembly_error_closes_boundary_and_lock(
+    tmp_path, monkeypatch, failure_point
+):
+    """R28-AC06:factory 成功后的确认/UI 异常也经统一关闭面收口。"""
+    class Boundary:
+        boundary_id = "TESTONLY"
+        epoch = 1
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def aclose(self):
+            self.close_calls += 1
+            return {"cleanup_status": "ok", "remaining_resources": [], "errors": []}
+
+    config = make_config(tmp_path, [])
+    boundary = Boundary()
+
+    def factory(ctx):
+        handle = default_loop_factory(ctx)
+        handle.boundary = boundary
+        return handle
+
+    config.loop_factory = factory
+    if failure_point == "scope_confirm":
+        original_append = AuditLog.append
+
+        def fail_confirm(self, kind, payload):
+            if kind == KIND_SCOPE_CONFIRMED:
+                raise OSError("TESTONLY scope confirmation failure")
+            return original_append(self, kind, payload)
+
+        monkeypatch.setattr(AuditLog, "append", fail_confirm)
+    else:
+        def fail_ui(_self, _engagement_id, _operator):
+            raise OSError("TESTONLY UI assembly failure")
+
+        monkeypatch.setattr(StatusBar, "set_engagement", fail_ui)
+
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        app.submit_text("recon lab")
+        await wait_for(lambda: notices_containing(main, "loop 装配失败") != [])
+        await wait_for(lambda: boundary.close_calls == 1)
+        await wait_for(lambda: config.backend.aclose_calls == 1)
+        assert app.run_handle is None
+        acquired = acquire_engagement_lock(only_engagement_root(tmp_path))
+        acquired.release()

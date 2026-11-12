@@ -1108,3 +1108,31 @@ WP-13(整合)依赖全部
 - 实施顺序：R28 → R29-A → R13（A→B→C）→ R29-B → R14（A→D）。R29-B 需真实
   Kali，不可用时标阻塞并继续 R14，不以容器结果替代。
 - 边界：不放宽 scope、`_trusted_source` 或 R11 能力边界；不打 tag、不发布。
+
+
+## 当前状态（2026-11-12：R28 开工）
+
+- 按授权序列开始 R28；实施前复核确认锁必须覆盖 file/NL 预备写入与 NL 确认仪式，
+  不能只改 `RunRuntime` 赋值。测试缝隙沿用规格指定的真实 TUI/CLI、审计字节和
+  真实进程退出；详见 [R28](items/R28.md) 末尾复核记录。
+- 根目录调试 zip 为既有未跟踪文件，所有提交明确排除；未改 scope、锁实现或 R11
+  能力边界。下一步：R28 先红回归 → 最小实现 → 全量验证与独立提交。
+
+
+## 当前状态（2026-11-12：R28 关闭）
+
+- [R28](items/R28.md) 完成，AC01–AC06 全部核销。TUI 的 file/NL create/open
+  入口统一在首次审计写入前取得与 CLI 相同的 flock；启动型 NL 仪式向正式 run
+  移交锁，取消/失败释放，正常、错误及 `close_run` 部分清理均最后释放锁。
+- 真实行为覆盖 TUI idle 拒绝独立 CLI resume（rc=2、审计字节不变）、外部写者/
+  第二个 TUI 拒绝、NL 确认卡等待期持锁与取消重取，以及真实 TUI 子进程
+  SIGKILL 后独立 CLI resume 和审计 `verify`。AC05 测试握手根因是 Textual
+  `_PrintCapture` 替换 `sys.stdout`，已改用 `sys.__stdout__`，未弱化公开缝隙。
+- 验证基线：macOS arm64 / Python 3.12.14；父代理完整离线
+  **939 passed + 40 skipped in 206.47s (0:03:26)**，ruff 全绿、diff 检查无输出。
+  40 个 skip 为既有环境/opt-in 面，R28 用例无 skip；逐项证据见 R28 实施记录。
+- 边界：旧版本 TUI 不持锁仍是残余风险；不得手删 `engagement.lock`，应等待
+  进程退出/释放或更换 `--workdir`。未改 scope、`_trusted_source`、flock 或 R11
+  能力边界。提交/推送及真实 SHA 待父代理回填；未打 tag、未发布软件包。
+- 下一步：进入 [R29-A](items/R29.md)，保持既定 R29-A → R13 → R29-B → R14
+  序列；R29-B 仍需真实 Kali，不以容器结果替代。

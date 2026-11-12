@@ -16,7 +16,7 @@ CLI/TUI 共享同一关闭服务 :func:`close_run`——修复前各入口各自
 4. **关闭审计**(永远最后:终态记录必须先于它落链;loop 在调用本服务前
    已写妥 run_finished)。
 5. **关闭后端**(httpx 连接等)。
-6. **释放单写者锁**(R02;TUI 未接锁时 lock 为 None)。
+6. **释放单写者锁**(R02/R28;未持锁的 run 其 lock 为 None)。
 
 任一步失败如实记入返回报告(``cleanup_status="partial"`` +
 ``remaining_resources``/``errors``),**不跳过后续步骤**(AC06);全程幂等,
@@ -47,7 +47,7 @@ class RunRuntime:
     engagement: Any = None  # Engagement
     audit: Any = None  # AuditLog
     backend: Any = None  # LLMBackend
-    lock: Any = None  # EngagementLock(R02;TUI 未接锁时为 None,见 R03 §7 D3)
+    lock: Any = None  # EngagementLock(R02/R28;未持锁时为 None)
     loop: Any = None  # AgentLoop(引用;不由本服务驱动)
     closed: bool = False
     close_result: dict[str, Any] | None = None
