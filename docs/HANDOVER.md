@@ -1176,3 +1176,21 @@ WP-13(整合)依赖全部
 - 父 R13 保持进行中：B 的配置/后端/脱敏/online/protected 诊断与 C 心跳活性
   均未实施；无真实 Linux/Kali 证据。下一步仅在授权范围内进入 R13-B；提交/
   推送待父代理，未打 tag、未发布，根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-12：R13-B 完整只读 doctor 完成）
+
+- [R13-B](items/R13.md) 补齐 §2.3 全部检查与 doctor flags；严格只读配置检查、
+  无输出纯后端解析、统一双层脱敏、tools/workdir/protected/stale 与显式 online
+  DNS/TCP/TLS 均已接线。protected 完全复用 R11 判据，stale 不 recover；原 run
+  wrapper 的解析、可见性行与非法 backend 警告有公开回归。
+- 公开测试红基线 **18 failed, 5 passed in 2.10s**；完整相关目标最终
+  **233 passed in 7.30s**。临时移除 redact 实效后 **1 failed in 0.15s**，恢复后
+  通过；针对改动 ruff/diff 全绿，无 skip。
+- 最终基线由父代理于 2026-11-12 在 macOS arm64 / Python 3.12.14 验证：
+  `.venv/bin/python -m pytest -q` = **964 passed, 40 skipped in 204.72s (0:03:24)**，
+  `.venv/bin/ruff check .` = **All checks passed!**，`git diff --check` 无输出。
+  40 个 skip 为既有环境/opt-in 面，本片无 skip。
+- R13-AC01/AC02 已核销；父 R13 与 C 心跳保持进行中。R29 仅同步 doctor 处置
+  接口事实，AC 与真实 Kali 发布门槛不变。下一步仅在授权范围内进入 R13-C；
+  提交/推送待父代理，未打 tag、未发布，根目录调试 zip 继续排除。

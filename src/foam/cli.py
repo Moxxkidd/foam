@@ -149,7 +149,7 @@ from foam.config import (
     sanitize_url,
     validate_profile_name,
 )
-from foam.diagnostics import collect_doctor, collect_status
+from foam.diagnostics import collect_doctor, collect_status, redact
 from foam.evidence import (
     render_human,
     result_to_dict,
@@ -446,9 +446,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser(
         "doctor",
-        help="只读诊断 Python、本项目版本与依赖(R13-A;默认零网络)",
+        help="只读诊断配置、后端与执行环境(默认零网络)",
     )
     doctor.add_argument("--json", action="store_true", help="机读 JSON 输出")
+    doctor.add_argument("--online", action="store_true", help="仅 DNS/TCP/TLS 探测")
+    doctor.add_argument("--profile", default=None, metavar="NAME")
+    doctor.add_argument("--backend", choices=["openai_compat", "claude"], default=None)
+    doctor.add_argument("--model", default=None)
+    doctor.add_argument("--base-url", default=None)
+    doctor.add_argument("--workdir", default=None)
 
     status = sub.add_parser(
         "status",
@@ -502,101 +508,143 @@ def _printable(text: str) -> str:
     )
 
 
-def _select_profile(args: argparse.Namespace) -> tuple[str | None, dict | None]:
-    """取本次生效的 (profile 名, profile):--profile 指定,否则 active_profile。
+@dataclass(frozen=True)
+class BackendResolution:
+    """无输出的后端解析结果;wrapper 与 doctor 共用同一优先级链。"""
 
-    配置文件全容错(load_config 口径):任何读取问题按「无 profile」处理,
-    绝不阻断启动;--profile 指名却不存在时警告并按解析链继续。
-    """
+    backend: str
+    model: str
+    base_url: str | None
+    sources: dict[str, str]
+    profile_name: str | None = None
+    profile: dict | None = None
+    missing_profile: bool = False
+    warn_missing: bool = False
+    invalid_backend: Any = None
+
+    @property
+    def effective_base_url(self) -> str | None:
+        if self.base_url is not None:
+            return self.base_url
+        return DEFAULT_BASE_URL if self.backend == "claude" else None
+
+
+def resolve_backend_values(args: argparse.Namespace) -> BackendResolution:
+    """纯解析 flag/env/profile/default;不打印、不构造后端、不写配置。"""
     config = load_config(Path.home())
-    name = getattr(args, "profile", None)
-    if name:
-        profile = get_profile(config, name)
-        if profile is None:
-            print(
-                f"[config] 警告:profile '{_printable(name)}' 不存在或为空"
-                "(已忽略,按优先级链继续解析)",
-                file=sys.stderr,
-            )
-            return None, None
-        return name, profile
-    active_name = config.get("active_profile")
-    if isinstance(active_name, str) and active_name:
-        profile = active_profile(config)
-        if profile is not None:
-            return active_name, profile
-    return None, None
-
-
-def resolve_backend_args(args: argparse.Namespace) -> None:
-    """就地回填 args.backend/args.model/args.base_url(P1-1 冻结契约)。
-
-    优先级(每键独立):CLI flag > 环境变量(FOAM_LLM_MODEL/FOAM_LLM_BASE_URL)
-    > profile(--profile 指定,否则 active_profile)> 内置默认
-    (k3/claude-sonnet-5)。backend 无 env 通道(维持现状);env base_url 对
-    claude 同样生效(经本函数回填,P1-1 起的行为改进)。profile 中 backend
-    非法值忽略并警告,其余键不受影响。profile 生效时打印一行启动可见性
-    (只含非密钥三元组,base_url 过 sanitize_url 上屏副本脱敏,脱敏失败
-    显示占位符;profile 名过 _printable 可打印过滤);无 profile 时零
-    额外输出(回归底线)。
-    """
-    name, profile = _select_profile(args)
+    requested = getattr(args, "profile", None)
+    name = None
+    profile = None
+    missing = False
+    if requested:
+        name = requested
+        profile = get_profile(config, requested)
+        missing = profile is None
+    else:
+        active_name = config.get("active_profile")
+        if isinstance(active_name, str) and active_name:
+            name = active_name
+            profile = active_profile(config)
+            missing = profile is None
+    invalid_backend = None
     if profile is not None:
         raw_backend = profile.get("backend")
         if raw_backend is not None and raw_backend not in _VALID_BACKENDS:
-            print(
-                f"[config] 警告:profile '{_printable(name)}' 的 backend 值"
-                f"「{_printable(str(raw_backend))}」非法"
-                f"(仅支持 {'/'.join(_VALID_BACKENDS)},已忽略该键)",
-                file=sys.stderr,
-            )
-            profile = {k: v for k, v in profile.items() if k != "backend"}
-        if profile:
-            # 上屏副本脱敏(Fix-2,2026-09-12 第三轮起 fail-closed):
-            # config.json 可手编,base_url 即使混入 userinfo/敏感 query
-            # 也不原样上屏;sanitize 解析不出(畸形且可能藏凭证)时显示
-            # 占位符,绝不回原值。下方解析进 args 的仍是 profile 原值
-            # (运行时不动)。profile 名过 _printable(防 ANSI/换行伪造
-            # 日志行)。
-            display = {}
-            for key, value in profile.items():
-                if key == "base_url":
-                    try:
-                        display[key] = sanitize_url(value)
-                    except ValueError:
-                        display[key] = _UNPARSEABLE_BASE_URL_PLACEHOLDER
-                else:
-                    display[key] = value
-            details = " ".join(
-                f"{key}={display[key]}"
-                for key in _PROFILE_DISPLAY_KEYS
-                if key in display
-            )
-            print(f"[config] profile '{_printable(name)}':{details}", flush=True)
-        else:
+            invalid_backend = raw_backend
+            profile = {key: value for key, value in profile.items() if key != "backend"}
+        if not profile:
             profile = None
     resolved = profile or {}
 
-    # backend:flag > profile > 内置默认(无 env 通道,维持现状)。
-    if args.backend is None:
-        args.backend = resolved.get("backend") or "openai_compat"
-    # model:flag > env > profile > 内置默认(按已解析的 backend 取)。
-    if args.model is None:
-        args.model = (
-            os.environ.get(ENV_MODEL)
-            or resolved.get("model")
-            or (
-                DEFAULT_CLAUDE_MODEL
-                if args.backend == "claude"
-                else DEFAULT_OPENAI_MODEL
-            )
+    if args.backend is not None:
+        backend = args.backend
+        backend_source = "flag"
+    elif resolved.get("backend"):
+        backend = resolved["backend"]
+        backend_source = "profile"
+    else:
+        backend = "openai_compat"
+        backend_source = "default"
+
+    if args.model is not None:
+        model = args.model
+        model_source = "flag"
+    elif os.environ.get(ENV_MODEL):
+        model = os.environ[ENV_MODEL]
+        model_source = "env"
+    elif resolved.get("model"):
+        model = resolved["model"]
+        model_source = "profile"
+    else:
+        model = DEFAULT_CLAUDE_MODEL if backend == "claude" else DEFAULT_OPENAI_MODEL
+        model_source = "default"
+
+    if args.base_url is not None:
+        base_url = args.base_url
+        base_source = "flag"
+    elif os.environ.get(ENV_BASE_URL):
+        base_url = os.environ[ENV_BASE_URL]
+        base_source = "env"
+    elif resolved.get("base_url"):
+        base_url = resolved["base_url"]
+        base_source = "profile"
+    else:
+        base_url = None
+        base_source = "default" if backend == "claude" else "none"
+    return BackendResolution(
+        backend=backend,
+        model=model,
+        base_url=base_url,
+        sources={
+            "backend": backend_source,
+            "model": model_source,
+            "base_url": base_source,
+        },
+        profile_name=name,
+        profile=profile,
+        missing_profile=missing,
+        warn_missing=bool(requested and missing),
+        invalid_backend=invalid_backend,
+    )
+
+
+def resolve_backend_args(args: argparse.Namespace) -> None:
+    """保持既有输出并就回填 args;纯值由 resolve_backend_values 提供。"""
+    resolution = resolve_backend_values(args)
+    name = resolution.profile_name
+    profile = resolution.profile
+    if resolution.warn_missing:
+        print(
+            f"[config] 警告:profile '{_printable(name)}' 不存在或为空"
+            "(已忽略,按优先级链继续解析)",
+            file=sys.stderr,
         )
-    # base_url:flag > env > profile;无内置默认——openai_compat 缺失报错、
-    # claude 退官方端点,两处兜底仍在 _build_backend。env 通道对 claude
-    # 同样生效(经此处回填进 args.base_url;P1-1 起的行为改进,README
-    # 已文档化)——这是与 P1-1 前「claude 不看 FOAM_LLM_BASE_URL」的行为差。
-    if args.base_url is None:
-        args.base_url = os.environ.get(ENV_BASE_URL) or resolved.get("base_url")
+    if resolution.invalid_backend is not None:
+        print(
+            f"[config] 警告:profile '{_printable(name)}' 的 backend 值"
+            f"「{_printable(str(resolution.invalid_backend))}」非法"
+            f"(仅支持 {'/'.join(_VALID_BACKENDS)},已忽略该键)",
+            file=sys.stderr,
+        )
+    if profile is not None:
+        display = {}
+        for key, value in profile.items():
+            if key == "base_url":
+                try:
+                    display[key] = sanitize_url(value)
+                except ValueError:
+                    display[key] = _UNPARSEABLE_BASE_URL_PLACEHOLDER
+            else:
+                display[key] = value
+        details = " ".join(
+            f"{key}={display[key]}"
+            for key in _PROFILE_DISPLAY_KEYS
+            if key in display
+        )
+        print(f"[config] profile '{_printable(name)}':{details}", flush=True)
+    args.backend = resolution.backend
+    args.model = resolution.model
+    args.base_url = resolution.base_url
 
 
 def _save_profile_if_requested(args: argparse.Namespace) -> None:
@@ -1478,8 +1526,8 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _cmd_doctor(args: argparse.Namespace) -> int:
-    result = collect_doctor()
+def _cmd_doctor(args: argparse.Namespace, *, dotenv) -> int:
+    result = collect_doctor(args, dotenv=dotenv)
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:
@@ -1490,14 +1538,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.engagement_dir)
     if not root.is_dir():
-        print(f"[错误] engagement 目录不存在:{root}", file=sys.stderr)
+        print(redact(f"[错误] engagement 目录不存在:{root}"), file=sys.stderr)
         return EXIT_USAGE
     if not (root / "engagement.json").is_file() and not (
         root / "audit.jsonl"
     ).is_file():
         print(
-            f"[错误] {root} 不是 engagement 目录"
-            "(缺 engagement.json 与 audit.jsonl)",
+            redact(
+                f"[错误] {root} 不是 engagement 目录"
+                "(缺 engagement.json 与 audit.jsonl)"
+            ),
             file=sys.stderr,
         )
         return EXIT_USAGE
@@ -1642,10 +1692,16 @@ def main(
     # JSON),[config] 注入注记改道 stderr;其余命令形态不变。
     injected, dotenv_warnings = load_dotenv(Path.cwd() / ".env")
     for warning in dotenv_warnings:
-        print(f"[config] .env {warning}", file=sys.stderr)
+        message = f"[config] .env {warning}"
+        if args.command in ("doctor", "status"):
+            message = redact(message)
+        print(message, file=sys.stderr)
     if injected:
+        message = f"[config] .env 注入 {len(injected)} 个变量:{', '.join(injected)}"
+        if args.command in ("doctor", "status"):
+            message = redact(message)
         print(
-            f"[config] .env 注入 {len(injected)} 个变量:{', '.join(injected)}",
+            message,
             file=sys.stderr
             if args.command in ("verify", "doctor", "status")
             else sys.stdout,
@@ -1666,7 +1722,7 @@ def main(
     if args.command == "verify":
         return _cmd_verify(args)
     if args.command == "doctor":
-        return _cmd_doctor(args)
+        return _cmd_doctor(args, dotenv=(injected, dotenv_warnings))
     if args.command == "status":
         return _cmd_status(args)
     if args.command == "tui":

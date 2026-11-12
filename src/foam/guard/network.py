@@ -33,6 +33,8 @@ __all__ = [
     "ExecutionUnsupportedError",
     "NetworkBoundary",
     "NetworkPolicy",
+    "list_stale_boundaries",
+    "probe_protected",
     "recover_stale",
 ]
 
@@ -112,6 +114,17 @@ def _trusted_source(path: Path) -> Path:
             break
         current = current.parent
     return resolved
+
+
+def probe_protected() -> dict[str, Any]:
+    """只读复用 protected 支持性与受信启动路径判据，不创建边界。"""
+    try:
+        network_helper.require_supported()
+        _trusted_source(Path(sys.executable))
+        _trusted_source(Path(network_helper.__file__).resolve())
+    except (ExecutionUnsupportedError, OSError) as exc:
+        return {"available": False, "reason": str(exc)}
+    return {"available": True, "reason": ""}
 
 
 class _HelperTransport:
@@ -616,6 +629,18 @@ def _remove_recovered_directories(state_dir: Path, workdir: Path) -> None:
     (state_dir / "control.sock").unlink(missing_ok=True)
     (state_dir / network_helper._CLEANED_MANIFEST).unlink(missing_ok=True)
     state_dir.rmdir()
+
+
+def list_stale_boundaries(*, state_root: str | Path | None = None) -> list[str]:
+    """只读列举边界目录；不读取 manifest、不清理、不调用 recover_stale。"""
+    root = Path(state_root or "/run/foam/network")
+    if not root.exists():
+        return []
+    return [
+        path.name
+        for path in sorted(root.iterdir())
+        if path.is_dir() and network_helper._BOUNDARY_RE.fullmatch(path.name)
+    ]
 
 
 def recover_stale(

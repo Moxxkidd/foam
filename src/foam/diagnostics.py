@@ -1,25 +1,78 @@
-"""R13-A:doctor/status 的纯只读诊断结果与同源渲染。"""
+"""R13-A/B:doctor/status 的纯只读诊断结果、脱敏与同源渲染。"""
 
 from __future__ import annotations
 
+import argparse
+import concurrent.futures
 import importlib.metadata
 import importlib.util
 import json
+import os
+import re
+import socket
 import sqlite3
+import ssl
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from foam import __version__
+from foam.agent.toolmap import scan_tools
+from foam.config import (
+    dotenv_secret_values,
+    inspect_config,
+    sanitize_url,
+)
 from foam.evidence import open_index_ro
+from foam.guard.network import list_stale_boundaries, probe_protected
 
 AUDIT_TAIL_BYTES = 64 * 1024
 
 
 def _generated_at() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _secret_values() -> set[str]:
+    values = set()
+    for key, value in os.environ.items():
+        if key in ("FOAM_LLM_API_KEY", "FOAM_ANTHROPIC_API_KEY") or (
+            key.startswith("FOAM_")
+            and re.search("KEY|TOKEN|SECRET|PASSWORD", key)
+        ):
+            if value:
+                values.add(value)
+    values.update(dotenv_secret_values(Path.cwd() / ".env"))
+    values.update(inspect_config(Path.home())["secret_values"])
+    return values
+
+
+def redact(text: str) -> str:
+    """先替换已知秘密，再对所有 HTTP URL 做 fail-closed 脱敏。"""
+    result = str(text)
+    for secret in sorted(_secret_values(), key=len, reverse=True):
+        result = result.replace(secret, "<已脱敏>")
+
+    def clean_url(match: re.Match[str]) -> str:
+        try:
+            return sanitize_url(match.group(0))
+        except ValueError:
+            return "<无法解析,已脱敏>"
+
+    return re.sub(r"https?://[^\s\"'<>]+", clean_url, result)
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {_redact_value(key): _redact_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -30,14 +83,20 @@ class Check:
     remediation: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self):
+        for item in fields(self):
+            object.__setattr__(self, item.name, _redact_value(getattr(self, item.name)))
+
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "code": self.code,
-            "status": self.status,
-            "message": self.message,
-            "remediation": self.remediation,
-            "details": self.details,
-        }
+        return _redact_value(
+            {
+                "code": self.code,
+                "status": self.status,
+                "message": self.message,
+                "remediation": self.remediation,
+                "details": self.details,
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -54,11 +113,13 @@ class DoctorResult:
         return 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema": "foam.doctor/1",
-            "generated_at": self.generated_at,
-            "checks": [check.to_dict() for check in self.checks],
-        }
+        return _redact_value(
+            {
+                "schema": "foam.doctor/1",
+                "generated_at": self.generated_at,
+                "checks": [check.to_dict() for check in self.checks],
+            }
+        )
 
     def render_human(self) -> str:
         lines = []
@@ -66,7 +127,7 @@ class DoctorResult:
             lines.append(f"[{check.code}] {check.status}: {check.message}")
             if check.remediation:
                 lines.append(f"  处置:{check.remediation}")
-        return "\n".join(lines) + "\n"
+        return redact("\n".join(lines) + "\n")
 
 
 @dataclass(frozen=True)
@@ -87,27 +148,33 @@ class StatusResult:
     )
     next_action: str = ""
 
+    def __post_init__(self):
+        for item in fields(self):
+            object.__setattr__(self, item.name, _redact_value(getattr(self, item.name)))
+
     @property
     def exit_code(self) -> int:
         return 3 if "unknown" in (self.run_state, self.liveness) else 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema": "foam.status/1",
-            "generated_at": self.generated_at,
-            "root": self.root,
-            "run_state": self.run_state,
-            "liveness": self.liveness,
-            "objective": self.objective,
-            "scope": self.scope,
-            "created_at": self.created_at,
-            "closed_at": self.closed_at,
-            "last_activity": self.last_activity,
-            "budget": self.budget,
-            "manifest": self.manifest,
-            "counts": self.counts,
-            "next_action": self.next_action,
-        }
+        return _redact_value(
+            {
+                "schema": "foam.status/1",
+                "generated_at": self.generated_at,
+                "root": self.root,
+                "run_state": self.run_state,
+                "liveness": self.liveness,
+                "objective": self.objective,
+                "scope": self.scope,
+                "created_at": self.created_at,
+                "closed_at": self.closed_at,
+                "last_activity": self.last_activity,
+                "budget": self.budget,
+                "manifest": self.manifest,
+                "counts": self.counts,
+                "next_action": self.next_action,
+            }
+        )
 
     def render_human(self) -> str:
         lines = [
@@ -151,10 +218,10 @@ class StatusResult:
         lines.append("发现/凭证/loot:" + "/".join(rendered_counts))
         lines.append(f"下一步:{self.next_action}")
         lines.append("提示:status 不校验审计链完整性;请用 foam verify 核验")
-        return "\n".join(lines) + "\n"
+        return redact("\n".join(lines) + "\n")
 
 
-def collect_doctor() -> DoctorResult:
+def _version_checks() -> tuple[Check, ...]:
     python_status = "pass" if sys.version_info >= (3, 12) else "fail"
     python_check = Check(
         code="python.version",
@@ -166,7 +233,6 @@ def collect_doctor() -> DoctorResult:
         remediation="" if python_status == "pass" else "安装 Python 3.12 或更新版本",
         details={"version": sys.version.split()[0], "executable": sys.executable},
     )
-
     try:
         distribution = importlib.metadata.version("foam")
     except importlib.metadata.PackageNotFoundError:
@@ -188,7 +254,6 @@ def collect_doctor() -> DoctorResult:
             "package": str(Path(__file__).parent),
         },
     )
-
     dependencies = []
     for name in ("httpx", "rich", "textual"):
         present = importlib.util.find_spec(name) is not None
@@ -215,7 +280,338 @@ def collect_doctor() -> DoctorResult:
                     remediation="按项目支持的安装方式安装缺失依赖后重试",
                 )
             )
-    return DoctorResult(checks=(python_check, foam_check, *dependencies))
+    return (python_check, foam_check, *dependencies)
+
+
+def _config_and_backend_checks(
+    args: argparse.Namespace, dotenv
+) -> tuple[list[Check], Any]:
+    from foam.cli import resolve_backend_values
+
+    injected, warnings = dotenv
+    dotenv_path = Path.cwd() / ".env"
+    dotenv_exists = dotenv_path.is_file()
+    dotenv_check = Check(
+        code="config.dotenv",
+        status="warn" if warnings else "pass",
+        message=(
+            f"{dotenv_path} 不存在,未注入"
+            if not dotenv_exists
+            else f"只读注入键:{', '.join(injected) or '(无新键)'}"
+            + (f";畸形:{';'.join(warnings)}" if warnings else "")
+        ),
+        details={"injected": injected, "warnings": warnings},
+    )
+
+    config = inspect_config(Path.home())
+    if not config["exists"]:
+        config_check = Check(
+            code="config.file",
+            status="pass",
+            message=f"{config['path']} 不存在(未配置)",
+        )
+    elif config["error"]:
+        config_check = Check(
+            code="config.file",
+            status="fail",
+            message=(
+                f"{config['path']} {config['error']};当前被静默忽略,profile 不生效"
+            ),
+            remediation="备份后修复为合法 JSON 对象,再重跑 doctor",
+        )
+    else:
+        problems = []
+        remedies = []
+        if config["mode"] != 0o600:
+            problems.append(f"权限为 {config['mode']:03o},应为 0600")
+            remedies.append("确认属主后执行 chmod 600")
+        if config["suspicious_keys"]:
+            problems.append(
+                "含敏感字段 " + ", ".join(config["suspicious_keys"]) + ";会被白名单丢弃"
+            )
+            remedies.append("手工删除这些字段,密钥只走环境变量")
+        config_check = Check(
+            code="config.file",
+            status="warn" if problems else "pass",
+            message=(
+                f"{config['path']} "
+                + (";".join(problems) if problems else "合法且权限适当")
+            ),
+            remediation=";".join(remedies),
+            details={
+                "path": config["path"],
+                "mode": config["mode"],
+                "suspicious_keys": config["suspicious_keys"],
+            },
+        )
+
+    resolution = resolve_backend_values(args)
+    if resolution.missing_profile:
+        profile_check = Check(
+            code="config.profile",
+            status="fail",
+            message=f"profile '{resolution.profile_name}' 不存在或为空",
+            remediation="修正 active_profile 或用 --profile 选择已保存 profile",
+        )
+    elif resolution.invalid_backend is not None:
+        profile_check = Check(
+            code="config.profile",
+            status="fail",
+            message=(
+                f"profile '{resolution.profile_name}' 的 backend 非法:"
+                f"{resolution.invalid_backend}"
+            ),
+            remediation="将 backend 改为 openai_compat 或 claude",
+        )
+    else:
+        profile_check = Check(
+            code="config.profile",
+            status="pass",
+            message=(
+                f"profile '{resolution.profile_name}' 有效"
+                if resolution.profile is not None
+                else "未指定有效 profile,使用其余解析链"
+            ),
+        )
+
+    effective_base_url = resolution.effective_base_url
+    if effective_base_url:
+        try:
+            shown_base_url = sanitize_url(effective_base_url)
+        except ValueError:
+            shown_base_url = "<无法解析,已脱敏>"
+    else:
+        shown_base_url = None
+    backend_check = Check(
+        code="backend.resolved",
+        status=(
+            "fail"
+            if resolution.backend == "openai_compat" and not effective_base_url
+            else "pass"
+        ),
+        message=(
+            f"backend={resolution.backend} model={resolution.model} "
+            f"base_url={shown_base_url}"
+            + (
+                ";openai_compat 缺 base_url"
+                if resolution.backend == "openai_compat" and not effective_base_url
+                else ""
+            )
+        ),
+        remediation=(
+            "通过 --base-url 或 FOAM_LLM_BASE_URL 设置 base_url"
+            if resolution.backend == "openai_compat" and not effective_base_url
+            else ""
+        ),
+        details={
+            "backend": resolution.backend,
+            "model": resolution.model,
+            "base_url": shown_base_url,
+            "sources": resolution.sources,
+            "profile": resolution.profile_name,
+        },
+    )
+    key_name = (
+        "FOAM_ANTHROPIC_API_KEY"
+        if resolution.backend == "claude"
+        else "FOAM_LLM_API_KEY"
+    )
+    key_set = bool(os.environ.get(key_name))
+    key_check = Check(
+        code="backend.api_key",
+        status="pass" if key_set else "fail",
+        message=f"{key_name} {'已设置' if key_set else '未设置'}",
+        remediation="" if key_set else f"在环境中设置 {key_name} 后重试;不得写入配置",
+        details={"env": key_name, "set": key_set},
+    )
+    return (
+        [dotenv_check, config_check, profile_check, backend_check, key_check],
+        resolution,
+    )
+
+
+def _tools_check() -> Check:
+    try:
+        scan = scan_tools()
+        counts = scan.counts()
+    except Exception as exc:
+        return Check(
+            code="tools.inventory",
+            status="unknown",
+            message=f"工具盘点失败:{exc}",
+            remediation="检查本机 PATH/dpkg 查询后重试;不会自动安装",
+        )
+    return Check(
+        code="tools.inventory",
+        status="pass",
+        message=(
+            f"工具 {counts['available']}/{counts['total']} 可用,"
+            f"缺失 {counts['missing']};dpkg={scan.dpkg_available}"
+        ),
+        details={**counts, "dpkg_available": scan.dpkg_available},
+    )
+
+
+def _workdir_check(path: Path) -> Check:
+    probe = path
+    try:
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        info = probe.stat()
+        writable = os.access(probe, os.W_OK)
+    except OSError as exc:
+        return Check(
+            code="workdir.engagements",
+            status="unknown",
+            message=f"无法读取 {probe}:{exc}",
+            remediation="检查目录权限与属主;doctor 不会创建目录",
+        )
+    return Check(
+        code="workdir.engagements",
+        status="pass" if writable else "fail",
+        message=(
+            f"目标 {path} "
+            + ("已存在" if path.exists() else f"不存在;检查既有父目录 {probe}")
+            + f";可写={writable}"
+        ),
+        remediation=(
+            "" if writable else "调整 workdir 到当前用户可写目录;不要写探针文件"
+        ),
+        details={
+            "path": str(path),
+            "probe": str(probe),
+            "exists": path.exists(),
+            "writable": writable,
+            "uid": info.st_uid,
+            "mode": f"{info.st_mode & 0o777:03o}",
+        },
+    )
+
+
+def _protected_check() -> Check:
+    probe = probe_protected()
+    if probe["available"]:
+        return Check(
+            code="exec.protected", status="pass", message="protected 前置条件满足"
+        )
+    return Check(
+        code="exec.protected",
+        status="warn",
+        message=f"protected 不可用:{probe['reason']};仅 legacy 可用",
+        remediation=(
+            "按 R29-A 使用 root /opt/foam venv 安装发布 wheel,并经 sudo 白名单启动;"
+            "不自动 sudo、不放宽权限"
+        ),
+        details=probe,
+    )
+
+
+def _stale_check() -> Check:
+    if sys.platform != "linux":
+        return Check(
+            code="exec.stale_boundaries",
+            status="skip",
+            message="非 Linux,无 /run/foam/network 残留目录检查",
+        )
+    try:
+        boundaries = list_stale_boundaries()
+    except OSError as exc:
+        return Check(
+            code="exec.stale_boundaries",
+            status="unknown",
+            message=f"残留边界目录不可读:{exc}",
+            remediation="以运行 protected 的 root 用户重试;不会自动 recover",
+        )
+    return Check(
+        code="exec.stale_boundaries",
+        status="warn" if boundaries else "pass",
+        message=(
+            f"发现 {len(boundaries)} 个残留边界;下一次 protected 创建会自动对账"
+            if boundaries
+            else "无残留边界目录"
+        ),
+        details={"count": len(boundaries), "boundaries": boundaries},
+    )
+
+
+def _online_check(base_url: str | None) -> Check:
+    if not base_url:
+        return Check(
+            code="online.base_url",
+            status="fail",
+            message="online 探测缺少生效 base_url",
+            remediation="先通过 --base-url 或 profile 设置 base_url",
+        )
+    host = None
+    try:
+        parts = urlsplit(base_url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("base_url 必须是含 host 的 http/https URL")
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            addresses = executor.submit(
+                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+            ).result(timeout=5)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        family, socktype, proto, _canonname, address = addresses[0]
+        connection = socket.socket(family, socktype, proto)
+        try:
+            connection.settimeout(5)
+            connection.connect(address)
+            if parts.scheme == "https":
+                connection = ssl.create_default_context().wrap_socket(
+                    connection, server_hostname=host
+                )
+                connection.settimeout(5)
+                connection.do_handshake()
+        finally:
+            connection.close()
+        steps = "DNS/TCP/TLS" if parts.scheme == "https" else "DNS/TCP"
+        return Check(
+            code="online.base_url",
+            status="pass",
+            message=f"{steps} 成功;未发送 HTTP 请求、未携带密钥",
+            details={"base_url": sanitize_url(base_url), "steps": steps},
+        )
+    except Exception as exc:
+        return Check(
+            code="online.base_url",
+            status="fail",
+            message=f"online DNS/TCP/TLS 探测失败:{exc}",
+            remediation="检查 DNS、网络路由、对端端口与 TLS 配置后重试",
+            details={"host": host},
+        )
+
+
+def collect_doctor(
+    args: argparse.Namespace | None = None, *, dotenv=None
+) -> DoctorResult:
+    args = args or argparse.Namespace(
+        backend=None, model=None, base_url=None, profile=None, workdir=None
+    )
+    config_backend, resolution = _config_and_backend_checks(args, dotenv or ([], []))
+    online = (
+        _online_check(resolution.effective_base_url)
+        if getattr(args, "online", False)
+        else Check(
+            code="online.base_url",
+            status="skip",
+            message="未指定 --online;默认零网络",
+        )
+    )
+    checks = (
+        *_version_checks(),
+        *config_backend,
+        _tools_check(),
+        _workdir_check(Path(args.workdir or "engagements")),
+        _protected_check(),
+        _stale_check(),
+        online,
+    )
+    return DoctorResult(checks=checks)
 
 
 def _read_meta(path: Path) -> tuple[dict[str, Any], str | None]:

@@ -725,3 +725,58 @@ def test_protected_mode_requires_linux_root_without_sudo(
         NetworkBoundary.create(
             parse_scope(""), state_root=tmp_path / "s", work_root=tmp_path / "w"
         )
+
+
+def test_probe_protected_reuses_existing_support_and_trust_checks(monkeypatch):
+    """R13-B:只读 probe 直接复用 R11 支持性与逐级受信路径判据。"""
+    checked = []
+    monkeypatch.setattr(network_helper, "require_supported", lambda: None)
+    monkeypatch.setattr(
+        network, "_trusted_source", lambda path: checked.append(path) or path
+    )
+    assert network.probe_protected()["available"] is True
+    assert len(checked) == 2
+
+    def unsupported():
+        raise ExecutionUnsupportedError("TESTONLY unsupported")
+
+    monkeypatch.setattr(network_helper, "require_supported", unsupported)
+    result = network.probe_protected()
+    assert result["available"] is False
+    assert result["reason"] == "TESTONLY unsupported"
+
+
+def test_list_stale_boundaries_is_read_only_and_never_recovers(
+    tmp_path, monkeypatch
+):
+    """R13-B:stale 仅列举匹配目录,不删除、不调用 recover_stale。"""
+    state = tmp_path / "state"
+    state.mkdir()
+    matching = state / "fb0123456789ab"
+    matching.mkdir()
+    (matching / "manifest.json").write_text("TESTONLY\n", encoding="utf-8")
+    (state / "not-a-boundary").mkdir()
+    (state / "plain").write_text("TESTONLY\n", encoding="utf-8")
+
+    def forbidden_recover(**_kwargs):
+        raise AssertionError("status/doctor 不得 recover")
+
+    monkeypatch.setattr(network, "recover_stale", forbidden_recover)
+    before = {
+        str(path.relative_to(state)): (
+            path.is_dir(),
+            path.read_bytes() if path.is_file() else None,
+            path.lstat().st_mtime_ns,
+        )
+        for path in state.rglob("*")
+    }
+    assert network.list_stale_boundaries(state_root=state) == ["fb0123456789ab"]
+    after = {
+        str(path.relative_to(state)): (
+            path.is_dir(),
+            path.read_bytes() if path.is_file() else None,
+            path.lstat().st_mtime_ns,
+        )
+        for path in state.rglob("*")
+    }
+    assert after == before

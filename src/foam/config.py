@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from collections.abc import MutableMapping
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -89,6 +90,61 @@ def load_config(home: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def inspect_config(home: Path) -> dict:
+    """严格只读检查配置文件;原样数据与敏感值仅供诊断层内部脱敏使用。"""
+    path = _config_path(home)
+    result = {
+        "path": str(path),
+        "exists": False,
+        "data": {},
+        "error": None,
+        "mode": None,
+        "suspicious_keys": [],
+        "secret_values": [],
+    }
+    try:
+        text = path.read_text(encoding="utf-8")
+        info = path.stat()
+    except FileNotFoundError:
+        return result
+    except (OSError, UnicodeError) as exc:
+        result["exists"] = True
+        result["error"] = f"读取失败:{exc}"
+        return result
+    result["exists"] = True
+    result["mode"] = stat.S_IMODE(info.st_mode)
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        result["error"] = f"JSON 解析失败:{exc}"
+        return result
+    if not isinstance(data, dict):
+        result["error"] = "顶层不是对象"
+        return result
+    result["data"] = data
+    suspicious_keys = []
+    secret_values = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(key, str) and re.search(
+                    "key|token|secret|password", key, re.IGNORECASE
+                ):
+                    suspicious_keys.append(key)
+                    if isinstance(child, str) and child:
+                        secret_values.append(child)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    result["suspicious_keys"] = sorted(set(suspicious_keys))
+    result["secret_values"] = secret_values
+    return result
 
 
 def save_config(home: Path, data: dict) -> None:
@@ -179,6 +235,32 @@ def load_dotenv(
         environ[key] = value
         injected.append(key)
     return injected, warnings
+
+
+def dotenv_secret_values(path: Path) -> list[str]:
+    """只读提取敏感键的值供脱敏使用;不注入环境、不返回键值给展示层。"""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    values = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, separator, raw_value = line.partition("=")
+        key = key.strip()
+        if (
+            separator
+            and _KEY_RE.fullmatch(key)
+            and re.search("key|token|secret|password", key, re.IGNORECASE)
+        ):
+            value = _parse_dotenv_value(raw_value)
+            if value:
+                values.append(value)
+    return values
 
 
 def validate_profile_name(name: str) -> str | None:

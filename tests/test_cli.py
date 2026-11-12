@@ -32,6 +32,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1700,3 +1701,58 @@ def test_r12_budget_stop_resume_expand_and_evidence(tmp_path, capsys):
     assert records[-1]["payload"]["budget"]["total_tokens"] == 14
     assert json.loads((workdir / "engagement.json").read_text())["status"] == "closed"
     assert verify(workdir / "audit.jsonl")
+
+
+def test_resolve_backend_args_output_and_values_regression(
+    tmp_path, monkeypatch, capsys
+):
+    """R13-B:纯解析抽取前后,wrapper 的回填、可见性行和非法 backend 警告不变。"""
+    from foam.cli import resolve_backend_args
+
+    monkeypatch.delenv("FOAM_LLM_MODEL", raising=False)
+    monkeypatch.delenv("FOAM_LLM_BASE_URL", raising=False)
+    config = tmp_path / ".foam" / "config.json"
+    config.parent.mkdir()
+    config.write_text(
+        json.dumps(
+            {
+                "active_profile": "saved",
+                "profiles": {
+                    "saved": {
+                        "backend": "openai_compat",
+                        "model": "k3-profile",
+                        "base_url": "https://example.com/v1",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(backend=None, model=None, base_url=None, profile=None)
+    resolve_backend_args(args)
+    assert (args.backend, args.model, args.base_url) == (
+        "openai_compat",
+        "k3-profile",
+        "https://example.com/v1",
+    )
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "[config] profile 'saved':backend=openai_compat model=k3-profile "
+        "base_url=https://example.com/v1\n"
+    )
+    assert captured.err == ""
+
+    data = json.loads(config.read_text())
+    data["profiles"]["saved"]["backend"] = "invalid"
+    config.write_text(json.dumps(data), encoding="utf-8")
+    args = SimpleNamespace(backend=None, model=None, base_url=None, profile=None)
+    resolve_backend_args(args)
+    assert args.backend == "openai_compat"
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "[config] profile 'saved':model=k3-profile base_url=https://example.com/v1\n"
+    )
+    assert captured.err == (
+        "[config] 警告:profile 'saved' 的 backend 值「invalid」非法"
+        "(仅支持 openai_compat/claude,已忽略该键)\n"
+    )
