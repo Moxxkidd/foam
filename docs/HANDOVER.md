@@ -1321,3 +1321,17 @@ WP-13(整合)依赖全部
   全绿：**1003 passed, 41 skipped in 245.17s**，ruff 全绿、diff 无输出；针对性
   高负载组合出现的已知 R13 间歇项已如实记录，未修改。候选尚未提交、打 tag 或发布；
   提交后干净树三门、五 job CI、构建、隔离安装与组合旅程仍待实际执行。
+
+
+## 当前状态（2026-11-13：v0.2.0 候选 CI 未通过，发布停止）
+
+- 候选提交 `50223f6a013f59a6a4ab1653ab458f3892383da7` 已推送 main；该 SHA
+  干净树完整三门实际为 **1003 passed, 41 skipped in 249.29s**、ruff
+  **All checks passed!**、diff 无输出。
+- CI <https://github.com/Moxxkidd/foam/actions/runs/43388961156> 已结束为 failure：
+  ruff job 成功；四个 pytest job 均因 `test_status_pid_reuse_and_stale` 的已知
+  时间敏感间歇问题失败，各为 **1 failed, 1003 passed, 40 skipped**。未修改、
+  skip 或弱化该用例，也不以历史 CI 替代。
+- 按“任何验收失败不得发布”停止：未构建发布资产，未做隔离安装/组合发布验收，
+  未创建 annotated `v0.2.0`、draft 或 GitHub release。R29-B 与父 R29 仍暂缓，
+  AC01–AC04 未勾；根目录既有 zip 未纳入。
