@@ -192,6 +192,7 @@ def build_system_prompt(
     *,
     workdir: str | Path,
     tool_map_text: str | None = None,
+    execution_mode: str = "legacy",
 ) -> str:
     """构造 system prompt。
 
@@ -199,7 +200,8 @@ def build_system_prompt(
     ENGAGEMENT.md 动态段;WP-14d 过渡形参 scope/source/loaded_at 已删)。
 
     - ``workdir``:engagement 目录(提示词中给出绝对路径与 ENGAGEMENT.md 位置);
-    - ``tool_map_text``:WP-08 工具地图注入点;None 时输出占位说明。
+    - ``tool_map_text``:WP-08 工具地图注入点;None 时输出占位说明;
+    - ``execution_mode``:既有入口配置;protected 才附执行能力边界。
     """
     workdir = Path(workdir)
     tool_map_section = (
@@ -207,6 +209,13 @@ def build_system_prompt(
         if tool_map_text and tool_map_text.strip()
         else f"{_TOOL_MAP_HEADER}\n\n{TOOL_MAP_PLACEHOLDER}"
     )
+    if execution_mode == "protected":
+        tool_map_section += (
+            "\n\n当前执行模式:execution_mode=protected\n"
+            "- 不支持 raw socket/AF_PACKET 类扫描;\n"
+            "- 不支持入站监听(反弹 shell、handler 等);\n"
+            "- scope 仅支持 CIDR,主机名/通配域/URL 不进入 protected 网络边界。"
+        )
     return _SYSTEM_TEMPLATE.format(
         engagement_path=workdir / ENGAGEMENT_FILENAME,
         workdir=workdir,

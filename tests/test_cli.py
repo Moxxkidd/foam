@@ -516,6 +516,44 @@ def test_protected_run_creation_failure_never_falls_back(
     assert "TESTONLY protected unsupported" in capsys.readouterr().err
 
 
+def test_cli_protected_prompt_contains_execution_boundaries(tmp_path, monkeypatch):
+    from foam.guard.network import NetworkBoundary
+
+    class Boundary:
+        boundary_id = "b-cli-prompt"
+        epoch = 1
+
+        def capabilities(self):
+            return {"boundary_id": self.boundary_id, "epoch": self.epoch}
+
+        def aclose(self):
+            return {"cleanup_status": "clean", "remaining_resources": [], "errors": []}
+
+    monkeypatch.setattr(NetworkBoundary, "create", lambda *_args, **_kwargs: Boundary())
+    backend = FakeBackend([FINISH])
+    scope_file = write_scope(tmp_path, "127.0.0.0/8\n")
+    rc = cli_main(
+        [
+            "run",
+            "--execution-mode",
+            "protected",
+            "--scope",
+            str(scope_file),
+            "--objective",
+            "检查 prompt",
+            "--workdir",
+            str(tmp_path / "eng"),
+        ],
+        backend_factory=lambda _args: backend,
+    )
+    assert rc == 0
+    prompt = backend.calls[0][0].content
+    assert "execution_mode=protected" in prompt
+    assert "raw socket/AF_PACKET" in prompt
+    assert "入站监听" in prompt
+    assert "scope 仅支持 CIDR" in prompt
+
+
 @pytest.mark.skipif(
     sys.platform == "linux" and os.geteuid() == 0,
     reason="真实 unsupported 验收只在 macOS 或非 root Linux 运行",

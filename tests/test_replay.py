@@ -941,3 +941,49 @@ def test_report_redacted_view_masks_creds_only(tmp_path):
     assert "## 凭证(全值)" in default
     assert SECRET_VALUE in default
     assert MASKED_FORM not in default
+
+
+# ---------------------------------------------------------------------------
+# R14-D:能力失败与重复阻断统计
+# ---------------------------------------------------------------------------
+
+
+def test_audit_stats_counts_capability_failures_and_blocked():
+    records = [
+        {
+            "kind": "exec_result_meta",
+            "payload": {
+                "tool": "nmap",
+                "failure_category": "raw_socket",
+                "failure_count": 1,
+            },
+        },
+        {
+            "kind": "exec_result_meta",
+            "payload": {
+                "tool": "nmap",
+                "failure_category": "raw_socket",
+                "failure_count": 2,
+            },
+        },
+        {
+            "kind": "loop_correction",
+            "payload": {
+                "reason": "capability_failure_retry_blocked",
+                "tool": "nmap",
+                "failure_category": "raw_socket",
+                "failure_count": 2,
+            },
+        },
+    ]
+    stats = audit_stats(records)
+    assert stats["capability_failures"] == 2
+    assert stats["capability_retry_blocked"] == 1
+    assert stats["capability_failure:nmap:raw_socket"] == 2
+    assert stats["capability_retry_blocked:nmap:raw_socket"] == 1
+
+    legacy = audit_stats([])
+    assert legacy["capability_failures"] == 0
+    assert legacy["capability_retry_blocked"] == 0
+    assert not any(key.startswith("capability_failure:") for key in legacy)
+    assert not any(key.startswith("capability_retry_blocked:") for key in legacy)

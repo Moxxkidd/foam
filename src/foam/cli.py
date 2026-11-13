@@ -862,6 +862,7 @@ def _assemble_runtime(
     system_prompt = build_system_prompt(
         workdir=engagement.paths.root,
         tool_map_text=render_tool_map(scan),
+        execution_mode=args.execution_mode,
     )
     loop_kwargs: dict[str, Any] = {}
     if args.max_context_tokens is not None:

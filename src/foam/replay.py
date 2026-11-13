@@ -345,6 +345,7 @@ def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
     R07 增量:``session_ops``(会话操作总数,一条记录 = 一次调用,成功/失败/
     取消都计)、``session_prompts``(提示检测数),并按
     ``session_op:{op}:{outcome}`` 扁平键给出分解(仅出现过的组合在场)。
+    R14-D 另计真实能力失败与 blocked,并按 tool/category 给扁平分解;旧链为零。
     """
     stats = {
         "runs": 0,
@@ -356,6 +357,8 @@ def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
         "refusals": 0,
         "session_ops": 0,
         "session_prompts": 0,
+        "capability_failures": 0,
+        "capability_retry_blocked": 0,
     }
     for record in records:
         kind = record.get("kind")
@@ -373,6 +376,23 @@ def audit_stats(records: list[dict[str, Any]]) -> dict[str, int]:
             stats["kills"] += 1
         elif kind == KIND_REFUSAL_DETECTED:
             stats["refusals"] += 1
+        elif kind == KIND_EXEC_RESULT_META:
+            payload = record.get("payload") or {}
+            tool = payload.get("tool")
+            category = payload.get("failure_category")
+            if tool and category:
+                stats["capability_failures"] += 1
+                key = f"capability_failure:{tool}:{category}"
+                stats[key] = stats.get(key, 0) + 1
+        elif kind == KIND_LOOP_CORRECTION:
+            payload = record.get("payload") or {}
+            if payload.get("reason") == "capability_failure_retry_blocked":
+                stats["capability_retry_blocked"] += 1
+                key = (
+                    f"capability_retry_blocked:{payload.get('tool')}:"
+                    f"{payload.get('failure_category')}"
+                )
+                stats[key] = stats.get(key, 0) + 1
         elif kind == KIND_SESSION_OP:
             stats["session_ops"] += 1
             payload = record.get("payload") or {}

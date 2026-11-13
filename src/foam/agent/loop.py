@@ -37,6 +37,7 @@ import dataclasses
 import hashlib
 import json
 import re
+import shlex
 import sqlite3
 import time
 import uuid
@@ -175,6 +176,42 @@ def _is_historical_summary(text: str, messages: Sequence[Message]) -> bool:
             continue
         return True
     return False
+
+
+_PERMISSION_FAILURE_RE = re.compile(r"operation not permitted|permission denied", re.I)
+
+
+def _capability_command(command: str) -> dict[str, str] | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    tool = Path(tokens[0]).name
+    if tool == "nmap" and any(flag in tokens for flag in ("-sS", "-sU", "-O")):
+        return {
+            "tool": tool,
+            "category": "raw_socket",
+            "reason": (
+                "protected 执行边界不支持 raw socket/AF_PACKET；这是能力/权限限制,"
+                "不表示目标不存在或 scope 拒绝。"
+            ),
+            "retry_policy": "require_operator_interjection",
+        }
+    if tool in {"nc", "ncat"} and any(
+        flag in tokens for flag in ("-l", "-lvnp")
+    ):
+        return {
+            "tool": tool,
+            "category": "inbound_listen",
+            "reason": (
+                "protected 执行边界不支持入站监听；这是能力/权限限制,"
+                "不表示目标不存在或 scope 拒绝。"
+            ),
+            "retry_policy": "require_operator_interjection",
+        }
+    return None
 
 
 _CLAIM_CORRECTION_TEXT = (
@@ -524,6 +561,8 @@ class AgentLoop:
         self._dispatch_gate = asyncio.Event()
         self._dispatch_gate.set()
         self._executor = getattr(bash, "executor", None)
+        self._capability_retry_blocked: set[tuple[str, str]] = set()
+        self._capability_failure_counts: dict[tuple[str, str], int] = {}
         if (
             session is not None
             and self._executor is not None
@@ -1030,6 +1069,18 @@ class AgentLoop:
 
     # ---------- 工具执行 ----------
 
+    def _protected_capability_error(
+        self, command: str, result: dict[str, Any]
+    ) -> dict[str, str] | None:
+        if self._executor.capabilities().get("execution_mode") != "protected":
+            return None
+        evidence = " ".join(
+            str(result.get(key) or "") for key in ("output_view", "error")
+        )
+        if not _PERMISSION_FAILURE_RE.search(evidence):
+            return None
+        return _capability_command(command)
+
     async def _execute_tool(self, call: ToolCall) -> dict[str, Any]:
         await self._dispatch_gate.wait()
         # R03 停止派发闸:终态后不再执行任何工具(防线;正常流程到不了这里,
@@ -1050,12 +1101,46 @@ class AgentLoop:
                     "violations": list(decision.violations),
                     "reason": decision.reason,
                 }
+            if self._executor.capabilities().get("execution_mode") == "protected":
+                candidate = _capability_command(command)
+                key = (
+                    (candidate["tool"], candidate["category"])
+                    if candidate is not None
+                    else None
+                )
+                if key is not None and key in self._capability_retry_blocked:
+                    self._audit.append(
+                        KIND_LOOP_CORRECTION,
+                        {
+                            "reason": "capability_failure_retry_blocked",
+                            "tool": candidate["tool"],
+                            "failure_category": candidate["category"],
+                            "failure_count": self._capability_failure_counts[key],
+                        },
+                    )
+                    return {
+                        "status": "capability_retry_blocked",
+                        "error": (
+                            "同类 protected 能力失败已发生；无新信息不重复真实派发。"
+                            "请等待明确 operator 插话。"
+                        ),
+                        "capability_error": candidate,
+                    }
         if call.name in SESSION_TOOL_NAMES:
             # R07:会话五工具逐条 session_op 审计(成功/失败/取消)
             return await self._execute_session_tool(call)
         result = await self._registry.dispatch(call.name, call.arguments)
-        if call.name == "run_command" and "error" not in result:
+        if call.name == "run_command":
             result = dict(result)
+            failure = self._protected_capability_error(command, result)
+            if failure is not None:
+                result["capability_error"] = failure
+                key = (failure["tool"], failure["category"])
+                self._capability_failure_counts[key] = (
+                    self._capability_failure_counts.get(key, 0) + 1
+                )
+                self._capability_retry_blocked.add(key)
+        if call.name == "run_command" and "error" not in result:
             note = describe_exit_code(result.get("exit_code"))
             if note:
                 result["exit_note"] = note
@@ -1074,6 +1159,12 @@ class AgentLoop:
             }
             if parsed_meta is not None:
                 payload["parsed"] = parsed_meta
+            failure = result.get("capability_error")
+            if isinstance(failure, dict):
+                key = (failure["tool"], failure["category"])
+                payload["tool"] = failure["tool"]
+                payload["failure_category"] = failure["category"]
+                payload["failure_count"] = self._capability_failure_counts[key]
             self._audit.append(KIND_EXEC_RESULT_META, payload)
         return result
 
@@ -1404,6 +1495,7 @@ class AgentLoop:
                 {"text": text, "operator": self._operator},  # WP-09:呼号入载荷
             )
             self._messages.append(Message.user(f"【操作员插话】{text}"))
+            self._capability_retry_blocked.clear()
 
     async def _pause_if_requested(self) -> None:
         if not (self._pause_requested and not self._kill_requested):

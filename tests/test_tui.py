@@ -2905,6 +2905,42 @@ async def test_tui_displays_execution_capabilities_and_cleans_boundary(
             assert boundary.closed
 
 
+async def test_tui_protected_prompt_contains_execution_boundaries(
+    tmp_path, monkeypatch
+):
+    from foam.guard.network import NetworkBoundary
+
+    class Boundary:
+        boundary_id = "b-tui-prompt"
+        epoch = 1
+
+        def capabilities(self):
+            return {"boundary_id": self.boundary_id, "epoch": self.epoch}
+
+        def aclose(self):
+            return {"cleanup_status": "clean", "remaining_resources": [], "errors": []}
+
+    monkeypatch.setattr(NetworkBoundary, "create", lambda *_args, **_kwargs: Boundary())
+    config = make_config(
+        tmp_path,
+        [[TextDelta("done"), Usage(1, 1)]],
+        execution_mode="protected",
+        scope=parse_scope("127.0.0.0/8\n"),
+        scope_bytes=b"127.0.0.0/8\n",
+    )
+    Path(config.scope_source).write_bytes(config.scope_bytes)
+    app = TuiApp(config)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        assert app._final_result.status == "finished"
+        prompt = config.backend.calls[0][0].content
+        assert "execution_mode=protected" in prompt
+        assert "raw socket/AF_PACKET" in prompt
+        assert "入站监听" in prompt
+        assert "scope 仅支持 CIDR" in prompt
+
+
 async def test_tui_protected_narrowing_failure_stops_run_without_success(
     tmp_path, monkeypatch
 ):

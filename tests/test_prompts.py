@@ -280,3 +280,19 @@ def test_engagement_template_and_message_wrapper():
     assert template.strip() in wrapped
     # 空内容有兜底
     assert "(空)" in build_engagement_message("  ")
+
+
+def test_protected_prompt_states_execution_boundaries():
+    protected = build_system_prompt(execution_mode="protected", **FIXED)
+    for expected in (
+        "execution_mode=protected",
+        "raw socket/AF_PACKET",
+        "入站监听",
+        "scope 仅支持 CIDR",
+    ):
+        assert expected in protected
+    legacy = build_system_prompt(execution_mode="legacy", **FIXED)
+    assert "execution_mode=protected" not in legacy
+    assert "raw socket/AF_PACKET" not in legacy
+    assert "入站监听" not in legacy
+    assert "scope 仅支持 CIDR" not in legacy

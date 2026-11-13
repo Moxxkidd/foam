@@ -908,6 +908,336 @@ async def test_job_exit_audit_preserves_timeout_metadata(tmp_path):
     assert payload["quiet_seconds"] >= 0
 
 
+# ---------------------------------------------------------------------------
+# R14-D:protected 能力失败解释与重试边界
+# ---------------------------------------------------------------------------
+
+
+class _CapabilityBoundary:
+    boundary_id = "b-capability-fake"
+    epoch = 1
+
+    def capabilities(self):
+        return {"boundary_id": self.boundary_id, "epoch": self.epoch}
+
+    def retire_generation(self):
+        return None
+
+    def apply_scope(self, _scope, **_kwargs):
+        self.epoch += 1
+
+
+def make_capability_loop(
+    tmp_path,
+    script,
+    *,
+    protected=True,
+    output_text="Operation not permitted",
+    observer=None,
+):
+    """用公开构造器组合 AgentLoop 与 fake 权限结果;不执行真实扫描。"""
+    from foam.tools.execution import ToolExecutor
+
+    scope = parse_scope(SCOPE_TEXT)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    audit.append(KIND_SCOPE_LOADED, scope_payload(scope, "test.scope"))
+    boundary = _CapabilityBoundary() if protected else None
+    bash = BashTool(
+        tmp_path / "outputs", executor=ToolExecutor(boundary=boundary)
+    )
+    backend = FakeBackend(script)
+    dispatch_calls = []
+
+    async def fake_run(arguments):
+        dispatch_calls.append(dict(arguments))
+        return {
+            "job_id": "fake01",
+            "status": "completed",
+            "exit_code": 1,
+            "duration_ms": 5,
+            "output_view": output_text,
+            "output_path": str(tmp_path / "fake.log"),
+            "sha256": None,
+            "total_bytes": len(output_text.encode()),
+        }
+
+    registry = ToolRegistry()
+    schema = next(item for item in TOOL_SCHEMAS if item["name"] == "run_command")
+    registry.register(schema, fake_run)
+    loop = AgentLoop(
+        backend=backend,
+        bash=bash,
+        scope=scope,
+        audit=audit,
+        workdir=tmp_path,
+        system_prompt="TESTONLY",
+        registry=registry,
+        observer=observer,
+    )
+    return SimpleNamespace(
+        loop=loop,
+        backend=backend,
+        audit=audit,
+        audit_path=tmp_path / "audit.jsonl",
+        dispatch_calls=dispatch_calls,
+    )
+
+
+async def test_protected_raw_scan_failure_explained(tmp_path):
+    command = "nmap -sS 127.0.0.1"
+    env = make_capability_loop(
+        tmp_path / "protected",
+        [
+            [ToolCall("tc-raw", "run_command", {"command": command}), Usage(1, 1)],
+            [TextDelta("停止"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("raw 权限失败")
+    assert result.status == "finished"
+    assert len(env.dispatch_calls) == 1
+    payload = json.loads(tool_messages(env, "tc-raw")[0].content)
+    assert payload["output_view"] == "Operation not permitted"
+    assert payload["exit_code"] == 1
+    assert payload["output_path"].endswith("fake.log")
+    failure = payload["capability_error"]
+    assert failure["tool"] == "nmap"
+    assert failure["category"] == "raw_socket"
+    assert "protected" in failure["reason"]
+    assert "不表示目标不存在" in failure["reason"]
+    assert "scope" in failure["reason"]
+    assert failure["retry_policy"] == "require_operator_interjection"
+    assert "legacy" not in failure["reason"]
+
+    legacy = make_capability_loop(
+        tmp_path / "legacy",
+        [
+            [ToolCall("tc-raw", "run_command", {"command": command}), Usage(1, 1)],
+            [TextDelta("停止"), Usage(1, 1)],
+        ],
+        protected=False,
+    )
+    await legacy.loop.run("legacy 对照")
+    legacy_payload = json.loads(tool_messages(legacy, "tc-raw")[0].content)
+    assert "capability_error" not in legacy_payload
+
+    ordinary = make_capability_loop(
+        tmp_path / "ordinary",
+        [
+            [
+                ToolCall(
+                    "tc-normal",
+                    "run_command",
+                    {"command": "nmap -sV 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("停止"), Usage(1, 1)],
+        ],
+        output_text="Host unreachable",
+    )
+    await ordinary.loop.run("普通失败对照")
+    ordinary_payload = json.loads(tool_messages(ordinary, "tc-normal")[0].content)
+    assert "capability_error" not in ordinary_payload
+
+
+async def test_protected_inbound_permission_failure_explained(tmp_path):
+    env = make_capability_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-listen",
+                    "run_command",
+                    {"command": "nc -lvnp 4444"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("停止"), Usage(1, 1)],
+        ],
+        output_text="Permission denied",
+    )
+    result = await env.loop.run("入站权限失败")
+    assert result.status == "finished"
+    assert len(env.dispatch_calls) == 1
+    payload = json.loads(tool_messages(env, "tc-listen")[0].content)
+    assert payload["output_view"] == "Permission denied"
+    assert payload["exit_code"] == 1
+    failure = payload["capability_error"]
+    assert failure["tool"] == "nc"
+    assert failure["category"] == "inbound_listen"
+    assert "入站监听" in failure["reason"]
+    assert "不表示目标不存在" in failure["reason"]
+    assert failure["retry_policy"] == "require_operator_interjection"
+    assert "legacy" not in failure["reason"]
+
+
+async def test_protected_capability_retry_blocked_and_scope_stays_first(tmp_path):
+    """同工具/能力类别改参数也阻断;后续越界命令仍由 scope 优先拒绝。"""
+    env = make_capability_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-raw-1",
+                    "run_command",
+                    {"command": "nmap -sS 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            [
+                ToolCall(
+                    "tc-raw-2",
+                    "run_command",
+                    {"command": "nmap -sS -p 80 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            [
+                ToolCall(
+                    "tc-outside",
+                    "run_command",
+                    {"command": "nmap -sS 8.8.8.8"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("停止"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("能力去重与 scope 优先")
+    assert result.status == "finished"
+    assert len(env.dispatch_calls) == 1
+    blocked = json.loads(tool_messages(env, "tc-raw-2")[0].content)
+    assert blocked["status"] == "capability_retry_blocked"
+    assert blocked["capability_error"]["category"] == "raw_socket"
+    outside = json.loads(tool_messages(env, "tc-outside")[0].content)
+    assert outside["status"] == "denied_by_scope_guard"
+    assert outside["violations"] == ["8.8.8.8"]
+    corrections = [
+        record
+        for record in audit_records(env)
+        if record["kind"] == "loop_correction"
+        and record["payload"]["reason"] == "capability_failure_retry_blocked"
+    ]
+    assert len(corrections) == 1
+
+
+async def test_capability_retry_requires_operator_interjection_not_scope_swap(tmp_path):
+    """scope 热换不算新信息;非空 operator 插话才清除阻断而非历史。"""
+    class RetryObserver(LoopObserver):
+        def __init__(self):
+            self.loop = None
+            self.sent = False
+
+        def on_tool_result(self, _name, result):
+            if (
+                result.get("status") == "capability_retry_blocked"
+                and not self.sent
+            ):
+                self.sent = True
+                self.loop.interject("operator 提供新的执行信息")
+
+    observer = RetryObserver()
+    holder = {}
+
+    async def retry_after_scope_swap(_messages):
+        await holder["env"].loop.replace_scope(parse_scope(SCOPE_TEXT))
+        return [
+            ToolCall(
+                "tc-after-swap",
+                "run_command",
+                {"command": "nmap -sS -p 80 127.0.0.1"},
+            ),
+            Usage(1, 1),
+        ]
+
+    env = make_capability_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-first",
+                    "run_command",
+                    {"command": "nmap -sS 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            retry_after_scope_swap,
+            [
+                ToolCall(
+                    "tc-after-interjection",
+                    "run_command",
+                    {"command": "nmap -sS -p 443 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("停止"), Usage(1, 1)],
+        ],
+        observer=observer,
+    )
+    holder["env"] = env
+    observer.loop = env.loop
+    result = await env.loop.run("新信息边界")
+    assert result.status == "finished"
+    assert len(env.dispatch_calls) == 2
+    corrections = [
+        record
+        for record in audit_records(env)
+        if record["kind"] == "loop_correction"
+        and record["payload"]["reason"] == "capability_failure_retry_blocked"
+    ]
+    assert len(corrections) == 1
+    interjections = [
+        record
+        for record in audit_records(env)
+        if record["kind"] == "operator_interject"
+    ]
+    assert len(interjections) == 1
+
+
+async def test_capability_failure_audit_counts_real_failures_not_blocked(tmp_path):
+    env = make_capability_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-real-failure",
+                    "run_command",
+                    {"command": "nmap -sS 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            [
+                ToolCall(
+                    "tc-blocked",
+                    "run_command",
+                    {"command": "nmap -sS -p 80 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta("停止"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("能力失败计数")
+    assert result.status == "finished"
+    assert len(env.dispatch_calls) == 1
+    records = audit_records(env)
+    exec_meta = [
+        record for record in records if record["kind"] == "exec_result_meta"
+    ]
+    assert len(exec_meta) == 1
+    payload = exec_meta[0]["payload"]
+    assert payload["tool"] == "nmap"
+    assert payload["failure_category"] == "raw_socket"
+    assert payload["failure_count"] == 1
+    blocked = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "loop_correction"
+        and record["payload"]["reason"] == "capability_failure_retry_blocked"
+    )
+    assert blocked["failure_count"] == 1
+
+
 async def test_malformed_tool_call_fed_back(tmp_path):
     malformed = MalformedToolCallError(
         "[fake] 工具 'run_command' 的参数不是合法 JSON",

@@ -289,6 +289,7 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
         prompt = build_system_prompt(
             workdir=engagement.paths.root,
             tool_map_text=render_tool_map(scan_tools()),
+            execution_mode=config.execution_mode,
         )
         heartbeat = HeartbeatWriter(
             engagement.paths.root, run_id="", entry="tui"

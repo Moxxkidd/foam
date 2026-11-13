@@ -1271,3 +1271,16 @@ WP-13(整合)依赖全部
 - AC04/AC05 已核销，D 未开始，父 R14 进行中；不改 A/B、scope、R11/R28/R29，
   不做 R16 状态模型。R13 时间敏感间歇失败保留为残余风险，本轮未触发、未修改；
   下一步仅在授权下进入 R14-D，未打 tag、未发布，调试 zip 继续排除。
+
+
+## 当前状态（2026-11-13：R14-D 与父 R14 完成）
+
+- [R14-D](items/R14.md) 完成 protected 工具地图、raw/入站权限解释、同工具/类别
+  无新信息去重和审计统计；scope 优先，非空 operator 插话才清阻断，热换不清。
+  CLI/TUI 均从实际执行配置传 prompt，分类只读 executor.capabilities，不改 R11。
+- 公开行为逐条红绿；移除 protected 条件和去去重两组故障均被捕获并还原。
+  最终 D 组合 **10 passed**，相关五文件 **296 passed**，R14 四文件 **359 passed**，
+  完整 **1003 passed, 41 skipped in 242.00s**，ruff/diff 全绿，无 skip。
+- AC06 与父 R14 完成；统计仅供 R30，不证明真实频率或 legacy 切换。未跑或冒充
+  Linux/Kali 集成，未改 A/B/C、scope/R11/R28/R29、R16/R30 或 R13 间歇项。
+  v0.2.0 未发布，R29-B 仍因真实 Kali 不可用而阻塞；未打 tag，zip 继续排除。
