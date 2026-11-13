@@ -541,3 +541,60 @@ def test_check_command_denies_malformed_url_not_raise():
     assert not decision.allowed
     decision = check_command("curl https://example.com:99999/", scope)
     assert not decision.allowed
+
+
+# ---------------------------------------------------------------- R14-A
+
+WP12_VERSION_NOTE_COMMAND = (
+    "cat >> engagements/wp12-scenario2-20260826/ENGAGEMENT.md << 'EOF'\n"
+    "\n"
+    "## 侦察结果(2026-08-26)\n"
+    "\n"
+    "- 目标 172.17.0.3 存活,25 个开放端口,指纹特征为 Metasploitable 2"
+    "(Ubuntu 8.04 系)。\n"
+    "- 关键服务:\n"
+    "  - 21/ftp vsftpd 2.3.4(已知笑脸后门)\n"
+    "  - 22/ssh OpenSSH 4.7p1\n"
+    "  - 445 Samba 3.0.20-Debian(usermap_script 可用)\n"
+    "  - 3632 distccd v1(命令注入 CVE-2004-2687)\n"
+    "  - 6667/6697 UnrealIRCd(3.2.8.1 后门)\n"
+    "  - 8180 Tomcat, 3306 MySQL 5.0.51a, 5432 PostgreSQL 8.3, 5900 VNC, "
+    "1524 ingreslock\n"
+    "- 攻击决策:首选 UnrealIRCd 3.2.8.1 后门"
+    "(exploit/unix/irc/unreal_ircd_3281_backdoor),稳定可靠,直接给 root shell;"
+    "备选 vsftpd_234_backdoor / distcc_exec / samba usermap_script。\n"
+    "EOF\n"
+    "echo done"
+)
+
+
+def test_version_note_does_not_trigger_scope_denial():
+    """known-issues ⑦:笔记版本号不拒命令,界内真实目标仍被提取。"""
+    scope = parse_scope("172.17.0.0/16")
+    assert extract_targets(WP12_VERSION_NOTE_COMMAND) == ["172.17.0.3"]
+    decision = check_command(WP12_VERSION_NOTE_COMMAND, scope)
+    assert decision.allowed
+    assert decision.targets == ("172.17.0.3",)
+    assert decision.violations == ()
+
+
+def test_version_text_does_not_hide_real_target():
+    """版本豁免不得吞掉同一真实命令后续参数中的界外目标。"""
+    command = WP12_VERSION_NOTE_COMMAND + "\nnmap -sV 8.8.8.8"
+    scope = parse_scope("172.17.0.0/16")
+    assert extract_targets(command) == ["172.17.0.3", "8.8.8.8"]
+    decision = check_command(command, scope)
+    assert not decision.allowed
+    assert decision.targets == ("172.17.0.3", "8.8.8.8")
+    assert decision.violations == ("8.8.8.8",)
+
+
+def test_version_text_outside_notes_remains_target():
+    """同对产品/版本在笔记外仍是目标;豁免只限已定位的笔记上下文。"""
+    scope = parse_scope("172.17.0.0/16")
+    outside = check_command(
+        "nmap -sV OpenSSH 4.7p1 UnrealIRCd 3.2.8.1", scope
+    )
+    assert not outside.allowed
+    assert outside.violations == ("4.7p1", "3.2.8.1")
+    assert check_command(WP12_VERSION_NOTE_COMMAND, scope).allowed

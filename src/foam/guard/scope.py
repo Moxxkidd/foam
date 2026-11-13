@@ -467,6 +467,35 @@ def _classify_value(value: str, *, loose_hostname: bool) -> str | None:
     return None
 
 
+_ENGAGEMENT_VERSION_PAIRS = frozenset(
+    {("openssh", "4.7p1"), ("unrealircd", "3.2.8.1")}
+)
+
+
+def _engagement_version_note_indices(tokens: list[str]) -> set[int]:
+    """历史误报两对版本 token 在 ENGAGEMENT heredoc 正文中的位置。"""
+    indices: set[int] = set()
+    for marker in range(1, len(tokens) - 1):
+        if tokens[0] != "cat" or tokens[marker] != "<<":
+            continue
+        prefix = tokens[:marker]
+        writes_engagement = any(
+            prefix[i] in {">", ">>"}
+            and i + 1 < len(prefix)
+            and Path(prefix[i + 1]).name == "ENGAGEMENT.md"
+            for i in range(len(prefix))
+        )
+        if not writes_engagement:
+            continue
+        delimiter = tokens[marker + 1]
+        i = marker + 2
+        while i < len(tokens) and tokens[i] != delimiter:
+            if (tokens[i - 1].lower(), tokens[i]) in _ENGAGEMENT_VERSION_PAIRS:
+                indices.add(i)
+            i += 1
+    return indices
+
+
 def extract_targets(command: str) -> list[str]:
     """从 shell 命令行启发式提取网络目标(IP/主机名/URL/CIDR),保持出现顺序去重。
 
@@ -476,12 +505,14 @@ def extract_targets(command: str) -> list[str]:
     - FILE_VALUE_FLAGS(``-oN`` 等)的值跳过,不参与提取;
     - 任意位置的 IP 字面量、CIDR、带 scheme 的 URL、``user@host``、
       ``host:port[/path]``、TARGET_KEYS 的 ``KEY=VALUE``;
-    - 裸位置参数中的含点主机名(``example.com``);裸单段词不提取。
+    - 裸位置参数中的含点主机名(``example.com``);裸单段词不提取;
+    - 仅 ENGAGEMENT.md heredoc 正文内已定位的两对产品/版本 token 不作为目标。
 
     ``shlex`` 分词失败(引号未闭合等)抛 ``ValueError``——无法静态解析的
     命令不得进入放行判定(fail closed)。
     """
     tokens = shlex.split(command, posix=True)
+    version_note_indices = _engagement_version_note_indices(tokens)
     targets: list[str] = []
     seen: set[str] = set()
 
@@ -497,6 +528,8 @@ def extract_targets(command: str) -> list[str]:
             continue
         if skip_next:
             skip_next = False
+            continue
+        if i in version_note_indices:
             continue
         # token 指命令行词元,非口令(S105 误报)
         if token.startswith("-") and token != "-":  # noqa: S105

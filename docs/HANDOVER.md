@@ -1232,3 +1232,16 @@ WP-13(整合)依赖全部
   遵守 root `/opt/foam` venv、受支持 wheel、sudo 四变量白名单、工具环境无密钥
   与 root 0700 产物定案。未改 scope、`_trusted_source` 或 R11，未打 tag、未发布，
   根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-13：R14-A 完成，父 R14 进行中）
+
+- [R14-A](items/R14.md) 仅豁免 ENGAGEMENT heredoc 内历史 `OpenSSH 4.7p1`、
+  `UnrealIRCd 3.2.8.1` 两对版本 token；真实界外参数、笔记外同串及其他目标判断
+  均未放宽。AC01/AC03 已核销，B/C/D 与 AC02/04/05/06 未开始，父 R14 进行中。
+- 三条公开行为逐条红绿；临时全局豁免使笔记外命令被错误放行，公开测试真实
+  捕获后已还原。最终 scope **146 passed**，R14 四文件 **340 passed**，完整
+  **974 passed, 41 skipped in 238.79s**，ruff 全绿、diff 无输出；本片无 skip。
+- 仅改 scope 提取、对应测试和状态文档，未改 `target_in_scope`、CIDR/URL/nmap、
+  R29、`_trusted_source` 或 R11。下一步仅在授权下进入 R14-B；未打 tag、未发布，
+  根目录调试 zip 继续排除。
