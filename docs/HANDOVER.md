@@ -1213,3 +1213,22 @@ WP-13(整合)依赖全部
   新增 1 个集成用例默认 opt-in，已单独通过。
 - 下一步按授权序列进入 R29-B；真实 Kali 仍待验证。提交/推送按 R13-C 执行，
   未打 tag、未发布，根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-13：R29-B 与父 R29 阻塞）
+
+- 基线 `2e58eff`。只读执行 VMware Fusion `vmrun list`，仅有 **1** 台运行中
+  VM：`Ubuntu 64 位 ARM Server 22.04.5.vmwarevm`；已登记 VM 目录也只有该
+  Ubuntu。`docker ps` 无输出（退出码 0），没有运行中容器。完整命令与原始输出
+  见 [R29](items/R29.md) 末尾。
+- 没有发现运行中且可访问的真实 Kali，裸 Kali SSH 通道仍未恢复；未下载、创建
+  或启动 VM，未认证 guest，未以 Ubuntu、macOS 或容器替代 Kali。R29-B 与父
+  R29 阻塞，AC01–AC04 保持未勾，真实 Kali 发布门槛未核销；R29-A 的 AC05
+  不变。
+- 本片无实现与可写红基线，仅做文档/环境状态变更；针对性文档验证结果见 R29，
+  不重跑无意义的全量 pytest/ruff。v0.2.0 迁移段中 `status`/`doctor` 尚待 R13
+  的过时提示已修正；README 已是最新事实，无需改动。
+- 下一步按既定序列进入 R14；只有真实 Kali VM/裸机可用时才恢复 R29-B，继续
+  遵守 root `/opt/foam` venv、受支持 wheel、sudo 四变量白名单、工具环境无密钥
+  与 root 0700 产物定案。未改 scope、`_trusted_source` 或 R11，未打 tag、未发布，
+  根目录调试 zip 继续排除。
