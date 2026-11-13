@@ -147,6 +147,36 @@ _ACTION_CLAIM_RE = re.compile(
     r"downloaded|uploaded|generated)\b)"
 )
 
+_HISTORICAL_SUMMARY_RE = re.compile(
+    r"总结|汇总|执行摘要|最终结论|结论如下|结果如下|以下为|本轮成果|不声称任何新动作"
+)
+_NEW_ACTION_INTENT_RE = re.compile(
+    r"(?:接下来|下一步|现在|马上|随后|然后|我将|我会|我准备|即将)"
+    r".{0,30}(?:执行|运行|扫描|探测|记录|保存|写入|创建|启动|获取|读取|下载|上传|收集|生成|部署)"
+)
+
+
+def _is_historical_summary(text: str, messages: Sequence[Message]) -> bool:
+    if not _HISTORICAL_SUMMARY_RE.search(text) or _NEW_ACTION_INTENT_RE.search(text):
+        return False
+    for message in messages:
+        if message.role != "tool":
+            continue
+        try:
+            result = json.loads(message.content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(result, dict) or "error" in result:
+            continue
+        if result.get("status") == "denied_by_scope_guard":
+            continue
+        exit_code = result.get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
+            continue
+        return True
+    return False
+
+
 _CLAIM_CORRECTION_TEXT = (
     "【主环自动纠正】你上一条回复声称执行了动作,但本轮没有检测到任何工具调用 "
     "tool_call。在本环境中只有真正发出工具调用才会产生动作,纯文本描述不算执行。"
@@ -785,6 +815,7 @@ class AgentLoop:
                 # finish 或幻觉执行(K3 实测:声称完成却不发 tool_call)
                 if (
                     _ACTION_CLAIM_RE.search(outcome.text)
+                    and not _is_historical_summary(outcome.text, self._messages)
                     and consecutive_claim_corrections
                     < MAX_CONSECUTIVE_CLAIM_CORRECTIONS
                 ):

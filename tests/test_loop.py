@@ -637,6 +637,168 @@ async def test_hallucination_correction_budget_then_accept(tmp_path):
     assert "exec_request" not in audit_kinds(env)  # 全程无真实执行
 
 
+# ---------------------------------------------------------------------------
+# R14-B:纯历史总结与真实工具证据
+# ---------------------------------------------------------------------------
+
+
+async def test_summary_does_not_trigger_action_claim(tmp_path):
+    """known-issues ②:真实执行后的历史总结不再多要求一次执行。"""
+    summary = "渗透任务已完成。总结如下:\n\n## 执行结果\n\n目标 127.0.0.1 侦察完毕。"
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-history",
+                    "run_command",
+                    {"command": "echo recon 127.0.0.1"},
+                ),
+                Usage(1, 1),
+            ],
+            [TextDelta(summary), Usage(2, 2)],
+        ],
+    )
+    result = await env.loop.run("总结历史侦察")
+    assert result.status == "finished"
+    assert result.summary == summary
+    assert result.rounds == 2
+    assert env.backend.chat_count == 2
+    corrections = [
+        r
+        for r in audit_records(env)
+        if r["kind"] == "loop_correction"
+        and r["payload"]["reason"] == "no_tool_call_action_claim"
+    ]
+    assert corrections == []
+    assert verify(env.audit_path)
+
+
+async def test_summary_without_tool_still_triggers_action_claim(tmp_path):
+    """总结措辞不能替代执行:无工具历史仍纠正两次后按原预算收尾。"""
+    final_text = "以下为最终结论:已完成全部工作。"
+    env = make_loop(
+        tmp_path,
+        [
+            [TextDelta("总结:已执行扫描。"), Usage(1, 1)],
+            [TextDelta("最终结论:已记录发现。"), Usage(1, 1)],
+            [TextDelta(final_text), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("无工具总结对照")
+    assert result.status == "finished"
+    assert result.summary == final_text
+    assert result.rounds == 3
+    assert env.backend.chat_count == 3
+    corrections = [
+        r
+        for r in audit_records(env)
+        if r["kind"] == "loop_correction"
+        and r["payload"]["reason"] == "no_tool_call_action_claim"
+    ]
+    assert len(corrections) == 2
+    assert "exec_request" not in audit_kinds(env)
+
+
+async def test_scope_denial_does_not_support_summary(tmp_path):
+    """scope denial 是失败反馈,不能作为历史总结的成功工具证据。"""
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall("tc-denied", "run_command", {"command": "nmap 8.8.8.8"}),
+                Usage(1, 1),
+            ],
+            [TextDelta("总结:已执行扫描并记录结果。"), Usage(1, 1)],
+            [TextDelta("核实后给出结论。"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("拒绝结果对照")
+    assert result.status == "finished"
+    assert result.summary == "核实后给出结论。"
+    assert result.rounds == 3
+    assert env.backend.chat_count == 3
+    corrections = [
+        r
+        for r in audit_records(env)
+        if r["kind"] == "loop_correction"
+        and r["payload"]["reason"] == "no_tool_call_action_claim"
+    ]
+    assert len(corrections) == 1
+    assert "exec_denied" in audit_kinds(env)
+    assert "exec_request" not in audit_kinds(env)
+
+
+@pytest.mark.parametrize("failure_kind", ["malformed", "unknown_tool", "nonzero_exit"])
+async def test_failed_tool_results_do_not_support_summary(tmp_path, failure_kind):
+    """malformed/error/非零退出都不是支持历史总结的成功工具证据。"""
+    if failure_kind == "malformed":
+        first = (
+            [TextDelta("尝试执行。")],
+            MalformedToolCallError(
+                "bad",
+                provider="fake",
+                tool_name="run_command",
+                call_id="tc-failed",
+                raw_arguments="{",
+            ),
+        )
+    elif failure_kind == "unknown_tool":
+        first = [ToolCall("tc-failed", "nonsense_tool", {}), Usage(1, 1)]
+    else:
+        first = [
+            ToolCall("tc-failed", "run_command", {"command": "bash -c 'exit 1'"}),
+            Usage(1, 1),
+        ]
+    env = make_loop(
+        tmp_path,
+        [
+            first,
+            [TextDelta("总结:已执行扫描并记录结果。"), Usage(1, 1)],
+            [TextDelta("核实后给出结论。"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("失败结果对照")
+    assert result.status == "finished"
+    assert result.summary == "核实后给出结论。"
+    assert result.rounds == 3
+    assert env.backend.chat_count == 3
+    corrections = [
+        r
+        for r in audit_records(env)
+        if r["kind"] == "loop_correction"
+        and r["payload"]["reason"] == "no_tool_call_action_claim"
+    ]
+    assert len(corrections) == 1
+
+
+async def test_new_action_after_success_still_triggers_action_claim(tmp_path):
+    """带总结措辞的新动作意图不属于纯历史总结,仍须核实工具调用。"""
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall("tc-old", "run_command", {"command": "echo old"}),
+                Usage(1, 1),
+            ],
+            [TextDelta("总结如上。下一步执行完毕后再写入报告。"), Usage(1, 1)],
+            [TextDelta("核实后给出结论。"), Usage(1, 1)],
+        ],
+    )
+    result = await env.loop.run("新动作对照")
+    assert result.status == "finished"
+    assert result.summary == "核实后给出结论。"
+    assert result.rounds == 3
+    assert env.backend.chat_count == 3
+    corrections = [
+        r
+        for r in audit_records(env)
+        if r["kind"] == "loop_correction"
+        and r["payload"]["reason"] == "no_tool_call_action_claim"
+    ]
+    assert len(corrections) == 1
+
+
 async def test_malformed_tool_call_fed_back(tmp_path):
     malformed = MalformedToolCallError(
         "[fake] 工具 'run_command' 的参数不是合法 JSON",

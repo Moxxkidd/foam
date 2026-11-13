@@ -1245,3 +1245,16 @@ WP-13(整合)依赖全部
 - 仅改 scope 提取、对应测试和状态文档，未改 `target_in_scope`、CIDR/URL/nmap、
   R29、`_trusted_source` 或 R11。下一步仅在授权下进入 R14-B；未打 tag、未发布，
   根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-13：R14-B 完成，父 R14 进行中）
+
+- [R14-B](items/R14.md) 仅在明确历史总结框架、此前真实成功工具证据且无新动作
+  意图时豁免纠正；无工具、scope denial、malformed/error、非零退出仍核实。
+  `_ACTION_CLAIM_RE` 与两次纠正预算不变，AC02 已核销，C/D 未开始。
+- 七项公开场景逐条红绿；临时以 assistant tool_call 冒充成功证据时四项失败被
+  捕获，还原后 B+预算回归 **8 passed**。最终 loop **74 passed**，R14 四文件
+  **347 passed**，完整 **981 passed, 41 skipped in 237.30s**，ruff/diff 全绿。
+- 无关 R13 时间敏感用例曾在全量/文件级失败，单例与后续复跑通过，未改无关
+  代码；最终全绿才提交。下一步仅在授权下进入 R14-C；未打 tag、未发布，
+  根目录调试 zip 继续排除。
