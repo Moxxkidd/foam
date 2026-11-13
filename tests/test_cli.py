@@ -1756,3 +1756,69 @@ def test_resolve_backend_args_output_and_values_regression(
         "[config] 警告:profile 'saved' 的 backend 值「invalid」非法"
         "(仅支持 openai_compat/claude,已忽略该键)\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# R14-C:后台运行与终态可见性
+# ---------------------------------------------------------------------------
+
+
+def test_cli_observer_shows_running_quiet_guidance():
+    out = io.StringIO()
+    observer = _CliObserver(out=out)
+    observer.on_tool_result(
+        "run_command",
+        {
+            "job_id": "quiet01",
+            "status": "running",
+            "output_view": (
+                "静默不等于挂死;无全局 idle timeout。"
+                "可等待,read_output 读取,kill_job 终止。"
+            ),
+        },
+    )
+    rendered = out.getvalue()
+    assert "静默不等于挂死" in rendered
+    assert "无全局 idle timeout" in rendered
+    assert "read_output" in rendered
+    assert "kill_job" in rendered
+
+
+def test_cli_observer_shows_background_terminal_reason_and_actions():
+    from foam.tools.bash import JobExitEvent
+
+    out = io.StringIO()
+    observer = _CliObserver(out=out)
+    for reason, timeout_reason, _expected in (
+        ("completed", None, "已完成"),
+        ("timeout", "wall_clock_deadline", "超时"),
+        ("killed", None, "终止"),
+    ):
+        observer.on_job_exit(
+            JobExitEvent(
+                event_id=f"job_exit:{reason}",
+                run_id="run-c",
+                job_id=reason,
+                command="sleep 30",
+                reason=reason,
+                exit_code=0 if reason == "completed" else -9,
+                duration_ms=1234,
+                ended_at="2026-11-13T00:00:00+00:00",
+                output_path=f"outputs/{reason}.log",
+                sha256=None,
+                stdout_path=None,
+                stdout_sha256=None,
+                stderr_path=None,
+                stderr_sha256=None,
+                total_bytes=0,
+                total_lines=0,
+                background=True,
+                timeout_seconds=0.3 if reason == "timeout" else None,
+                timeout_reason=timeout_reason,
+                quiet_seconds=1.2,
+            )
+        )
+    rendered = out.getvalue()
+    for expected in ("已完成", "超时", "终止", "1234", "read_output"):
+        assert expected in rendered
+    assert "wall_clock_deadline" in rendered

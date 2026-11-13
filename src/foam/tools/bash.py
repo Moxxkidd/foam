@@ -196,6 +196,10 @@ class JobExitEvent:
     total_bytes: int | None
     total_lines: int | None
     error: str | None = None
+    background: bool = False
+    timeout_seconds: float | None = None
+    timeout_reason: str | None = None
+    quiet_seconds: float | None = None
 
 
 @dataclass
@@ -222,6 +226,8 @@ class _Job:
     exit_event_sent: bool = False  # R06:完成事件每 job 恰一次的守卫
     done: asyncio.Event = field(default_factory=asyncio.Event)
     wait_task: asyncio.Task[None] | None = None  # 看管任务(前台/后台一律独立任务)
+    last_output_mono: float | None = None
+    ended_mono: float | None = None
 
 
 class BashTool:
@@ -350,9 +356,10 @@ class BashTool:
                 "exit_code": None,
                 "duration_ms": None,
                 "output_view": (
-                    f"已转入后台运行(job_id={job_id})。用 list_jobs 查看状态与"
-                    f"超时剩余时间,read_output 分页读取输出,kill_job 终止;"
-                    f"run 结束时未终止的 job 由 harness 统一收割。"
+                    f"已转入后台运行(job_id={job_id})。静默不等于挂死,"
+                    "无全局 idle timeout;可继续等待,用 list_jobs 查看状态、"
+                    "耗时/静默与超时剩余时间,read_output 分页读取输出,"
+                    "kill_job 终止;run 结束时未终止的 job 由 harness 统一收割。"
                 ),
                 "output_path": str(recorder.combined_path),
                 "sha256": None,
@@ -393,17 +400,36 @@ class BashTool:
             "content": page.text,
             "output_path": str(job.recorder.combined_path),
             "sha256": job.manifest.sha256 if job.manifest else None,
+            "duration_ms": job.duration_ms,
+            "quiet_seconds": self._elapsed_and_quiet(job, time.monotonic())[1],
+            "timeout_seconds": job.timeout_seconds,
+            "timeout_reason": self._timeout_reason(job),
         }
+
+    @staticmethod
+    def _elapsed_and_quiet(job: _Job, now: float) -> tuple[float, float]:
+        elapsed = (
+            job.duration_ms / 1000
+            if job.duration_ms is not None
+            else now - job.started_mono
+        )
+        end = job.ended_mono if job.ended_mono is not None else now
+        last_output = (
+            job.last_output_mono
+            if job.last_output_mono is not None
+            else job.started_mono
+        )
+        return elapsed, round(max(0.0, end - last_output), 3)
+
+    @staticmethod
+    def _timeout_reason(job: _Job) -> str | None:
+        return "wall_clock_deadline" if job.status == "timeout" else None
 
     async def list_jobs(self) -> dict[str, Any]:
         now = time.monotonic()
         entries = []
         for job in self._jobs.values():
-            elapsed = (
-                job.duration_ms / 1000
-                if job.duration_ms is not None
-                else now - job.started_mono
-            )
+            elapsed, quiet = self._elapsed_and_quiet(job, now)
             remaining = None
             if job.status == "running" and job.timeout_seconds is not None:
                 deadline = job.started_mono + job.timeout_seconds
@@ -419,7 +445,9 @@ class BashTool:
                     "exit_code": job.exit_code,
                     "background": job.background,
                     "elapsed_seconds": round(elapsed, 1),
+                    "quiet_seconds": quiet,
                     "timeout_seconds": job.timeout_seconds,
+                    "timeout_reason": self._timeout_reason(job),
                     "timeout_remaining_seconds": remaining,
                     "output_bytes_so_far": job.recorder.bytes_total,
                     "output_path": str(job.recorder.combined_path),
@@ -511,6 +539,11 @@ class BashTool:
             await self._supervise(job)
         except Exception as exc:  # 理论不到达(_supervise 已尽收);防御兜底
             job.error = f"看管异常: {exc!r}"
+            job.ended_mono = time.monotonic()
+            if job.duration_ms is None:
+                job.duration_ms = round(
+                    (job.ended_mono - job.started_mono) * 1000
+                )
             try:
                 job.manifest = job.manifest or job.recorder.finalize()
             except Exception as finalize_exc:
@@ -556,6 +589,10 @@ class BashTool:
             total_bytes=manifest.total_bytes if manifest else None,
             total_lines=manifest.total_lines if manifest else None,
             error=job.error,
+            background=job.background,
+            timeout_seconds=job.timeout_seconds,
+            timeout_reason=self._timeout_reason(job),
+            quiet_seconds=self._elapsed_and_quiet(job, time.monotonic())[1],
         )
         try:
             callback(event)
@@ -565,9 +602,17 @@ class BashTool:
 
     async def _supervise(self, job: _Job) -> None:
         """看管一个 job 到终态:喂 recorder、等退出/超时、收尾账目与视图。"""
+        def feed_stdout(chunk: bytes) -> None:
+            job.last_output_mono = time.monotonic()
+            job.recorder.feed_stdout(chunk)
+
+        def feed_stderr(chunk: bytes) -> None:
+            job.last_output_mono = time.monotonic()
+            job.recorder.feed_stderr(chunk)
+
         readers = [
-            asyncio.create_task(self._pump(job.proc.stdout, job.recorder.feed_stdout)),
-            asyncio.create_task(self._pump(job.proc.stderr, job.recorder.feed_stderr)),
+            asyncio.create_task(self._pump(job.proc.stdout, feed_stdout)),
+            asyncio.create_task(self._pump(job.proc.stderr, feed_stderr)),
         ]
         timed_out = False
         try:
@@ -602,7 +647,8 @@ class BashTool:
         else:
             job.status = "completed"
         job.exit_code = job.proc.returncode
-        job.duration_ms = round((time.monotonic() - job.started_mono) * 1000)
+        job.ended_mono = time.monotonic()
+        job.duration_ms = round((job.ended_mono - job.started_mono) * 1000)
         job.manifest = job.recorder.finalize()
         job.output_view = self._render_view(job)
         job.recorder.release_ring()  # 完结 job 释放 ring:内存只随活动 job 数增长
@@ -672,6 +718,9 @@ class BashTool:
             "status": job.status,
             "exit_code": job.exit_code,
             "duration_ms": job.duration_ms,
+            "quiet_seconds": self._elapsed_and_quiet(job, time.monotonic())[1],
+            "timeout_seconds": job.timeout_seconds,
+            "timeout_reason": self._timeout_reason(job),
             "output_view": job.output_view,
             "output_path": str(job.recorder.combined_path),
             "sha256": m.sha256 if m else None,

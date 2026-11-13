@@ -32,6 +32,7 @@ from textual.message_pump import MessagePump
 from foam.agent.backends.base import ToolCall
 from foam.agent.loop import LoopObserver
 from foam.guard.scope import GuardDecision
+from foam.tools.bash import JobExitEvent
 from foam.tools.session import mask_call_arguments
 
 
@@ -93,6 +94,14 @@ class ToolResultMsg(Message):
         super().__init__()
         self.name = name
         self.result = result
+
+
+class JobExitMsg(Message):
+    """后台 job 终态;包含耗时、静默和 wall deadline 原因。"""
+
+    def __init__(self, event: JobExitEvent) -> None:
+        super().__init__()
+        self.event = event
 
 
 class CorrectionMsg(Message):
@@ -177,6 +186,9 @@ class TuiObserver(LoopObserver):
 
     def on_tool_result(self, name: str, result: dict[str, Any]) -> None:
         self._target.post_message(ToolResultMsg(name, result))
+
+    def on_job_exit(self, event: JobExitEvent) -> None:
+        self._target.post_message(JobExitMsg(event))
 
     def on_correction(self, reason: str) -> None:
         self._target.post_message(CorrectionMsg(reason))

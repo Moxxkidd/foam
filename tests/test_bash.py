@@ -191,6 +191,109 @@ async def test_default_timeout_and_explicit_null(tmp_path):
     assert ok["status"] == "completed"
 
 
+async def test_quiet_job_not_killed_without_deadline(tool, exit_events):
+    """无 wall deadline 的完全静默任务可完成,且静默账目可见。"""
+    await tool.run_command("sleep 0.35", background=True, timeout_seconds=None)
+    [running] = (await tool.list_jobs())["jobs"]
+    assert running["status"] == "running"
+    assert running["quiet_seconds"] >= 0
+    assert running["timeout_seconds"] is None
+    assert running["timeout_reason"] is None
+
+    await _wait_events(exit_events)
+    [event] = exit_events
+    assert event.reason == "completed"  # 生存性基线:当前就不应有 idle 误杀
+    assert event.timeout_reason is None
+    assert event.quiet_seconds >= 0
+    assert event.duration_ms >= 300
+
+
+async def test_background_running_hint_mentions_quiet_and_actions(tool):
+    bg = await tool.run_command("sleep 30", background=True, timeout_seconds=None)
+    hint = bg["output_view"]
+    assert "静默不等于挂死" in hint
+    assert "无全局 idle timeout" in hint
+    assert "继续等待" in hint
+    assert "read_output" in hint
+    assert "kill_job" in hint
+    await tool.kill_job(bg["job_id"])
+
+
+async def test_job_quiet_resets_and_terminal_times_freeze(tool, exit_events):
+    """新输出只重置 quiet;elapsed 继续增长,终态后两者都冻结。"""
+    await tool.run_command(
+        "sleep 0.25; printf 'tick\\n'; sleep 0.35",
+        background=True,
+        timeout_seconds=None,
+    )
+    deadline = time.monotonic() + 5
+    while True:
+        job_id = (await tool.list_jobs())["jobs"][0]["job_id"]
+        page = await tool.read_output(job_id)
+        if "tick" in page["content"]:
+            break
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.02)
+
+    [before] = (await tool.list_jobs())["jobs"]
+    assert before["elapsed_seconds"] >= 0.2
+    assert before["quiet_seconds"] < 0.2
+    assert before["quiet_seconds"] < before["elapsed_seconds"]
+    await asyncio.sleep(0.12)
+    [after] = (await tool.list_jobs())["jobs"]
+    assert after["quiet_seconds"] > before["quiet_seconds"]
+    assert after["elapsed_seconds"] > before["elapsed_seconds"]
+
+    await _wait_events(exit_events)
+    [event] = exit_events
+    assert event.reason == "completed"
+    assert event.quiet_seconds >= 0.25
+    [terminal] = (await tool.list_jobs())["jobs"]
+    page = await tool.read_output(job_id)
+    assert page["quiet_seconds"] == terminal["quiet_seconds"]
+    assert page["duration_ms"] == event.duration_ms
+    await asyncio.sleep(0.12)
+    [later] = (await tool.list_jobs())["jobs"]
+    assert later["quiet_seconds"] == terminal["quiet_seconds"]
+    assert later["elapsed_seconds"] == terminal["elapsed_seconds"]
+
+
+async def test_wall_clock_timeout_metadata(tool, exit_events):
+    """wall deadline 与 completed/kill 在结果和 JobExitEvent 中明确区分。"""
+    done = await tool.run_command("true", background=True)
+    timed = await tool.run_command("sleep 30", background=True, timeout_seconds=0.3)
+    victim = await tool.run_command("sleep 30", background=True, timeout_seconds=None)
+    await _wait_events(exit_events, 1)
+    await tool.kill_job(victim["job_id"])
+    await _wait_events(exit_events, 3)
+    by_job = {event.job_id: event for event in exit_events}
+
+    timed_event = by_job[timed["job_id"]]
+    assert timed_event.reason == "timeout"
+    assert timed_event.timeout_reason == "wall_clock_deadline"
+    assert timed_event.timeout_seconds == 0.3
+    assert timed_event.duration_ms >= 250
+    assert timed_event.quiet_seconds >= 0
+    timed_result = await tool.kill_job(timed["job_id"])
+    assert timed_result["timeout_reason"] == "wall_clock_deadline"
+    assert timed_result["timeout_seconds"] == 0.3
+    page = await tool.read_output(timed["job_id"])
+    assert page["timeout_reason"] == "wall_clock_deadline"
+    jobs = {job["job_id"]: job for job in (await tool.list_jobs())["jobs"]}
+    assert jobs[timed["job_id"]]["timeout_reason"] == "wall_clock_deadline"
+
+    done_event = by_job[done["job_id"]]
+    assert done_event.reason == "completed"
+    assert done_event.timeout_reason is None
+    assert done_event.timeout_seconds == 1800.0
+    assert done_event.duration_ms is not None
+    killed_event = by_job[victim["job_id"]]
+    assert killed_event.reason == "killed"
+    assert killed_event.timeout_reason is None
+    assert killed_event.timeout_seconds is None
+    assert killed_event.duration_ms is not None
+
+
 # ---------- list_jobs / read_output ----------
 
 

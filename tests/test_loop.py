@@ -799,6 +799,115 @@ async def test_new_action_after_success_still_triggers_action_claim(tmp_path):
     assert len(corrections) == 1
 
 
+# ---------------------------------------------------------------------------
+# R14-C:后台终态 observer 与最小可见性
+# ---------------------------------------------------------------------------
+
+
+class _JobExitObserver(LoopObserver):
+    def __init__(self) -> None:
+        self.events = []
+        self.completed = asyncio.Event()
+
+    def on_job_exit(self, event) -> None:
+        self.events.append(event)
+        self.completed.set()
+
+
+async def test_background_exit_notifies_observer_without_index(tmp_path):
+    """index=None 不消费索引,后台 JobExitEvent 仍恰通知 observer 一次。"""
+    observer = _JobExitObserver()
+
+    async def finish_after_exit(_messages):
+        await asyncio.wait_for(observer.completed.wait(), timeout=2)
+        return [TextDelta("后台已结束"), Usage(1, 1)]
+
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-bg-exit",
+                    "run_command",
+                    {"command": "printf 'done\\n'", "background": True},
+                ),
+                Usage(1, 1),
+            ],
+            finish_after_exit,
+        ],
+        loop_kw={"observer": observer},
+    )
+    result = await env.loop.run("后台完成通知")
+    assert result.status == "finished"
+    assert len(observer.events) == 1
+    [event] = observer.events
+    assert event.background is True
+    assert event.reason == "completed"
+    assert event.run_id is not None
+    assert "job_exit" not in audit_kinds(env)  # 无索引时不应进入消费路径
+
+
+async def test_foreground_exit_does_not_duplicate_observer_notice(tmp_path):
+    """前台结果已由 on_tool_result 收卡,不再重复发后台终态通知。"""
+    observer = _JobExitObserver()
+    env = make_loop(
+        tmp_path,
+        [
+            [ToolCall("tc-fg", "run_command", {"command": "echo fg"}), Usage(1, 1)],
+            [TextDelta("前台已结束"), Usage(1, 1)],
+        ],
+        loop_kw={"observer": observer},
+    )
+    result = await env.loop.run("前台不重复通知")
+    assert result.status == "finished"
+    assert observer.events == []
+
+
+async def test_job_exit_audit_preserves_timeout_metadata(tmp_path):
+    """index 存在时消费顺序不变,job_exit 审计携带 wall deadline 账目。"""
+    from foam.state.index import Index
+
+    observer = _JobExitObserver()
+
+    async def finish_after_exit(_messages):
+        await asyncio.wait_for(observer.completed.wait(), timeout=2)
+        return [TextDelta("超时已结束"), Usage(1, 1)]
+
+    env = make_loop(
+        tmp_path,
+        [
+            [
+                ToolCall(
+                    "tc-timeout",
+                    "run_command",
+                    {
+                        "command": "sleep 30",
+                        "background": True,
+                        "timeout_seconds": 0.3,
+                    },
+                ),
+                Usage(1, 1),
+            ],
+            finish_after_exit,
+        ],
+        loop_kw={
+            "observer": observer,
+            "index": Index(tmp_path / "index.sqlite"),
+        },
+    )
+    result = await env.loop.run("超时审计")
+    assert result.status == "finished"
+    assert len(observer.events) == 1
+    records = audit_records(env)
+    kinds = [record["kind"] for record in records]
+    assert kinds.index("job_exit") < kinds.index("run_finished")
+    payload = records[kinds.index("job_exit")]["payload"]
+    assert payload["reason"] == "timeout"
+    assert payload["timeout_reason"] == "wall_clock_deadline"
+    assert payload["timeout_seconds"] == 0.3
+    assert payload["quiet_seconds"] >= 0
+
+
 async def test_malformed_tool_call_fed_back(tmp_path):
     malformed = MalformedToolCallError(
         "[fake] 工具 'run_command' 的参数不是合法 JSON",

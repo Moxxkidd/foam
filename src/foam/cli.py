@@ -242,13 +242,40 @@ class _CliObserver(LoopObserver):
             self._line(f"[result] {name}: error={result['error'][:160]}")
             return
         parts = [f"[result] {name}:"]
-        for key in ("status", "exit_code", "duration_ms", "total_bytes"):
+        for key in (
+            "status",
+            "exit_code",
+            "duration_ms",
+            "quiet_seconds",
+            "timeout_reason",
+            "total_bytes",
+        ):
             if result.get(key) is not None:
                 parts.append(f"{key}={result[key]}")
         if result.get("sha256"):
             parts.append(f"sha256={str(result['sha256'])[:12]}…")
         if result.get("exit_note"):
             parts.append(f"({result['exit_note']})")
+        self._line(" ".join(parts))
+        if result.get("status") == "running" and result.get("output_view"):
+            self._line(str(result["output_view"]))
+
+    def on_job_exit(self, event: Any) -> None:
+        label = {
+            "completed": "已完成",
+            "timeout": "超时",
+            "killed": "被终止",
+        }.get(event.reason, event.reason)
+        parts = [f"[job {event.job_id}] {label}"]
+        if event.duration_ms is not None:
+            parts.append(f"duration_ms={event.duration_ms}")
+        if event.quiet_seconds is not None:
+            parts.append(f"quiet_seconds={event.quiet_seconds}")
+        if event.timeout_seconds is not None:
+            parts.append(f"timeout_seconds={event.timeout_seconds}")
+        if event.timeout_reason is not None:
+            parts.append(f"timeout_reason={event.timeout_reason}")
+        parts.append("read_output 可读取完整产物")
         self._line(" ".join(parts))
 
     def on_correction(self, reason: str) -> None:

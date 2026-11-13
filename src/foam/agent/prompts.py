@@ -73,6 +73,8 @@ _SYSTEM_TEMPLATE = """\
   session_list 列出全部会话。能非交互完成的任务仍优先非交互写法。
 - 大输出:用 output_budget_bytes 控制返回视图;完整输出始终全量落盘(带
   sha256),需要更多内容用 read_output 按字节分页读取,不要把整文件灌进上下文。
+- 扫描事实以完整落盘产物与 read_output 分页为准,不要自行用 tail/head 截断
+  扫描原始输出;截断视图和解析摘要只作导航,不能替代完整证据。
 - 长跑命令:background=true 拿 job_id,用 list_jobs 看状态与超时剩余秒数,
   kill_job 止损。run 结束(finished/error/kill/取消)时仍未终止的进程由
   harness 统一收割:整进程组 SIGKILL、有总时间上界、无宽限期;进程组外逃逸

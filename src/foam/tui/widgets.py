@@ -232,7 +232,15 @@ def summarize_result(name: str, result: dict[str, Any]) -> tuple[str, str, str, 
         if status == "completed" and exit_code == 0:
             return "✓", "ok", f"exit 0 · {duration} · {size}", False
         if status == "timeout":
-            return "⏱", "warn", f"超时强杀 · {duration} · {size}", True
+            reason = result.get("timeout_reason") or "wall_clock_deadline"
+            deadline = result.get("timeout_seconds")
+            detail = f" · deadline {deadline}s" if deadline is not None else ""
+            return (
+                "⏱",
+                "warn",
+                f"超时强杀({reason}){detail} · {duration} · {size}",
+                True,
+            )
         if status == "killed":
             return "⚠", "warn", f"被终止 · {duration} · {size}", True
         note = result.get("exit_note") or ""
@@ -557,10 +565,17 @@ class SidebarPane(VerticalScroll):
             elapsed = job.get("elapsed_seconds", "?")
             remaining = job.get("timeout_remaining_seconds")
             tail = f" 剩{remaining:.0f}s" if isinstance(remaining, float) else ""
+            quiet = job.get("quiet_seconds")
+            quiet_tail = (
+                f" · 静默{quiet}s(非 idle timeout)"
+                if job.get("status") == "running"
+                and isinstance(quiet, int | float)
+                else ""
+            )
             if index:
                 text.append("\n")
             text.append(f"{marker} {command}", style=style)
-            text.append(f"  {elapsed}s{tail}", style="dim")
+            text.append(f"  {elapsed}s{tail}{quiet_tail}", style="dim")
         target.update(text)
 
     def set_sessions(self, sessions: list[dict[str, Any]]) -> None:

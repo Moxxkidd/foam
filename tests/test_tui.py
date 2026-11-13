@@ -3698,3 +3698,96 @@ async def test_tui_heartbeat_alive_and_closed(tmp_path):
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# R14-C:后台终态与静默可见性
+# ---------------------------------------------------------------------------
+
+
+async def test_tui_background_exit_notice_shows_reason_duration_and_actions(tmp_path):
+    from foam.tools.bash import JobExitEvent
+    from foam.tui.bridge import JobExitMsg
+
+    app = TuiApp(make_config(tmp_path, []))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        for reason, timeout_reason in (
+            ("completed", None),
+            ("timeout", "wall_clock_deadline"),
+            ("killed", None),
+        ):
+            event = JobExitEvent(
+                event_id=f"job_exit:{reason}",
+                run_id="run-c",
+                job_id=reason,
+                command="sleep 30",
+                reason=reason,
+                exit_code=0 if reason == "completed" else -9,
+                duration_ms=1234,
+                ended_at="2026-11-13T00:00:00+00:00",
+                output_path=f"outputs/{reason}.log",
+                sha256=None,
+                stdout_path=None,
+                stdout_sha256=None,
+                stderr_path=None,
+                stderr_sha256=None,
+                total_bytes=0,
+                total_lines=0,
+                background=True,
+                timeout_seconds=0.3 if reason == "timeout" else None,
+                timeout_reason=timeout_reason,
+                quiet_seconds=1.2,
+            )
+            main.on_job_exit_msg(JobExitMsg(event))
+        await pilot.pause(0.1)
+        content = "\n".join(
+            block.content for block in narrative_blocks(main, NoticeBlock)
+        )
+        for expected in (
+            "已完成",
+            "超时",
+            "被终止",
+            "1234",
+            "wall_clock_deadline",
+            "read_output",
+        ):
+            assert expected in content
+
+
+async def test_tui_running_job_sidebar_shows_quiet_not_idle_timeout(tmp_path):
+    app = TuiApp(make_config(tmp_path, []))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        main.sidebar.set_jobs(
+            [
+                {
+                    "job_id": "quiet01",
+                    "command": "sleep 30",
+                    "status": "running",
+                    "elapsed_seconds": 12.0,
+                    "quiet_seconds": 7.5,
+                    "timeout_seconds": None,
+                    "timeout_remaining_seconds": None,
+                }
+            ]
+        )
+        rendered = str(main.query_one("#side-jobs").render())
+        assert "12.0s" in rendered
+        assert "7.5s" in rendered
+        assert "非 idle timeout" in rendered
+
+
+def test_timeout_summary_shows_wall_deadline():
+    _marker, _tone, summary, expand = summarize_result(
+        "run_command",
+        {
+            "status": "timeout",
+            "duration_ms": 300,
+            "timeout_seconds": 0.3,
+            "timeout_reason": "wall_clock_deadline",
+        },
+    )
+    assert expand is True
+    assert "wall_clock_deadline" in summary
+    assert "0.3s" in summary

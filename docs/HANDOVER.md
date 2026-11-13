@@ -1258,3 +1258,16 @@ WP-13(整合)依赖全部
 - 无关 R13 时间敏感用例曾在全量/文件级失败，单例与后续复跑通过，未改无关
   代码；最终全绿才提交。下一步仅在授权下进入 R14-C；未打 tag、未发布，
   根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-13：R14-C 完成，父 R14 进行中）
+
+- [R14-C](items/R14.md) 交付 quiet/elapsed 观测与终态冻结、wall deadline 原因/
+  配置/耗时，后台 JobExitEvent 每 job 恰一次通知 observer；index=None 不消费，
+  前台不重复。CLI/TUI 有运行静默与完成/超时/终止提示，prompt 以完整产物为准。
+- 无全局 idle killer，1800s 默认/显式 null 不变。静默 killer 与移除 observer
+  两组故障均被公开测试捕获并还原；最终相关七文件 **326 passed**，R14 四文件
+  **353 passed**，完整 **994 passed, 41 skipped in 240.40s**，ruff/diff 全绿。
+- AC04/AC05 已核销，D 未开始，父 R14 进行中；不改 A/B、scope、R11/R28/R29，
+  不做 R16 状态模型。R13 时间敏感间歇失败保留为残余风险，本轮未触发、未修改；
+  下一步仅在授权下进入 R14-D，未打 tag、未发布，调试 zip 继续排除。

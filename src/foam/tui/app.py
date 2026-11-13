@@ -117,6 +117,7 @@ from foam.tui.bridge import (
     CompressedMsg,
     CorrectionMsg,
     GuardMsg,
+    JobExitMsg,
     NarrativeMsg,
     PhaseMsg,
     RetryMsg,
@@ -579,6 +580,28 @@ class MainScreen(Screen):
             self.narrative.add_notice(
                 "error", f"收到无对应卡片的工具结果:{msg.name}(契约外序列)"
             )
+        self.run_worker(self.refresh_panels())
+
+    def on_job_exit_msg(self, msg: JobExitMsg) -> None:
+        event = msg.event
+        label = {
+            "completed": "已完成",
+            "timeout": "超时",
+            "killed": "被终止",
+        }.get(event.reason, event.reason)
+        parts = [f"后台 job {event.job_id}:{label}"]
+        if event.duration_ms is not None:
+            parts.append(f"耗时 {event.duration_ms}ms")
+        if event.quiet_seconds is not None:
+            parts.append(f"静默 {event.quiet_seconds}s")
+        if event.timeout_seconds is not None:
+            parts.append(f"配置 deadline {event.timeout_seconds}s")
+        if event.timeout_reason is not None:
+            parts.append(f"原因 {event.timeout_reason}")
+        parts.append("可 read_output 读取完整产物")
+        self.narrative.add_notice(
+            "info" if event.reason == "completed" else "warning", " ".join(parts)
+        )
         self.run_worker(self.refresh_panels())
 
     def on_correction_msg(self, msg: CorrectionMsg) -> None:

@@ -377,6 +377,9 @@ class LoopObserver:
     def on_tool_result(self, name: str, result: dict[str, Any]) -> None:
         pass
 
+    def on_job_exit(self, event: JobExitEvent) -> None:
+        pass
+
     def on_correction(self, reason: str) -> None:
         pass
 
@@ -550,8 +553,7 @@ class AgentLoop:
         # 消费任务异常错误面(done_callback 取回入账,防 never-retrieved 噪音;
         # 事件仍留 pending 由 drain 兜底)——并入 drain 报告 errors。
         self._job_exit_errors: list[str] = []
-        if self._index is not None:
-            self._bash.on_job_exit = self._schedule_job_exit
+        self._bash.on_job_exit = self._schedule_job_exit
 
     # ---------- 公开只读面 ----------
 
@@ -1063,6 +1065,9 @@ class AgentLoop:
                 "status": result.get("status"),
                 "exit_code": result.get("exit_code"),
                 "duration_ms": result.get("duration_ms"),
+                "timeout_seconds": result.get("timeout_seconds"),
+                "timeout_reason": result.get("timeout_reason"),
+                "quiet_seconds": result.get("quiet_seconds"),
                 "sha256": result.get("sha256"),
                 "output_path": result.get("output_path"),
                 "total_bytes": result.get("total_bytes"),
@@ -1241,10 +1246,13 @@ class AgentLoop:
         (解析/索引/审计)调度为独立任务,由 ``_finish`` 排空(R06-C)。
         """
         event = dataclasses.replace(event, run_id=self._run_id)
-        self._job_exit_pending[event.event_id] = event
-        task = asyncio.create_task(self._consume_job_exit(event))
-        self._job_exit_tasks.add(task)
-        task.add_done_callback(self._on_job_exit_task_done)
+        if self._index is not None:
+            self._job_exit_pending[event.event_id] = event
+            task = asyncio.create_task(self._consume_job_exit(event))
+            self._job_exit_tasks.add(task)
+            task.add_done_callback(self._on_job_exit_task_done)
+        if event.background:
+            self._observer.on_job_exit(event)
 
     def _on_job_exit_task_done(self, task: asyncio.Task[None]) -> None:
         """消费任务完成回调:移出任务集;取回异常入错误面(不取则 asyncio
@@ -1335,6 +1343,9 @@ class AgentLoop:
             "reason": event.reason,
             "exit_code": event.exit_code,
             "duration_ms": event.duration_ms,
+            "timeout_seconds": event.timeout_seconds,
+            "timeout_reason": event.timeout_reason,
+            "quiet_seconds": event.quiet_seconds,
             "ended_at": event.ended_at,
             "output_path": event.output_path,
             "sha256": event.sha256,
