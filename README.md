@@ -41,8 +41,11 @@ Foam 之于授权安全测试。
   分别核验审计链、产物 hash、证据引用和覆盖状态,不改被检查数据。
 
 **边界**:PTY 会话命令与输入不经过 `run_command` 的命令级 scope 检查;
-审计可见不等于授权隔离。网络层执行边界属于 v0.2 的 R10/R11,当前版本
-不得当作已交付。本地哈希链也未外部锚定,不能证明未截尾或整体重写。
+审计可见不等于授权隔离。v0.2.0 的 protected 网络边界仅支持以 root 启动的
+Linux 与 CIDR scope,不支持 raw socket/AF_PACKET 或入站监听;创建、恢复或换代
+失败会停止,不静默回退 legacy。真实 Kali 的受支持安装与 protected 用户旅程
+尚未验收并明确延期,既有 Docker/linuxkit 结果不冒充 Kali。本地哈希链也未外部
+锚定,不能证明未截尾或整体重写。
 
 ## 法律与边界
 
@@ -143,9 +146,19 @@ sudo /opt/foam/bin/foam verify engagements/<id>
 不要预设 sudo 后仍能读到调用用户的配置。
 
 `doctor` 已有 R13-B 只读诊断与 protected/无权限处置,`status` 已接入 R13-C
-心跳活性与运行结局。R13 分片已完成不代表 protected 安装已验证:本小节仍是
-R29-A 公开安装约定与文档草案,尚未完成真实 Kali 的干净系统安装、sudo、wheel
-与 protected run 验证。
+心跳活性与运行结局。R13 分片已完成不代表 protected 安装已验证:本小节只发布
+R29-A 安装约定与诊断说明。真实 Kali 的干净系统安装、sudo、wheel 与 protected
+run/resume/verify 均未验证;用户已明确裁定 R29-B 延期,不自动指定后续版本。
+
+## v0.2.0 已知边界
+
+- 旧版本 TUI 不持单写者锁,不能与新版形成互斥;不得手删 `engagement.lock`。
+- macOS 进程身份使用秒级启动时间,同秒 PID reuse 仍可能误认;
+  `test_status_pid_reuse_and_stale` 有高负载时间敏感间歇失败记录。
+- R14-A/B/D 只覆盖收窄的笔记上下文、已定位总结框架/命令与权限证据;其他表达
+  保持保守或通用路径。真实 token 节省(R22)与真实能力失败频率(R30)未证。
+- 本版没有新 SQLite schema;`heartbeat.json` 是独立 0600 活性快照,R14-C 的
+  JobExitEvent 新字段在末尾提供默认值。既有 v4 索引迁移与备份规则不变。
 
 ## 配置持久化
 
@@ -193,7 +206,7 @@ key/token/secret 字样的键一律剔除、不落盘。
 
 ## 文档
 
-- 当前版本、迁移/回退与发布证据:`docs/releases/v0.1.3.md`
+- 当前候选、迁移/回退与发布证据:`docs/releases/v0.2.0.md`
 - R 条目规格与逐条验收:`docs/items/README.md`
 - 战绩表与证据说明:`docs/track-record.md`
 - 实弹报告:`docs/e2e/scenario1-report.md`、`docs/demo/scenario2-report.md`、
@@ -204,23 +217,20 @@ key/token/secret 字样的键一律剔除、不落盘。
 
 ## 项目状态
 
-**[v0.1.3 已发布](https://github.com/Moxxkidd/foam/releases/tag/v0.1.3)**
-(2026-10-24):包含 R06–R09 的后台终态事件、PTY 操作/提示审计、通用
-成果登记与证据模型、verify/manifest/结项页,并承接未单独发布的
-v0.1.2(R01–R05)全部变更。annotated tag 指向 `fad75d9`,包元数据与
-CLI 统一为 0.1.3;wheel/sdist/SHA256SUMS 已上传并下载回验。
+**v0.2.0 候选准备中,待发布**:包含 R10 研究结论、R11 Linux protected
+执行边界、R12 预算与恢复、R13 doctor/status、R14 误报/等待/能力解释改进及
+R28 TUI 单写者锁。R29-B 真实 Kali 验收经用户明确授权延期;本版只含 R29-A
+文档与诊断约定,不宣称真实 Kali 安装或 protected 用户旅程已验证。候选三门、
+CI、构建与安装验收仍在本次执行,详见 `docs/releases/v0.2.0.md`。
 
-- 发布提交本机全量 **814 passed + 2 skipped**,安装包选择性回归
-  **539 passed**;main 合并 CI 五 job 全绿,四个 pytest leg 均为
-  **815 passed + 3 skipped**:<https://github.com/Moxxkidd/foam/actions/runs/40088646666>。
-- 完整迁移/回退、能力边界、构建和线上资产 hash 见
-  `docs/releases/v0.1.3.md`。
+上一正式发布为 **[v0.1.3](https://github.com/Moxxkidd/foam/releases/tag/v0.1.3)**
+(2026-10-24):包含 R06–R09 并承接未单独发布的 v0.1.2(R01–R05)全部变更。
+annotated tag 指向 `fad75d9`,wheel/sdist/SHA256SUMS 已上传并下载回验;完整
+记录见 `docs/releases/v0.1.3.md`。
 
 - v0.1.2 不补打历史 tag,其剩余版本级验收由 v0.1.3 承接。
 - 历史发布:v0.1.0 有 GitHub release;v0.1.1 仅有 tag,且当时包元数据
   仍为 0.1.0。历史 tag 不改动,异常记录于 `docs/releases/v0.1.2.md`。
-- 后续 v0.2.0 从 R10 的 Kali 执行边界实证开始;设计文档或在飞草稿不
-  代表隔离执行已经交付。
 
 ## License
 
