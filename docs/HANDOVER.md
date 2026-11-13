@@ -1351,3 +1351,22 @@ WP-13(整合)依赖全部
   无输出；41 个 skip 为既有环境/opt-in，本次无新增 skip。
 - 下一步提交 `R13-C: 修正活性测试的时间漂移` 并等待新 SHA 五 job CI 全绿；
   不靠 rerun 掩盖。未构建/tag/release，zip 继续排除。
+
+
+## 当前状态（2026-11-14：v0.2.0 已发布）
+
+- annotated `v0.2.0` 指向 `a107972729b4b57762f69bec0ed978d9a73bf9ef`，已公开并设
+  latest：<https://github.com/Moxxkidd/foam/releases/tag/v0.2.0>。最终 CI
+  <https://github.com/Moxxkidd/foam/actions/runs/43476768587> 为 attempt 1、五 job
+  全绿；本机该 SHA 干净树新跑 **1003 passed, 41 skipped in 247.19s**，ruff/diff
+  全绿。旧候选失败只保留为历史。
+- 最终 wheel/sdist/SHA256SUMS 已从该提交重建，sdist 独立重构的 46 个 wheel 文件
+  内容 hash 全相同。隔离安装、无 src 离线 **945 passed, 2 skipped**、安装后
+  file/NL 本地 OpenAI 桩 run/resume→doctor/status→report/verify，以及锁/心跳/
+  超时/能力说明 **13 passed** 均通过。draft 下载的 digest/内容/重装 smoke 通过后
+  才公开；资产大小/hash 详见 [v0.2.0](releases/v0.2.0.md)。
+- R29-B 与父 R29 仍暂缓，AC01–AC04 未勾，真实 Kali 安装/protected 验收未做；
+  Docker/linuxkit 不冒充 Kali。未发布 PyPI、未改历史 tag、未操作 VM。
+- 当前边界：旧版 TUI 不持锁，macOS 秒级身份仍有同秒 PID reuse 风险；R14 仅覆盖
+  已定位上下文/命令，R22 token 与 R30 真实频率未证。R13 fixture 时间漂移已根修，
+  不再列为未修复缺口。本次发布结果提交仅改文档，不伪称新跑全量；zip 继续排除。

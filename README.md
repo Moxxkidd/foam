@@ -217,12 +217,15 @@ key/token/secret 字样的键一律剔除、不落盘。
 
 ## 项目状态
 
-**v0.2.0 候选 CI 修复验证中**:包含 R10 研究结论、R11 Linux protected
-执行边界、R12 预算与恢复、R13 doctor/status、R14 误报/等待/能力解释改进及
-R28 TUI 单写者锁。R29-B 真实 Kali 验收经用户明确授权延期;本版只含 R29-A
-文档与诊断约定,不宣称真实 Kali 安装或 protected 用户旅程已验证。候选四个 CI
-pytest job 曾因 R13 fixture 共享时间戳失败;该漂移已修复并重新验证。尚未构建
-发布资产、创建 tag/draft;历史失败与当前结果见 `docs/releases/v0.2.0.md`。
+**[v0.2.0 已发布](https://github.com/Moxxkidd/foam/releases/tag/v0.2.0)**
+(2026-11-14):包含 R10 研究结论、R11 Linux protected 执行边界、R12 预算与恢复、
+R13 doctor/status、R14 误报/等待/能力解释改进及 R28 TUI 单写者锁。annotated tag
+指向 `a107972`;wheel/sdist/SHA256SUMS 已经 draft 下载回验后公开并设 latest。
+最终提交完整 **1003 passed + 41 skipped**,五 job CI 全绿,安装与组合旅程通过;
+完整证据和资产 hash 见 `docs/releases/v0.2.0.md`。
+
+R29-B 真实 Kali 验收经用户明确授权延期,AC01–AC04 未核销;本版只含 R29-A
+文档与诊断约定,不宣称真实 Kali 安装或 protected 用户旅程已验证。
 
 上一正式发布为 **[v0.1.3](https://github.com/Moxxkidd/foam/releases/tag/v0.1.3)**
 (2026-10-24):包含 R06–R09 并承接未单独发布的 v0.1.2(R01–R05)全部变更。
