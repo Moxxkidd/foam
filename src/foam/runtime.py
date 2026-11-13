@@ -16,7 +16,8 @@ CLI/TUI 共享同一关闭服务 :func:`close_run`——修复前各入口各自
 4. **关闭审计**(永远最后:终态记录必须先于它落链;loop 在调用本服务前
    已写妥 run_finished)。
 5. **关闭后端**(httpx 连接等)。
-6. **释放单写者锁**(R02/R28;未持锁的 run 其 lock 为 None)。
+6. **写终态心跳**(R13-C;失败记报告但不改变 run 结果)。
+7. **释放单写者锁**(R02/R28;未持锁的 run 其 lock 为 None)。
 
 任一步失败如实记入返回报告(``cleanup_status="partial"`` +
 ``remaining_resources``/``errors``),**不跳过后续步骤**(AC06);全程幂等,
@@ -48,6 +49,7 @@ class RunRuntime:
     audit: Any = None  # AuditLog
     backend: Any = None  # LLMBackend
     lock: Any = None  # EngagementLock(R02/R28;未持锁时为 None)
+    heartbeat: Any = None  # HeartbeatWriter(R13-C;关闭时写 closed)
     loop: Any = None  # AgentLoop(引用;不由本服务驱动)
     closed: bool = False
     close_result: dict[str, Any] | None = None
@@ -157,7 +159,16 @@ async def _close_run_impl(
         except Exception as exc:
             errors.append(f"backend 关闭异常: {exc!r}")
 
-    # 5. 释放单写者锁
+    # 5. 写终态心跳;失败如实记清理报告,不改变 run 结果
+    if runtime.heartbeat is not None:
+        try:
+            error = await runtime.heartbeat.aclose()
+            if error:
+                errors.append(f"心跳收尾异常: {error}")
+        except Exception as exc:
+            errors.append(f"心跳收尾异常: {exc!r}")
+
+    # 6. 释放单写者锁(R28 顺序不变:心跳先于锁)
     if runtime.lock is not None:
         try:
             runtime.lock.release()

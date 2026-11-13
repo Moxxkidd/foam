@@ -142,8 +142,8 @@ sudo /opt/foam/bin/foam verify engagements/<id>
 取决于系统/sudoers 配置,**尚未在真实 Kali 实测**;上述示例不依赖 profile,
 不要预设 sudo 后仍能读到调用用户的配置。
 
-`doctor` 已有 R13-B 只读诊断与 protected/无权限处置,`status` 仍为 R13-A
-静态骨架;心跳活性归尚未实施的 R13-C,不能当作完整 R13 已交付。本小节是
+`doctor` 已有 R13-B 只读诊断与 protected/无权限处置,`status` 已接入 R13-C
+心跳活性与运行结局。R13 分片已完成不代表 protected 安装已验证:本小节仍是
 R29-A 公开安装约定与文档草案,尚未完成真实 Kali 的干净系统安装、sudo、wheel
 与 protected run 验证。
 
@@ -185,7 +185,7 @@ key/token/secret 字样的键一律剔除、不落盘。
 | `foam replay <dir>` | 哈希链校验 + 只读重放审计时间线 |
 | `foam verify <dir>` | 只读核验证据;0=pass,1=fail,2=使用错误,3=unknown/pending |
 | `foam doctor` | R13-B 只读诊断配置/后端/工具/workdir/protected;默认零网络,`--online` 仅 DNS/TCP/TLS |
-| `foam status <dir>` | R13-A 只读静态 meta/链尾/manifest/索引;心跳活性归 R13-C |
+| `foam status <dir>` | 只读显示运行结局与心跳活性(alive/stale/gone/unknown/none)、最近活动与 manifest/索引 |
 | `foam report <dir>` | 生成中文 markdown 报告;默认凭证全值,`--redact` 仅脱敏凭证节 |
 
 `fm` 为等价短别名。engagement 运行时产物(原始输出 / loot / 索引库)

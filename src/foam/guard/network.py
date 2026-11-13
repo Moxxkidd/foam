@@ -27,6 +27,7 @@ from foam.guard.network_helper import (
     BoundaryError,
     ExecutionUnsupportedError,
 )
+from foam.state.heartbeat import process_is_active
 
 __all__ = [
     "BoundaryError",
@@ -596,12 +597,7 @@ class NetworkBoundary:
 
 
 def _process_is_active(pid: int, start: str) -> bool:
-    try:
-        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, ProcessLookupError):
-        return False
-    fields = text.rsplit(") ", 1)[1].split()
-    return fields[19] == start and fields[0] != "Z"
+    return process_is_active(pid, start)
 
 
 def _remove_recovered_directories(state_dir: Path, workdir: Path) -> None:

@@ -1008,3 +1008,78 @@ def test_protected_permission_failures_are_explicit_and_clean(
         check=False,
     )
     assert rc == 0, residue
+
+
+def test_r13_root_heartbeat_nonroot_status_and_stale_read_only(
+    r11_lab: Lab, r11_endpoints
+) -> None:
+    """R13-C Linux 容器实证：root 心跳、非 root unknown、stale 零清理。"""
+    harness = r11_endpoints["harness"]
+    driver = _CLI_DRIVER.replace(
+        "/tmp/r11-cli-eng",  # noqa: S108
+        "/tmp/r13-c-eng",  # noqa: S108
+    )
+    push_file(r11_lab, harness, "/opt/r13-c-cli.py", driver)
+    rc, out = docker_exec(
+        r11_lab,
+        harness,
+        "HOME=/tmp/r13-c-home PYTHONUNBUFFERED=1 "
+        "timeout --signal=KILL 100s python /opt/r13-c-cli.py",
+        timeout=120,
+        check=False,
+    )
+    assert rc == 0, out
+    rc, heartbeat_text = docker_exec(
+        r11_lab,
+        harness,
+        "python -c 'from pathlib import Path; "
+        "p=Path(\"/tmp/r13-c-eng/heartbeat.json\"); "
+        "print(p.read_text()); print(p.stat().st_uid, oct(p.stat().st_mode & 0o777))'",
+    )
+    heartbeat = json.loads(heartbeat_text.splitlines()[0])
+    assert heartbeat["schema"] == "foam.heartbeat/1"
+    assert heartbeat["entry"] == "cli-resume"
+    assert heartbeat["loop_status"] == "closed"
+    assert heartbeat_text.splitlines()[-1] == "0 0o600"
+
+    rc, status_text = docker_exec(
+        r11_lab,
+        harness,
+        "setpriv --reuid=65534 --regid=65534 --clear-groups "
+        "env HOME=/tmp/r13-c-nonroot python -m foam.cli "
+        "status /tmp/r13-c-eng --json",
+        check=False,
+    )
+    assert rc == 3, status_text
+    status = json.loads(status_text)
+    assert status["liveness"] == "unknown"
+    assert status["run_state"] == "unknown"
+    assert "以运行用户查看" in status["details"]["identity_note"]
+
+    docker_exec(
+        r11_lab,
+        harness,
+        "mkdir -p /run/foam/network/fb0123456789ab",
+    )
+    snapshot = "find /run/foam/network -maxdepth 2 -printf '%P %y %m\\n' | sort"
+    _, before = docker_exec(r11_lab, harness, snapshot)
+    rc, doctor_text = docker_exec(
+        r11_lab,
+        harness,
+        "HOME=/tmp/r13-c-home python -m foam.cli doctor --json --workdir /tmp",
+        check=False,
+    )
+    assert rc in (0, 1, 3), doctor_text
+    doctor = json.loads(doctor_text)
+    stale = next(
+        check for check in doctor["checks"] if check["code"] == "exec.stale_boundaries"
+    )
+    assert stale["status"] == "warn"
+    assert stale["details"]["count"] == 1
+    _, after = docker_exec(r11_lab, harness, snapshot)
+    assert after == before
+    docker_exec(
+        r11_lab,
+        harness,
+        "rmdir /run/foam/network/fb0123456789ab",
+    )

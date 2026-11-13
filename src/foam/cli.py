@@ -176,6 +176,7 @@ from foam.state.files import (
     EngagementLockedError,
     acquire_engagement_lock,
 )
+from foam.state.heartbeat import HeartbeatWriter
 from foam.tools.bash import TOOL_SCHEMAS as BASH_TOOL_SCHEMAS
 from foam.tools.bash import BashTool
 from foam.tools.execution import ToolExecutor
@@ -840,6 +841,12 @@ def _assemble_runtime(
         loop_kwargs["max_context_tokens"] = args.max_context_tokens
     if args.first_event_timeout is not None:
         loop_kwargs["first_event_timeout"] = args.first_event_timeout
+    heartbeat = HeartbeatWriter(
+        engagement.paths.root,
+        run_id="",
+        entry="cli-run" if args.command == "run" else "cli-resume",
+    )
+    runtime.heartbeat = heartbeat
     loop = AgentLoop(
         backend=backend,
         bash=bash,
@@ -848,7 +855,7 @@ def _assemble_runtime(
         workdir=engagement.paths.root,
         system_prompt=system_prompt,
         registry=registry,
-        observer=observer,
+        observer=heartbeat.observer(observer),
         session=session,
         engagement=engagement,
         index=state.index,  # WP-11:解析层 facts 与 state 工具共用同一连接
@@ -856,6 +863,8 @@ def _assemble_runtime(
         budget=budget or _budget_from_args(args),
         **loop_kwargs,
     )
+    heartbeat.run_id = loop._run_id
+    heartbeat.start()
     runtime.loop = loop
     runtime.toolmap_line = render_startup_line(scan)
     runtime.backend = backend
@@ -1540,9 +1549,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if not root.is_dir():
         print(redact(f"[错误] engagement 目录不存在:{root}"), file=sys.stderr)
         return EXIT_USAGE
-    if not (root / "engagement.json").is_file() and not (
-        root / "audit.jsonl"
-    ).is_file():
+    try:
+        recognized = (root / "engagement.json").is_file() or (
+            root / "audit.jsonl"
+        ).is_file()
+    except OSError:
+        recognized = True  # 无权限不是用法错误;交给 status 只读降级为 unknown
+    if not recognized:
         print(
             redact(
                 f"[错误] {root} 不是 engagement 目录"

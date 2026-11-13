@@ -105,6 +105,7 @@ from foam.state.files import (
     _default_engagement_id,
     acquire_engagement_lock,
 )
+from foam.state.heartbeat import HeartbeatWriter
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 from foam.tools.execution import ToolExecutor
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
@@ -250,6 +251,7 @@ class RunHandle:
     engagement: Engagement | None = None
     state: Any | None = None  # R03:StateTool;统一关闭要关其 Index 连接
     boundary: Any | None = None
+    heartbeat: Any | None = None  # R13-C:默认 factory 的心跳写入端
 
 
 LoopFactory = Callable[[RunContext], RunHandle]
@@ -287,6 +289,9 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
             workdir=engagement.paths.root,
             tool_map_text=render_tool_map(scan_tools()),
         )
+        heartbeat = HeartbeatWriter(
+            engagement.paths.root, run_id="", entry="tui"
+        )
         loop = AgentLoop(
             backend=config.backend,
             bash=bash,
@@ -295,7 +300,7 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
             workdir=engagement.paths.root,
             system_prompt=prompt,
             registry=registry,
-            observer=ctx.observer,
+            observer=heartbeat.observer(ctx.observer),
             session=session,
             engagement=engagement,
             index=state.index,
@@ -306,6 +311,8 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
             wait_on_finish=config.wait_on_finish,
             budget=ctx.budget,
         )
+        heartbeat.run_id = loop._run_id
+        heartbeat.start()
         return RunHandle(
             loop=loop,
             bash=bash,
@@ -313,6 +320,7 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
             engagement=engagement,
             state=state,
             boundary=boundary,
+            heartbeat=heartbeat,
         )
     except Exception:
         executor.close()
@@ -1745,6 +1753,7 @@ class TuiApp(App[None]):
             audit=audit,
             backend=self.config.backend,
             lock=lock,
+            heartbeat=handle.heartbeat,
             loop=handle.loop,
             boundary=handle.boundary,
         )

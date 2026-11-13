@@ -1194,3 +1194,22 @@ WP-13(整合)依赖全部
 - R13-AC01/AC02 已核销；父 R13 与 C 心跳保持进行中。R29 仅同步 doctor 处置
   接口事实，AC 与真实 Kali 发布门槛不变。下一步仅在授权范围内进入 R13-C；
   提交/推送待父代理，未打 tag、未发布，根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-13：R13-C 与父 R13 完成）
+
+- [R13-C](items/R13.md) 已交付原子心跳、CLI run/resume/TUI 装配、close_run
+  锁前 closed、平台身份与 status 活性双轴；最近活动取心跳/链尾较新者，Linux
+  `/proc/locks` 仅按 inode 只读佐证。写失败一次 warning 不影响 run/审计/退出码。
+- 已有证据（非本次重跑）：真实 CLI 生命周期 **2 passed in 32.68s**（SIGSTOP
+  31 秒）、含 TUI 必要回归 **326 passed in 213.36s**、权限修复后目标
+  **238 passed in 43.58s**；临时忽略 proc_start 的 PID 对照 **1 failed in 0.65s**
+  后已还原。Docker/linuxkit **1 passed in 15.54s**，root 0600 心跳、非 root
+  unknown、stale 只读计数通过，不称作 Kali。
+- AC01–AC07 已核销，R13 完成。最终于 2026-11-13 在 macOS arm64 /
+  Python 3.12.14 执行 `.venv/bin/python -m pytest -q` =
+  **971 passed, 41 skipped in 241.73s (0:04:01)**，`.venv/bin/ruff check .` =
+  **All checks passed!**，`git diff --check` 无输出。40 个 skip 为既有环境/opt-in，
+  新增 1 个集成用例默认 opt-in，已单独通过。
+- 下一步按授权序列进入 R29-B；真实 Kali 仍待验证。提交/推送按 R13-C 执行，
+  未打 tag、未发布，根目录调试 zip 继续排除。

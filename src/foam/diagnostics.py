@@ -28,6 +28,7 @@ from foam.config import (
 )
 from foam.evidence import open_index_ro
 from foam.guard.network import list_stale_boundaries, probe_protected
+from foam.state.heartbeat import assess_heartbeat, lock_evidence
 
 AUDIT_TAIL_BYTES = 64 * 1024
 
@@ -147,6 +148,7 @@ class StatusResult:
         default_factory=lambda: {"vulns": None, "creds": None, "loot": None}
     )
     next_action: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         for item in fields(self):
@@ -173,6 +175,7 @@ class StatusResult:
                 "manifest": self.manifest,
                 "counts": self.counts,
                 "next_action": self.next_action,
+                "details": self.details,
             }
         )
 
@@ -625,9 +628,9 @@ def _read_meta(path: Path) -> tuple[dict[str, Any], str | None]:
 
 
 def _read_audit_tail(path: Path) -> tuple[list[dict[str, Any]], str | None]:
-    if not path.is_file():
-        return [], None
     try:
+        if not path.is_file():
+            return [], None
         with path.open("rb") as fh:
             fh.seek(0, 2)
             size = fh.tell()
@@ -652,19 +655,12 @@ def _read_audit_tail(path: Path) -> tuple[list[dict[str, Any]], str | None]:
     return records, None
 
 
-def _liveness_without_heartbeat_reader(root: Path) -> str:
-    try:
-        (root / "heartbeat.json").lstat()
-    except FileNotFoundError:
-        return "none"
-    except OSError:
-        return "unknown"
-    return "unknown"
-
-
 def _index_counts(root: Path) -> dict[str, int | None]:
     counts: dict[str, int | None] = {"vulns": None, "creds": None, "loot": None}
-    conn = open_index_ro(root / "index.sqlite")
+    try:
+        conn = open_index_ro(root / "index.sqlite")
+    except OSError:
+        return counts
     if conn is None:
         return counts
     try:
@@ -717,7 +713,9 @@ def _run_state(
         if terminal_status in ("killed", "error"):
             return "interrupted"
         return "unknown"
-    return "interrupted" if liveness == "none" else "unknown"
+    if liveness == "alive":
+        return "active"
+    return "unknown" if liveness == "unknown" else "interrupted"
 
 
 def _next_action(root: Path, run_state: str) -> str:
@@ -730,11 +728,49 @@ def _next_action(root: Path, run_state: str) -> str:
     return f"检查 engagement.json/链尾;可用 foam verify {root} 进一步核验"
 
 
+def _activity_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def _latest_activity(records: list[dict[str, Any]], heartbeat: dict | None):
+    activity = None
+    if records:
+        last = records[-1]
+        activity = {
+            "at": last.get("ts"),
+            "source": "audit",
+            "kind": last.get("kind"),
+        }
+    if heartbeat:
+        candidate = heartbeat.get("last_activity")
+        if isinstance(candidate, dict) and candidate.get("at"):
+            current_time = _activity_datetime((activity or {}).get("at"))
+            candidate_time = _activity_datetime(candidate.get("at"))
+            if activity is None or (
+                current_time is not None
+                and candidate_time is not None
+                and candidate_time > current_time
+            ):
+                activity = {
+                    "at": candidate.get("at"),
+                    "source": "heartbeat",
+                    "kind": candidate.get("kind"),
+                }
+    return activity
+
+
 def collect_status(root: str | Path) -> StatusResult:
     root = Path(root)
     meta, meta_error = _read_meta(root / "engagement.json")
     records, tail_error = _read_audit_tail(root / "audit.jsonl")
-    liveness = _liveness_without_heartbeat_reader(root)
+    assessment = assess_heartbeat(root)
+    liveness = assessment["liveness"]
     run_state = _run_state(meta, meta_error, records, tail_error, liveness)
     terminal = next(
         (
@@ -744,14 +780,7 @@ def collect_status(root: str | Path) -> StatusResult:
         ),
         None,
     )
-    last = records[-1] if records else None
-    last_activity = None
-    if last is not None:
-        last_activity = {
-            "at": last.get("ts"),
-            "source": "audit",
-            "kind": last.get("kind"),
-        }
+    last_activity = _latest_activity(records, assessment["heartbeat"])
     scope = None
     scope_meta = meta.get("scope")
     if isinstance(scope_meta, dict):
@@ -781,4 +810,9 @@ def collect_status(root: str | Path) -> StatusResult:
         manifest=_manifest_exists(root),
         counts=_index_counts(root),
         next_action=_next_action(root, run_state),
+        details={
+            "identity_method": assessment["identity_method"],
+            "identity_note": assessment["identity_note"],
+            "lock": lock_evidence(root),
+        },
     )

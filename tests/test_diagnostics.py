@@ -647,3 +647,84 @@ def test_doctor_protected_and_stale_remediation(tmp_path, monkeypatch, capsys):
     assert stale["status"] == "warn"
     assert stale["details"]["count"] == 1
     assert "自动对账" in stale["message"]
+
+
+def test_status_pid_reuse_and_stale(tmp_path):
+    """R13-C：新鲜+身份才 alive；过期/复用/boot/时钟/权限分别降级。"""
+    from datetime import UTC, datetime, timedelta
+
+    from foam.state.heartbeat import current_process_identity
+
+    home = tmp_path / "home"
+    cwd = tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    identity = current_process_identity()
+    assert identity["identity_method"] in ("proc-stat", "ps-lstart")
+    now = datetime.now(UTC)
+    cases = [
+        ("fresh", "alive", "active", 0),
+        ("expired", "stale", "interrupted", 0),
+        ("pid-reuse", "gone", "interrupted", 0),
+        ("boot-change", "gone", "interrupted", 0),
+        ("pid-missing", "gone", "interrupted", 0),
+        ("future", "unknown", "unknown", 3),
+        ("corrupt", "unknown", "unknown", 3),
+        ("permission", "unknown", "unknown", 3),
+    ]
+    for name, expected_liveness, expected_run_state, expected_rc in cases:
+        engagement = Engagement.create(cwd / "engagements", name)
+        root = engagement.paths.root
+        audit = AuditLog(root / "audit.jsonl")
+        audit.append("run_started", {"run_id": "r13-c", "objective": name})
+        audit.close()
+        heartbeat = {
+            "schema": "foam.heartbeat/1",
+            "run_id": "r13-c",
+            "entry": "cli-run",
+            "pid": os.getpid(),
+            "proc_start": identity["proc_start"],
+            "boot_id": identity["boot_id"],
+            "platform": sys.platform,
+            "started_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "interval_s": 10,
+            "seq": 1,
+            "loop_status": "running",
+            "last_activity": {
+                "kind": "status",
+                "at": (now + timedelta(seconds=2)).isoformat(),
+            },
+        }
+        if name == "expired":
+            heartbeat["updated_at"] = (now - timedelta(seconds=31)).isoformat()
+            heartbeat["last_activity"]["at"] = heartbeat["updated_at"]
+        elif name == "pid-reuse":
+            heartbeat["proc_start"] = "TESTONLY-different-start"
+        elif name == "boot-change":
+            heartbeat["boot_id"] = "TESTONLY-different-boot"
+        elif name == "pid-missing":
+            heartbeat["pid"] = 99999999
+        elif name == "future":
+            heartbeat["updated_at"] = (now + timedelta(seconds=6)).isoformat()
+        path = root / "heartbeat.json"
+        if name == "corrupt":
+            path.write_text("{bad\n", encoding="utf-8")
+        else:
+            path.write_text(json.dumps(heartbeat), encoding="utf-8")
+        if name == "permission":
+            path.chmod(0)
+        before_lock = (root / "engagement.lock").exists()
+        result = run_cli(["status", str(root), "--json"], cwd=cwd, home=home)
+        assert result.returncode == expected_rc, result.stderr
+        data = json.loads(result.stdout)
+        assert data["liveness"] == expected_liveness
+        assert data["run_state"] == expected_run_state
+        assert (root / "engagement.lock").exists() == before_lock
+        assert "lock" in data["details"]
+        if name == "fresh":
+            assert data["details"]["identity_method"] == identity["identity_method"]
+            assert data["last_activity"]["source"] == "heartbeat"
+        if name == "permission":
+            path.chmod(0o600)
+        engagement.close()

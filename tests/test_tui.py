@@ -3602,3 +3602,99 @@ async def test_tui_post_runtime_assembly_error_closes_boundary_and_lock(
         assert app.run_handle is None
         acquired = acquire_engagement_lock(only_engagement_root(tmp_path))
         acquired.release()
+
+
+_TUI_HEARTBEAT_SCRIPT = """
+import asyncio
+import sys
+from pathlib import Path
+from foam.agent.backends.base import LLMBackend, TextDelta, Usage
+from foam.guard.scope import parse_scope
+from foam.tui import TuiApp, TUIConfig
+
+class Backend(LLMBackend):
+    provider = "fake"
+    async def aclose(self):
+        pass
+    def chat(self, messages, tools=None):
+        async def stream():
+            yield TextDelta("ready")
+            yield Usage(1, 1)
+        return stream()
+
+async def wait_final(app):
+    while app._final_result is None:
+        await asyncio.sleep(0.05)
+
+async def hold():
+    base = Path(sys.argv[1])
+    scope_path = base / "lab.scope"
+    scope_path.write_text("127.0.0.0/8\\nlocalhost\\n", encoding="utf-8")
+    app = TuiApp(TUIConfig(
+        scope=parse_scope(scope_path.read_text(encoding="utf-8")),
+        scope_source=str(scope_path),
+        backend=Backend(),
+        engagements_dir=base / "engagements",
+        config_home=base / "home",
+        wait_on_finish=sys.argv[2] == "idle",
+    ))
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await app.confirm_operator("nightowl")
+        app.submit_text("recon lab")
+        for _ in range(200):
+            if app._final_result is not None or (
+                app.run_handle is not None and app.run_handle.loop.status == "idle"
+            ):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise RuntimeError("TUI run not ready")
+        print(app.engagement.paths.root, file=sys.__stdout__, flush=True)
+        while not (base / "finish").exists():
+            await asyncio.sleep(0.1)
+        if app.active_loop is not None:
+            app.active_loop.kill("TESTONLY cleanup")
+            await wait_final(app)
+
+asyncio.run(hold())
+"""
+
+
+async def test_tui_heartbeat_alive_and_closed(tmp_path):
+    """R13-C：真实 TUI idle 为 alive；正常 finished 后 closed/gone。"""
+    from tests.test_diagnostics import run_cli
+
+    for mode, expected_state in (("idle", "active"), ("finished", "closed")):
+        base = tmp_path / mode
+        base.mkdir()
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _TUI_HEARTBEAT_SCRIPT,
+            str(base),
+            mode,
+            cwd=base,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+            assert line, "TUI 子进程未就绪"
+            root = Path(line.decode().strip())
+            result = run_cli(
+                ["status", str(root), "--json"], cwd=base, home=base / "home"
+            )
+            assert result.returncode == 0, result.stderr
+            data = json.loads(result.stdout)
+            assert data["run_state"] == expected_state
+            expected_liveness = "alive" if mode == "idle" else "gone"
+            assert data["liveness"] == expected_liveness
+            (base / "finish").touch()
+            await asyncio.wait_for(proc.wait(), timeout=15)
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
