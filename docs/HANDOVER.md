@@ -1335,3 +1335,19 @@ WP-13(整合)依赖全部
 - 按“任何验收失败不得发布”停止：未构建发布资产，未做隔离安装/组合发布验收，
   未创建 annotated `v0.2.0`、draft 或 GitHub release。R29-B 与父 R29 仍暂缓，
   AC01–AC04 未勾；根目录既有 zip 未纳入。
+
+
+## 当前状态（2026-11-14：R13 活性测试时间漂移修复验证中）
+
+- CI 43388961156 四 pytest leg 的历史失败保留。受控 future-only 偏移 5 秒
+  **1 failed in 0.52s**，0 偏移/+60 控制均 unknown/rc3；产品未来检查正确。
+  根因是 fixture 共享 now 在八个子进程间老化，非产品缺陷。
+- 仅修改 `tests/test_diagnostics.py`：每例独立 now、future+60、rc 附诊断。
+  单一 now 偏移 5 秒对照 **1 failed in 0.29s** 后恢复；修复单例
+  **1 passed in 1.26s**，诊断/心跳 **26 passed in 36.47s**。5 秒未来容差、
+  30 秒 stale 与授权边界不变。
+- 最终完整 `.venv/bin/python -m pytest -q` = **1003 passed, 41 skipped in 246.34s**
+  (0:04:06)，`.venv/bin/ruff check .` = **All checks passed!**，`git diff --check`
+  无输出；41 个 skip 为既有环境/opt-in，本次无新增 skip。
+- 下一步提交 `R13-C: 修正活性测试的时间漂移` 并等待新 SHA 五 job CI 全绿；
+  不靠 rerun 掩盖。未构建/tag/release，zip 继续排除。

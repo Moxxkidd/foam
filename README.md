@@ -154,7 +154,7 @@ run/resume/verify 均未验证;用户已明确裁定 R29-B 延期,不自动指�
 
 - 旧版本 TUI 不持单写者锁,不能与新版形成互斥;不得手删 `engagement.lock`。
 - macOS 进程身份使用秒级启动时间,同秒 PID reuse 仍可能误认;
-  `test_status_pid_reuse_and_stale` 有高负载时间敏感间歇失败记录。
+  `test_status_pid_reuse_and_stale` 曾因 fixture 共享时间戳在 CI 失败,现已改为每例独立时钟。
 - R14-A/B/D 只覆盖收窄的笔记上下文、已定位总结框架/命令与权限证据;其他表达
   保持保守或通用路径。真实 token 节省(R22)与真实能力失败频率(R30)未证。
 - 本版没有新 SQLite schema;`heartbeat.json` 是独立 0600 活性快照,R14-C 的
@@ -217,12 +217,12 @@ key/token/secret 字样的键一律剔除、不落盘。
 
 ## 项目状态
 
-**v0.2.0 候选 CI 未通过,发布停止**:包含 R10 研究结论、R11 Linux protected
+**v0.2.0 候选 CI 修复验证中**:包含 R10 研究结论、R11 Linux protected
 执行边界、R12 预算与恢复、R13 doctor/status、R14 误报/等待/能力解释改进及
 R28 TUI 单写者锁。R29-B 真实 Kali 验收经用户明确授权延期;本版只含 R29-A
-文档与诊断约定,不宣称真实 Kali 安装或 protected 用户旅程已验证。候选源码
-完整门通过,但四个 CI pytest job 均触发已知 R13 时间敏感间歇失败,故未构建
-发布资产、未创建 tag/draft;真实记录见 `docs/releases/v0.2.0.md`。
+文档与诊断约定,不宣称真实 Kali 安装或 protected 用户旅程已验证。候选四个 CI
+pytest job 曾因 R13 fixture 共享时间戳失败;该漂移已修复并重新验证。尚未构建
+发布资产、创建 tag/draft;历史失败与当前结果见 `docs/releases/v0.2.0.md`。
 
 上一正式发布为 **[v0.1.3](https://github.com/Moxxkidd/foam/releases/tag/v0.1.3)**
 (2026-10-24):包含 R06–R09 并承接未单独发布的 v0.1.2(R01–R05)全部变更。

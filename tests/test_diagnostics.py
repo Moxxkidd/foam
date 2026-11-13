@@ -661,7 +661,6 @@ def test_status_pid_reuse_and_stale(tmp_path):
     cwd.mkdir()
     identity = current_process_identity()
     assert identity["identity_method"] in ("proc-stat", "ps-lstart")
-    now = datetime.now(UTC)
     cases = [
         ("fresh", "alive", "active", 0),
         ("expired", "stale", "interrupted", 0),
@@ -673,6 +672,7 @@ def test_status_pid_reuse_and_stale(tmp_path):
         ("permission", "unknown", "unknown", 3),
     ]
     for name, expected_liveness, expected_run_state, expected_rc in cases:
+        now = datetime.now(UTC)
         engagement = Engagement.create(cwd / "engagements", name)
         root = engagement.paths.root
         audit = AuditLog(root / "audit.jsonl")
@@ -706,7 +706,7 @@ def test_status_pid_reuse_and_stale(tmp_path):
         elif name == "pid-missing":
             heartbeat["pid"] = 99999999
         elif name == "future":
-            heartbeat["updated_at"] = (now + timedelta(seconds=6)).isoformat()
+            heartbeat["updated_at"] = (now + timedelta(seconds=60)).isoformat()
         path = root / "heartbeat.json"
         if name == "corrupt":
             path.write_text("{bad\n", encoding="utf-8")
@@ -716,7 +716,11 @@ def test_status_pid_reuse_and_stale(tmp_path):
             path.chmod(0)
         before_lock = (root / "engagement.lock").exists()
         result = run_cli(["status", str(root), "--json"], cwd=cwd, home=home)
-        assert result.returncode == expected_rc, result.stderr
+        assert result.returncode == expected_rc, (
+            name,
+            result.stdout,
+            result.stderr,
+        )
         data = json.loads(result.stdout)
         assert data["liveness"] == expected_liveness
         assert data["run_state"] == expected_run_state
