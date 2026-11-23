@@ -732,3 +732,31 @@ def test_status_pid_reuse_and_stale(tmp_path):
         if name == "permission":
             path.chmod(0o600)
         engagement.close()
+
+
+def test_doctor_protected_host_prerequisite_remediation(tmp_path, monkeypatch, capsys):
+    import foam.diagnostics as diagnostics
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("FOAM_LLM_API_KEY", "sk-TESTONLY")
+    monkeypatch.setenv("FOAM_LLM_BASE_URL", "https://example.com")
+    monkeypatch.setattr(
+        diagnostics,
+        "probe_protected",
+        lambda: {
+            "available": False,
+            "reason": "宿主机缺少 protected 必需命令: conntrack",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(diagnostics, "list_stale_boundaries", lambda: [], raising=False)
+    monkeypatch.setattr(diagnostics.sys, "platform", "linux")
+    assert cli_main(["doctor", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    protected = next(c for c in data["checks"] if c["code"] == "exec.protected")
+    assert protected["status"] == "warn"
+    assert "conntrack" in protected["message"]
+    assert "/opt/foam" in protected["remediation"]
+    assert "conntrack" in protected["remediation"]
+    assert "net.ipv6.conf.all.forwarding=1" in protected["remediation"]

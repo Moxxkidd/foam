@@ -516,6 +516,110 @@ def test_protected_run_creation_failure_never_falls_back(
     assert "TESTONLY protected unsupported" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "protected 执行仅支持 Linux 且 euid=root",
+        "helper 启动路径不可信: /home/TESTONLY/.local/share/pipx/venvs/foam",
+    ],
+)
+def test_protected_run_and_resume_unsupported_show_supported_remediation(
+    tmp_path, monkeypatch, capsys, reason
+):
+    """R29-AC02:run/resume 拒绝 protected 时与 doctor 一致给出 /opt/foam 处置。"""
+    from foam.guard.network import ExecutionUnsupportedError, NetworkBoundary
+    from foam.state.files import Engagement
+
+    scope_file = write_scope(tmp_path, "127.0.0.0/8\n")
+
+    def fail_create(scope, **kwargs):
+        raise ExecutionUnsupportedError(reason)
+
+    monkeypatch.setattr(NetworkBoundary, "create", fail_create)
+
+    rc_run = cli_main(
+        [
+            "run",
+            "--execution-mode",
+            "protected",
+            "--scope",
+            str(scope_file),
+            "--objective",
+            "x",
+            "--workdir",
+            str(tmp_path / "eng-run"),
+        ],
+        backend_factory=lambda _args: FakeBackend([FINISH]),
+    )
+    err_run = capsys.readouterr().err
+    assert rc_run == 1
+    assert "未回退 legacy" in err_run
+    assert "/opt/foam" in err_run
+    assert "处置:" in err_run
+
+    eng = Engagement.create(
+        tmp_path / "eng-resume",
+        "x",
+        scope_path=str(scope_file),
+        engagement_id="r29-res",
+    )
+    from foam.guard.audit import AuditLog
+
+    audit = AuditLog(eng.paths.audit_jsonl)
+    audit.append("run_started", {"run_id": "r1", "objective": "x"})
+    audit.close()
+    eng.close()
+
+    rc_resume = cli_main(
+        [
+            "resume",
+            str(eng.paths.root),
+            "--execution-mode",
+            "protected",
+        ],
+        backend_factory=lambda _args: FakeBackend([FINISH]),
+    )
+    err_resume = capsys.readouterr().err
+    assert rc_resume == 1
+    assert "未回退 legacy" in err_resume
+    assert "/opt/foam" in err_resume
+    assert "处置:" in err_resume
+
+
+def test_protected_run_nl_unsupported_shows_supported_remediation(
+    tmp_path, monkeypatch, capsys
+):
+    from foam.guard.network import ExecutionUnsupportedError, NetworkBoundary
+
+    monkeypatch.setattr(
+        NetworkBoundary,
+        "create",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            ExecutionUnsupportedError("helper 启动路径不可信: /tmp/TESTONLY")
+        ),
+    )
+    backend = FakeBackend([COMPILE_OK])
+    rc = cli_main(
+        [
+            "run",
+            "--execution-mode",
+            "protected",
+            "--scope-text",
+            "仅限 127.0.0.0/8",
+            "--objective",
+            "x",
+            "--workdir",
+            str(tmp_path / "eng-nl"),
+        ],
+        backend_factory=lambda _args: backend,
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "未回退 legacy" in err
+    assert "/opt/foam" in err
+    assert "处置:" in err
+
+
 def test_cli_protected_prompt_contains_execution_boundaries(tmp_path, monkeypatch):
     from foam.guard.network import NetworkBoundary
 

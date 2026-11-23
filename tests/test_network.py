@@ -17,6 +17,8 @@ from foam.guard.network import (
 )
 from foam.guard.scope import parse_scope
 
+REAL_HELPER_TRANSPORT = network._HelperTransport
+
 
 class FakeTransport:
     """通过公开 client 接口驱动代际，不创建真实 namespace。"""
@@ -728,12 +730,13 @@ def test_protected_mode_requires_linux_root_without_sudo(
 
 
 def test_probe_protected_reuses_existing_support_and_trust_checks(monkeypatch):
-    """R13-B:只读 probe 直接复用 R11 支持性与逐级受信路径判据。"""
+    """R13-B/R29-B:只读 probe 复用支持性、逐级受信路径与宿主机前置判据。"""
     checked = []
     monkeypatch.setattr(network_helper, "require_supported", lambda: None)
     monkeypatch.setattr(
         network, "_trusted_source", lambda path: checked.append(path) or path
     )
+    monkeypatch.setattr(network, "_check_host_prerequisites", lambda: None)
     assert network.probe_protected()["available"] is True
     assert len(checked) == 2
 
@@ -744,6 +747,87 @@ def test_probe_protected_reuses_existing_support_and_trust_checks(monkeypatch):
     result = network.probe_protected()
     assert result["available"] is False
     assert result["reason"] == "TESTONLY unsupported"
+
+    monkeypatch.setattr(network_helper, "require_supported", lambda: None)
+    monkeypatch.setattr(
+        network,
+        "_check_host_prerequisites",
+        lambda: (_ for _ in ()).throw(
+            ExecutionUnsupportedError("宿主机缺少 protected 必需命令: conntrack")
+        ),
+    )
+    missing_result = network.probe_protected()
+    assert missing_result["available"] is False
+    assert "conntrack" in missing_result["reason"]
+
+
+def test_check_host_prerequisites_validates_commands_and_forwarding(
+    tmp_path, monkeypatch
+):
+    """R29-B:缺少 conntrack/必需命令或 forwarding!=1 必须显式失败。"""
+    ip4 = tmp_path / "ip_forward"
+    ip6 = tmp_path / "ip6_forward"
+    ip4.write_text("1\n", encoding="utf-8")
+    ip6.write_text("1\n", encoding="utf-8")
+    sysctls = (
+        ("net.ipv4.ip_forward", ip4),
+        ("net.ipv6.conf.all.forwarding", ip6),
+    )
+
+    monkeypatch.setattr(
+        network.shutil,
+        "which",
+        lambda cmd, path=None: None if cmd == "conntrack" else f"/usr/sbin/{cmd}",
+    )
+    with pytest.raises(ExecutionUnsupportedError, match="conntrack"):
+        network._check_host_prerequisites(sysctl_paths=sysctls)
+
+    monkeypatch.setattr(
+        network.shutil,
+        "which",
+        lambda cmd, path=None: f"/usr/sbin/{cmd}",
+    )
+    ip6.write_text("0\n", encoding="utf-8")
+    with pytest.raises(
+        ExecutionUnsupportedError, match="net\\.ipv6\\.conf\\.all\\.forwarding=1"
+    ):
+        network._check_host_prerequisites(sysctl_paths=sysctls)
+
+    ip6.write_text("1\n", encoding="utf-8")
+    network._check_host_prerequisites(sysctl_paths=sysctls)
+
+    ip4.unlink()
+    with pytest.raises(ExecutionUnsupportedError, match="net\\.ipv4\\.ip_forward"):
+        network._check_host_prerequisites(sysctl_paths=sysctls)
+
+
+def test_protected_remediation_includes_host_guidance_when_prerequisites_missing():
+    base = network.protected_remediation("helper 启动路径不可信: /home/u/foam")
+    assert "/opt/foam" in base
+    assert "conntrack" not in base
+
+    for reason in (
+        "宿主机缺少 protected 必需命令: conntrack",
+        "宿主机未预置 net.ipv6.conf.all.forwarding=1，拒绝修改全局 forwarding",
+    ):
+        detailed = network.protected_remediation(reason)
+        assert "/opt/foam" in detailed
+        assert "conntrack" in detailed
+        assert "net.ipv4.ip_forward=1" in detailed
+        assert "net.ipv6.conf.all.forwarding=1" in detailed
+
+
+def test_helper_transport_preflight_skips_prerequisites_only_on_recover(monkeypatch):
+    """R29-B:recover 清理不得被关闭的 forwarding/缺少的前置阻断。"""
+    calls = []
+    monkeypatch.setattr(network, "_require_supported", lambda: None)
+    monkeypatch.setattr(network, "_trusted_source", lambda path: path)
+    monkeypatch.setattr(
+        network, "_check_host_prerequisites", lambda: calls.append("checked")
+    )
+    REAL_HELPER_TRANSPORT.preflight(require_prerequisites=True)
+    REAL_HELPER_TRANSPORT.preflight(require_prerequisites=False)
+    assert calls == ["checked"]
 
 
 def test_list_stale_boundaries_is_read_only_and_never_recovers(

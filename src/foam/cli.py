@@ -157,7 +157,12 @@ from foam.evidence import (
     write_manifest,
 )
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_LOADED, AuditLog
-from foam.guard.network import BoundaryError, NetworkBoundary
+from foam.guard.network import (
+    BoundaryError,
+    ExecutionUnsupportedError,
+    NetworkBoundary,
+    protected_remediation,
+)
 from foam.guard.scope import GuardDecision, Scope, parse_scope, scope_payload
 from foam.replay import (
     build_report,
@@ -1074,6 +1079,14 @@ def _write_scope_section(
     engagement.update_scope_section(section)
 
 
+def _format_protected_boundary_error(exc: BoundaryError) -> str:
+    """R29-AC02:对受支持环境/路径不满足的拒绝给出与 doctor 一致的中文处置。"""
+    message = f"[错误] protected 执行边界创建失败:{exc};未回退 legacy"
+    if isinstance(exc, ExecutionUnsupportedError):
+        return f"{message};处置:{protected_remediation(str(exc))}"
+    return message
+
+
 async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
     resolve_backend_args(args)  # P1-1:flag > env > profile > 内置默认,就地回填
     if args.scope_text is not None:
@@ -1125,10 +1138,7 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
                 observer=_CliObserver(),
             )
         except BoundaryError as exc:
-            print(
-                f"[错误] protected 执行边界创建失败:{exc};未回退 legacy",
-                file=sys.stderr,
-            )
+            print(_format_protected_boundary_error(exc), file=sys.stderr)
             return EXIT_ERROR
         # Q8:file 流装配后补确认记录(与 scope_loaded 相邻、run_started 之前)
         _append_file_scope_confirm(runtime.audit, scope, str(args.scope), scope_digest)
@@ -1231,10 +1241,7 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
                 budget=budget,
             )
         except BoundaryError as exc:
-            print(
-                f"[错误] protected 执行边界创建失败:{exc};未回退 legacy",
-                file=sys.stderr,
-            )
+            print(_format_protected_boundary_error(exc), file=sys.stderr)
             return EXIT_ERROR
         driven = True
         return await _drive(runtime, objective=args.objective)
@@ -1491,10 +1498,7 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
                 budget=budget,
             )
         except BoundaryError as exc:
-            print(
-                f"[错误] protected 执行边界创建失败:{exc};未回退 legacy",
-                file=sys.stderr,
-            )
+            print(_format_protected_boundary_error(exc), file=sys.stderr)
             return EXIT_ERROR
         if args.scope:
             # W14b-3:--scope 显式覆盖 = 命令行重新授权,与 run file 流同义补写

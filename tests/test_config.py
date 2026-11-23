@@ -1090,6 +1090,10 @@ def test_r29_readme_protected_install_public_contract():
         "HOME",
         "真实 Kali",
         "R13",
+        "conntrack",
+        "net.ipv4.ip_forward",
+        "net.ipv6.conf.all.forwarding",
+        "/root/.foam/config.json",
     ):
         assert expected in section
     assert "pipx 仅用于 legacy" in readme

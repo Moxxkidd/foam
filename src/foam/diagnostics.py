@@ -27,7 +27,11 @@ from foam.config import (
     sanitize_url,
 )
 from foam.evidence import open_index_ro
-from foam.guard.network import list_stale_boundaries, probe_protected
+from foam.guard.network import (
+    list_stale_boundaries,
+    probe_protected,
+    protected_remediation,
+)
 from foam.state.heartbeat import assess_heartbeat, lock_evidence
 
 AUDIT_TAIL_BYTES = 64 * 1024
@@ -501,10 +505,7 @@ def _protected_check() -> Check:
         code="exec.protected",
         status="warn",
         message=f"protected 不可用:{probe['reason']};仅 legacy 可用",
-        remediation=(
-            "按 R29-A 使用 root /opt/foam venv 安装发布 wheel,并经 sudo 白名单启动;"
-            "不自动 sudo、不放宽权限"
-        ),
+        remediation=protected_remediation(probe["reason"]),
         details=probe,
     )
 

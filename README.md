@@ -107,7 +107,10 @@ Ctrl-C 触发 kill switch,回收全部活动任务与会话。
 ## protected 安装
 
 pipx 仅用于 legacy;用户目录中的解释器或 helper 源可被普通用户修改,
-不满足 protected 的受信启动路径要求。protected 的受支持安装约定是由 root
+不满足 protected 的受信启动路径要求。protected 宿主机还须已安装
+`iproute2` / `nftables` / `conntrack`(如 `sudo apt-get install -y conntrack`),
+并预先开启 `net.ipv4.ip_forward=1` 与 `net.ipv6.conf.all.forwarding=1`
+(Foam 拒绝在运行期修改全局 forwarding)。protected 的受支持安装约定是由 root
 在 `/opt/foam` 创建 venv 并安装发布 wheel,不要用 pipx、`sudo pip` 直接写系统
 Python 或源码目录代替:
 
@@ -140,15 +143,20 @@ sudo /opt/foam/bin/foam verify engagements/<id>
 ```
 
 `.env` 的查找位置是当前工作目录的 `.env`,不是 `HOME` 或 `/opt/foam`;
-它在 Foam 启动后只读注入缺省环境变量,不覆盖已有同名变量。sudo 后的
-`HOME` 以及 profile(`~/.foam/config.json`)实际指向 root 还是调用用户,
-取决于系统/sudoers 配置,**尚未在真实 Kali 实测**;上述示例不依赖 profile,
-不要预设 sudo 后仍能读到调用用户的配置。
+它在 Foam 启动后只读注入缺省环境变量,不覆盖已有同名变量。真实 Kali(Kali
+Rolling 2025.3)默认 `sudo` 配置下 `HOME` 会重置为 `/root`,此时 profile 读取
+`/root/.foam/config.json`,而非调用用户的 `~/.foam/config.json`(若 `sudoers`
+显式保留 `HOME` 则行为随之改变);上述示例不依赖 profile,不要预设 sudo 后仍能
+读到调用用户的配置。
 
 `doctor` 已有 R13-B 只读诊断与 protected/无权限处置,`status` 已接入 R13-C
-心跳活性与运行结局。R13 分片已完成不代表 protected 安装已验证:本小节只发布
-R29-A 安装约定与诊断说明。真实 Kali 的干净系统安装、sudo、wheel 与 protected
-run/resume/verify 均未验证;用户已明确裁定 R29-B 延期,不自动指定后续版本。
+心跳活性与运行结局;当安装路径不可信、缺少 `conntrack` 或未预置 forwarding 时,
+`doctor`、`run`/`resume` 与 TUI 均拒绝回退 legacy 并给出上述处置说明。此外若
+宿主机同时运行 Docker 并把 `ip filter FORWARD` 设为 `policy drop`,宿主机管理员
+须自行在宿主机防火墙(如 `DOCKER-USER`)显式放行授权目标转发,Foam 不修改宿主机
+全局防火墙。`main` 分支已于 2026-11-23 在真实 Kali(Kali Rolling 2025.3 /
+`6.12.38+kali-arm64` / Python 3.13.7)完成 R29-B AC01–AC04 实测验收;此前已发布
+的 `v0.2.0` tag 保持不动,仅含 R29-A 文档与诊断约定。
 
 ## v0.2.0 已知边界
 

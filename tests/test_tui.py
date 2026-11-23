@@ -2851,6 +2851,8 @@ async def test_tui_protected_start_failure_never_falls_back(tmp_path, monkeypatc
         error = notices_containing(main, "protected 执行边界创建失败")[-1].content
         assert "TESTONLY TUI protected unsupported" in error
         assert "未回退 legacy" in error
+        assert "/opt/foam" in error
+        assert "处置:" in error
 
 
 @pytest.mark.parametrize("mode", ["legacy", "protected"])

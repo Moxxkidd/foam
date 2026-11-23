@@ -95,7 +95,12 @@ from foam.guard.audit import (
     KIND_SCOPE_UPDATED,
     AuditLog,
 )
-from foam.guard.network import BoundaryError, NetworkBoundary
+from foam.guard.network import (
+    BoundaryError,
+    ExecutionUnsupportedError,
+    NetworkBoundary,
+    protected_remediation,
+)
 from foam.guard.scope import Scope, render_canonical_rules, scope_payload
 from foam.runtime import RunRuntime, cleanup_warning_text, close_run
 from foam.state.files import (
@@ -1757,9 +1762,15 @@ class TuiApp(App[None]):
                 ";".join(cleanup_errors) if cleanup_errors else ""
             )
             if isinstance(exc, BoundaryError):
+                remediation = (
+                    f";处置:{protected_remediation(str(exc))}"
+                    if isinstance(exc, ExecutionUnsupportedError)
+                    else ""
+                )
                 main.narrative.add_notice(
                     "error",
-                    f"protected 执行边界创建失败:{exc};未回退 legacy;{cleanup_detail}",
+                    f"protected 执行边界创建失败:{exc};未回退 legacy"
+                    f"{remediation};{cleanup_detail}",
                 )
             else:
                 main.narrative.add_notice(

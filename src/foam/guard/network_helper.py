@@ -17,6 +17,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import stat
@@ -748,6 +749,19 @@ class BoundaryHelper:
         policy = _Policy.from_payload(policy_value)
         config = self.config
         try:
+            if (
+                shutil.which("conntrack", path="/usr/sbin:/usr/bin:/sbin:/bin")
+                is None
+            ):
+                raise ExecutionUnsupportedError(
+                    "宿主机缺少 protected 必需命令: conntrack"
+                )
+            for key in ("net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"):
+                result = self.runner.run(["sysctl", "-n", key])
+                if result.stdout.strip() != "1":
+                    raise BoundaryError(
+                        f"宿主机未预置 {key}=1，拒绝修改全局 forwarding"
+                    )
             self.runner.run(["ip", "netns", "add", config.netns])
             self._netns_created = True
             self.runner.run(
@@ -845,12 +859,6 @@ class BoundaryHelper:
                     config.host_ipv6,
                 ]
             )
-            for key in ("net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"):
-                result = self.runner.run(["sysctl", "-n", key])
-                if result.stdout.strip() != "1":
-                    raise BoundaryError(
-                        f"宿主机未预置 {key}=1，拒绝修改全局 forwarding"
-                    )
             self.runner.run(
                 [
                     "ip",

@@ -34,10 +34,62 @@ __all__ = [
     "ExecutionUnsupportedError",
     "NetworkBoundary",
     "NetworkPolicy",
+    "PROTECTED_REMEDIATION",
     "list_stale_boundaries",
     "probe_protected",
+    "protected_remediation",
     "recover_stale",
 ]
+
+PROTECTED_REMEDIATION = (
+    "按 R29-A 使用 root /opt/foam venv 安装发布 wheel,并经 sudo 白名单启动;"
+    "不自动 sudo、不放宽权限"
+)
+_HOST_COMMAND_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+_REQUIRED_HOST_COMMANDS = ("ip", "nft", "unshare", "nsenter", "sysctl", "conntrack")
+_FORWARDING_SYSCTLS = (
+    ("net.ipv4.ip_forward", Path("/proc/sys/net/ipv4/ip_forward")),
+    ("net.ipv6.conf.all.forwarding", Path("/proc/sys/net/ipv6/conf/all/forwarding")),
+)
+
+
+def protected_remediation(reason: str = "") -> str:
+    """返回与 doctor/CLI/TUI 一致的 protected 中文处置建议。"""
+    if "缺少 protected 必需命令" in reason or "forwarding" in reason:
+        return (
+            f"{PROTECTED_REMEDIATION};"
+            "宿主机还需安装 iproute2/nftables/conntrack "
+            "并预置 net.ipv4.ip_forward=1 与 net.ipv6.conf.all.forwarding=1"
+        )
+    return PROTECTED_REMEDIATION
+
+
+def _check_host_prerequisites(
+    *,
+    command_path: str = _HOST_COMMAND_PATH,
+    sysctl_paths: tuple[tuple[str, Path], ...] = _FORWARDING_SYSCTLS,
+) -> None:
+    """只读检查 Linux protected 宿主机必需命令与 forwarding sysctl。"""
+    missing = [
+        cmd
+        for cmd in _REQUIRED_HOST_COMMANDS
+        if shutil.which(cmd, path=command_path) is None
+    ]
+    if missing:
+        raise ExecutionUnsupportedError(
+            f"宿主机缺少 protected 必需命令: {', '.join(missing)}"
+        )
+    for key, sysctl_path in sysctl_paths:
+        try:
+            value = sysctl_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ExecutionUnsupportedError(
+                f"无法读取 {key}，拒绝修改全局 forwarding: {exc}"
+            ) from exc
+        if value != "1":
+            raise ExecutionUnsupportedError(
+                f"宿主机未预置 {key}=1，拒绝修改全局 forwarding"
+            )
 
 
 @dataclass(frozen=True)
@@ -123,6 +175,7 @@ def probe_protected() -> dict[str, Any]:
         network_helper.require_supported()
         _trusted_source(Path(sys.executable))
         _trusted_source(Path(network_helper.__file__).resolve())
+        _check_host_prerequisites()
     except (ExecutionUnsupportedError, OSError) as exc:
         return {"available": False, "reason": str(exc)}
     return {"available": True, "reason": ""}
@@ -130,6 +183,15 @@ def probe_protected() -> dict[str, Any]:
 
 class _HelperTransport:
     """受信解释器/源码、最小 env 与带 FD 的有界 SOCK_SEQPACKET 连接。"""
+
+    @staticmethod
+    def preflight(*, require_prerequisites: bool = True) -> tuple[Path, Path]:
+        _require_supported()
+        python = _trusted_source(Path(sys.executable))
+        source = _trusted_source(Path(network_helper.__file__).resolve())
+        if require_prerequisites:
+            _check_host_prerequisites()
+        return python, source
 
     def __init__(
         self,
@@ -139,13 +201,11 @@ class _HelperTransport:
         *,
         recover: bool = False,
     ) -> None:
-        _require_supported()
+        python, source = self.preflight(require_prerequisites=not recover)
         self.boundary_id = boundary_id
         self.state_dir = state_dir
         self.workdir = workdir
         self._closed = False
-        python = _trusted_source(Path(sys.executable))
-        source = _trusted_source(Path(network_helper.__file__).resolve())
         argv = [
             str(python),
             "-I",
@@ -341,6 +401,9 @@ class NetworkBoundary:
     ) -> NetworkBoundary:
         policy = NetworkPolicy.from_scope(scope, dns=dns, digest=digest)
         _require_supported()
+        preflight = getattr(_HelperTransport, "preflight", None)
+        if preflight is not None:
+            preflight()
         boundary_id = f"fb{uuid.uuid4().hex[:12]}"
         state_base = Path(state_root or "/run/foam/network")
         work_base = Path(work_root or "/run/foam/tool-work")

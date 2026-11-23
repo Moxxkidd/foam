@@ -1370,3 +1370,27 @@ WP-13(整合)依赖全部
 - 当前边界：旧版 TUI 不持锁，macOS 秒级身份仍有同秒 PID reuse 风险；R14 仅覆盖
   已定位上下文/命令，R22 token 与 R30 真实频率未证。R13 fixture 时间漂移已根修，
   不再列为未修复缺口。本次发布结果提交仅改文档，不伪称新跑全量；zip 继续排除。
+
+
+## 当前状态（2026-11-23：R29-B 与父 R29 完成）
+
+- [R29](items/R29.md)（R29-B 与父条目）已完成，AC01–AC05 全部核销；已发布
+  `v0.2.0` tag（`a107972`）保持不动，修补与真 Kali 实机证据落于 `main`。
+- 真 Kali（Kali Rolling 2025.3 / `6.12.38+kali-arm64` / Python 3.13.7）先用
+  已发布 `v0.2.0` wheel 录得三处真实缺口并已在 `main` 收口：① Kali 默认无
+  `conntrack` 且 `net.ipv6.conf.all.forwarding=0`，`v0.2.0` `doctor` 误报 pass
+  ——现已由 `probe_protected()`/`_HelperTransport.preflight()`/`BoundaryHelper.create()`
+  只读检出并拒绝；② `run`/`resume`/TUI 拒绝 `protected` 缺 `/opt/foam` 处置
+  ——现统一经 `protected_remediation()` 与 `doctor` 对齐；③ `README.md` 补齐
+  `conntrack`/forwarding 前置、Kali 默认 `sudo HOME=/root`（profile 读
+  `/root/.foam/config.json`）及 Docker `FORWARD policy drop` 宿主机影响说明。
+- 真 Kali 使用本地回环 OpenAI 兼容桩 + `TESTONLY` 密钥跑通 `pipx` 拒启对照（AC02）
+  及 `/opt/foam` venv `protected` `run`/`status`/`verify`/`report`/`resume`/复验
+  全链（AC01/AC03/AC04），实证 `uid/gid=65534`、`CapEff=0`、`NoNewPrivs=1`、
+  环境零密钥泄漏、`0700 root:root` 阻断 `doma` 读取；测试结束后已清空 Kali
+  测试 netns/进程/规则/临时文件，恢复 `net.ipv6.conf.all.forwarding=0`，并删除
+  临时 `sudoers`（`sudo -n true` 实测恢复需密码）。
+- 代码改动前本机全量基线 `1009 passed, 41 skipped in 235.94s`，补充 recover
+  回归后 `test_network.py` `68 passed`；最终提交流水线全量 `pytest -q`、`ruff`
+  与 `git diff --check` 见本轮交付报告。根目录调试 zip 继续排除；下一步可按
+  [v0.3.0 清单](releases/v0.3.0.md) 与评估序列推进 R20-A 基线采集。
