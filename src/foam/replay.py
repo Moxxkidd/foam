@@ -41,6 +41,7 @@ from foam.guard.audit import (
     KIND_SCOPE_UPDATED,
     KIND_SESSION_OP,
     KIND_SESSION_PROMPT,
+    KIND_TARGET_DECLARED,
     ZERO_HASH,
     compute_hash,
     explain,
@@ -282,6 +283,11 @@ def format_record(record: dict[str, Any]) -> str:
             f"(会话 {payload.get('session_id')}):"
             f"{_clip(str(payload.get('prompt_text') or ''), 60)}"
         )
+    if kind == KIND_TARGET_DECLARED:
+        targets = ",".join(payload.get("targets") or []) or "(对话指定)"
+        inst = str(payload.get("instruction") or "").strip()
+        suffix = f" 指示={_clip(inst, 60)}" if inst else ""
+        return head + f"目标声明:targets={targets}{suffix}"
     # 未知 kind(KNOWN_KINDS 允许后续 WP 扩展):通用摘要,不炸。
     summary = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return head + f"{kind}:{_clip(summary)}"
@@ -335,6 +341,14 @@ def recover_scope_record(records: list[dict[str, Any]]) -> dict[str, Any] | None
                 "url_prefixes": payload.get("url_prefixes"),
                 "canonical_sha256": payload.get("canonical_sha256"),
             }
+    return None
+
+
+def recover_target_record(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """取审计链上最后一条 target_declared 载荷(若有),供报告与 resume 展示。"""
+    for record in reversed(records):
+        if record.get("kind") == KIND_TARGET_DECLARED:
+            return dict(record.get("payload") or {})
     return None
 
 
@@ -568,7 +582,22 @@ def build_report(
             lines.append("- 规则:")
             lines.extend("  " + rule for rule in rule_lines)
     if not scope_meta and not scope_record:
-        lines.append("(无 scope 记录)")
+        target_rec = recover_target_record(records)
+        targets = list(
+            meta.get("targets") or (target_rec or {}).get("targets") or []
+        )
+        instruction = str(
+            meta.get("instruction") or (target_rec or {}).get("instruction") or ""
+        ).strip()
+        if targets or instruction or meta.get("guard_mode") == "target_only":
+            lines.append("- 护栏模式:Target + Instruction(无参数级 scope 硬拦截)")
+            lines.append(
+                f"- 目标(targets):{', '.join(targets) if targets else '(对话指定)'}"
+            )
+            if instruction:
+                lines.append(f"- 附加指示(instruction):{instruction}")
+        else:
+            lines.append("(无 scope 记录)")
     lines.append("")
 
     # ---- 过程时间线 ----

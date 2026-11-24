@@ -62,6 +62,8 @@ KIND_SESSION_OP = "session_op"
 # R07-B 注册:提示检测事件(检测时落链,不依赖 read;同 offset 去重由
 # session 层 last_event_offset 保证)。
 KIND_SESSION_PROMPT = "session_prompt"
+# 2026-11-24 UX 整改:Strix 对齐的 Target + Instruction 声明事件。
+KIND_TARGET_DECLARED = "target_declared"
 
 KNOWN_KINDS = frozenset(
     {
@@ -78,6 +80,7 @@ KNOWN_KINDS = frozenset(
         KIND_JOB_EXIT,
         KIND_SESSION_OP,
         KIND_SESSION_PROMPT,
+        KIND_TARGET_DECLARED,
     }
 )
 

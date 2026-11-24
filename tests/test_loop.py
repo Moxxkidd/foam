@@ -43,7 +43,13 @@ from foam.agent.loop import (
     estimate_tokens,
 )
 from foam.agent.prompts import build_system_prompt
-from foam.guard.audit import KIND_SCOPE_LOADED, AuditLog, verify
+from foam.guard.audit import (
+    KIND_EXEC_DENIED,
+    KIND_EXEC_REQUEST,
+    KIND_SCOPE_LOADED,
+    AuditLog,
+    verify,
+)
 from foam.guard.scope import parse_scope, scope_payload
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 from foam.tools.session import TOOL_SCHEMAS as SESSION_TOOL_SCHEMAS
@@ -2806,3 +2812,71 @@ async def test_near_budget_guides_wrap_up_without_expanding(tmp_path):
     assert not any(
         r["kind"] == "budget_limit_changed" for r in audit_records(env)
     )
+
+
+async def test_loop_target_only_allows_commands_until_scope_enabled(tmp_path):
+    """scope=None (Target+Instruction 模式):允许自由命令并写 target_only 审计;
+    通过 replace_scope 热启用 scope 后立即拦截越界命令。"""
+    bash = BashTool(tmp_path / "outputs")
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    idle_event = asyncio.Event()
+    idle_count = 0
+
+    class _IdleObserver(LoopObserver):
+        def on_status(self, status: str) -> None:
+            nonlocal idle_count
+            if status == "idle":
+                idle_count += 1
+                idle_event.set()
+
+    backend = FakeBackend(
+        [
+            [ToolCall("c1", "run_command", {"command": "echo 8.8.8.8"}), Usage(2, 1)],
+            [TextDelta("第一步完成"), Usage(2, 1)],
+            [ToolCall("c2", "run_command", {"command": "echo 8.8.8.8"}), Usage(2, 1)],
+            [TextDelta("护栏已拦截"), Usage(2, 1)],
+        ]
+    )
+    loop = AgentLoop(
+        backend=backend,
+        bash=bash,
+        scope=None,
+        audit=audit,
+        workdir=tmp_path,
+        system_prompt=build_system_prompt(workdir=tmp_path, guard_enabled=False),
+        observer=_IdleObserver(),
+        wait_on_finish=True,
+    )
+    task = asyncio.create_task(loop.run("对 10.0.0.1 测试"))
+    await asyncio.wait_for(idle_event.wait(), timeout=5)
+    assert loop.status == "idle"
+    idle_event.clear()
+
+    # 第一轮无护栏拦截,直接执行且落 target_only exec_request
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    started = next(r["payload"] for r in records if r["kind"] == "run_started")
+    assert started["guard_mode"] == "target_only"
+    req = next(r["payload"] for r in records if r["kind"] == KIND_EXEC_REQUEST)
+    assert req["mode"] == "target_only"
+    assert not any(r["kind"] == KIND_EXEC_DENIED for r in records)
+
+    # 通过 replace_scope 启用硬护栏后再次尝试越界目标 -> 被拦截
+    await loop.replace_scope(parse_scope("127.0.0.0/8\n"))
+    loop.interject("继续测 8.8.8.8")
+    await asyncio.wait_for(idle_event.wait(), timeout=5)
+    assert backend.chat_count == 4
+    loop.kill("done")
+    result = await asyncio.wait_for(task, timeout=5)
+    assert result.status == "killed"
+    audit.close()
+
+    records_after = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(r["kind"] == KIND_EXEC_DENIED for r in records_after)

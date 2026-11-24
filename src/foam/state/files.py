@@ -65,10 +65,12 @@ import json
 import logging
 import os
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from foam.agent.prompts import render_target_section
 from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_UPDATED
 from foam.state.index import Index
 
@@ -91,6 +93,8 @@ DEFAULT_ENGAGEMENTS_DIR = Path("engagements")
 #: ``_ENGAGEMENT_TEMPLATE`` 的动态段占位与写入助手消费同一字面量)。
 SCOPE_SECTION_BEGIN = "<!-- foam:scope:begin -->"
 SCOPE_SECTION_END = "<!-- foam:scope:end -->"
+TARGET_SECTION_BEGIN = "<!-- foam:target:begin -->"
+TARGET_SECTION_END = "<!-- foam:target:end -->"
 
 #: ENGAGEMENT.md 目标行(create 模板 ``- 目标:`` 与 prompts 模板
 #: ``- 目标(objective):`` 两种形态都认),update_objective 据此定位。
@@ -278,6 +282,9 @@ class Engagement:
         scope_path: str | Path | None = None,
         engagement_id: str | None = None,
         scope_bytes: bytes | None = None,
+        targets: Sequence[str] = (),
+        instruction: str = "",
+        guard_mode: str | None = None,
     ) -> Engagement:
         """创建(或幂等复开)一个 engagement 目录。
 
@@ -294,6 +301,8 @@ class Engagement:
         """
         engagement_id = engagement_id or _default_engagement_id(objective)
         root = Path(base_dir) / engagement_id
+        cleaned_targets = [t.strip() for t in targets if t and t.strip()]
+        cleaned_instruction = instruction.strip()
         if scope_path is not None and scope_bytes is not None:
             scope_meta = {
                 "path": str(Path(scope_path)),
@@ -318,6 +327,12 @@ class Engagement:
                 raise ValueError(
                     f"engagement 目录 {root} 已被占用,参数冲突:{'; '.join(conflicts)}"
                 )
+            if cleaned_targets:
+                meta["targets"] = cleaned_targets
+            if cleaned_instruction:
+                meta["instruction"] = cleaned_instruction
+            if guard_mode is not None and "guard_mode" not in meta:
+                meta["guard_mode"] = guard_mode
         else:
             now = _utc_now_iso()
             meta = {
@@ -328,6 +343,14 @@ class Engagement:
                 "status": "active",
                 "scope": scope_meta,
             }
+            if cleaned_targets or cleaned_instruction or guard_mode == "target_only":
+                meta["targets"] = cleaned_targets
+                meta["instruction"] = cleaned_instruction
+                meta["guard_mode"] = guard_mode or (
+                    "scope_guard" if scope_meta is not None else "target_only"
+                )
+            elif guard_mode is not None:
+                meta["guard_mode"] = guard_mode
 
         root.mkdir(parents=True, exist_ok=True)
         # R08(规格 §1):engagement 目录集中存放敏感产物(凭证库/审计链/
@@ -552,20 +575,35 @@ class Engagement:
         scope = meta.get("scope")
         if scope:
             lines.append(f"- scope:{scope['path']} (sha256:{scope['sha256']})")
-        # WP-14a(定案 D12):create 路径开箱即含 scope 动态段 markers,与 14d
-        # _ENGAGEMENT_TEMPLATE 的动态段逐字合一(14d 一致性请求 2)——写入助手
-        # 据此只需「markers 间原子重写」单一形态,无插入特例。markers 间占位行
-        # 与 markers 外说明引用块均为模板静态文本,不经写入助手重写。
+        targets = meta.get("targets") or []
+        instruction = str(meta.get("instruction") or "")
+        target_only = meta.get("guard_mode") == "target_only" and not scope
+        if targets or instruction or target_only:
+            lines += [
+                "",
+                "## 目标与任务",
+                "",
+                TARGET_SECTION_BEGIN,
+                render_target_section(targets, instruction=instruction),
+                TARGET_SECTION_END,
+            ]
+        if not target_only:
+            # WP-14a(定案 D12):create 路径开箱即含 scope 动态段 markers,与 14d
+            # _ENGAGEMENT_TEMPLATE 的动态段逐字合一(14d 一致性请求 2)——写入助手
+            # 据此只需「markers 间原子重写」单一形态,无插入特例。markers 间占位行
+            # 与 markers 外说明引用块均为模板静态文本,不经写入助手重写。
+            lines += [
+                "",
+                "## 授权范围",
+                "",
+                SCOPE_SECTION_BEGIN,
+                "(scope 尚未冻结——确认后由 harness 写入当前生效的范围规则)",
+                SCOPE_SECTION_END,
+                "",
+                "> 以上「授权范围」段由 harness 维护,勿手改——护栏判定以代码为准,手改不",
+                "> 影响执行且会被下次写入覆盖。",
+            ]
         lines += [
-            "",
-            "## 授权范围",
-            "",
-            SCOPE_SECTION_BEGIN,
-            "(scope 尚未冻结——确认后由 harness 写入当前生效的范围规则)",
-            SCOPE_SECTION_END,
-            "",
-            "> 以上「授权范围」段由 harness 维护,勿手改——护栏判定以代码为准,手改不",
-            "> 影响执行且会被下次写入覆盖。",
             "",
             "## 进展(loop 每轮更新)",
             "",
@@ -661,6 +699,57 @@ class Engagement:
         meta["objective"] = objective
         self._write_metadata(meta)
         self._rewrite_objective_line(objective)
+
+    def update_targets(
+        self, targets: Sequence[str], *, instruction: str | None = None
+    ) -> dict[str, Any]:
+        """更新 Target + Instruction 元数据并原子同步 ENGAGEMENT.md 目标段。"""
+        cleaned = [t.strip() for t in targets if t and t.strip()]
+        meta = self.metadata()
+        meta["targets"] = cleaned
+        if instruction is not None:
+            meta["instruction"] = instruction.strip()
+        elif "instruction" not in meta:
+            meta["instruction"] = ""
+        self._write_metadata(meta)
+        section = render_target_section(
+            cleaned, instruction=str(meta.get("instruction") or "")
+        )
+        self.update_target_section(section)
+        return meta
+
+    def update_target_section(self, section: str) -> None:
+        """更新 ENGAGEMENT.md 中的「目标与任务」动态段。"""
+        path = self.paths.progress_md
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        body = section.strip("\n") + "\n"
+        begin_idx = text.find(TARGET_SECTION_BEGIN)
+        end_idx = (
+            text.find(TARGET_SECTION_END, begin_idx + len(TARGET_SECTION_BEGIN))
+            if begin_idx != -1
+            else -1
+        )
+        if begin_idx != -1 and end_idx != -1:
+            content_start = begin_idx + len(TARGET_SECTION_BEGIN)
+            new_text = text[:content_start] + "\n" + body + text[end_idx:]
+        else:
+            cleaned = text.replace(TARGET_SECTION_BEGIN, "").replace(
+                TARGET_SECTION_END, ""
+            )
+            block = (
+                "## 目标与任务\n\n"
+                + TARGET_SECTION_BEGIN
+                + "\n"
+                + body
+                + TARGET_SECTION_END
+                + "\n"
+            )
+            if not cleaned.strip():
+                new_text = block
+            else:
+                sep = "" if cleaned.endswith("\n") else "\n"
+                new_text = cleaned + sep + "\n" + block
+        _atomic_write_text(path, new_text)
 
     # ---------- R02:修订提交与恢复对账 ----------
 

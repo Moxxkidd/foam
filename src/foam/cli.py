@@ -115,6 +115,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import signal
@@ -156,7 +157,12 @@ from foam.evidence import (
     verify_engagement,
     write_manifest,
 )
-from foam.guard.audit import KIND_SCOPE_CONFIRMED, KIND_SCOPE_LOADED, AuditLog
+from foam.guard.audit import (
+    KIND_SCOPE_CONFIRMED,
+    KIND_SCOPE_LOADED,
+    KIND_TARGET_DECLARED,
+    AuditLog,
+)
 from foam.guard.network import (
     BoundaryError,
     ExecutionUnsupportedError,
@@ -173,6 +179,7 @@ from foam.replay import (
     read_records,
     recover_objective,
     recover_scope_record,
+    recover_target_record,
 )
 from foam.runtime import RunRuntime, cleanup_warning_text, close_run
 from foam.state.files import (
@@ -346,9 +353,43 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--execution-mode",
         choices=("protected", "legacy"),
-        required=True,
-        help="执行边界(必须显式选择):protected=Linux root 隔离执行;"
-        "legacy=传统路径,无网络强制且继承环境;不从 env/profile 猜测",
+        default=None,
+        help="执行边界(默认 legacy):legacy=常规自由 bash;protected=Linux root 隔离执行",
+    )
+    parser.add_argument(
+        "--protected",
+        action="store_true",
+        help="启用 protected 执行边界(等价 --execution-mode protected;不回退 legacy)",
+    )
+
+
+def _add_target_args(parser: argparse.ArgumentParser) -> None:
+    """添加 Strix 对齐的目标与指示参数(-t/--target、--target-list、--instruction)。"""
+    parser.add_argument(
+        "-t",
+        "--target",
+        action="append",
+        dest="targets",
+        default=[],
+        metavar="TARGET",
+        help="目标(IP/CIDR/域名/URL/路径,可重复多次)",
+    )
+    parser.add_argument(
+        "--target-list",
+        default=None,
+        metavar="FILE",
+        help="目标清单文件(每行一个目标,支持 # 注释与空行)",
+    )
+    parser.add_argument(
+        "--instruction",
+        default=None,
+        help="附加测试指示/任务说明(注入系统上下文与 ENGAGEMENT.md)",
+    )
+    parser.add_argument(
+        "--instruction-file",
+        default=None,
+        metavar="FILE",
+        help="从文件读取附加测试指示",
     )
 
 
@@ -388,7 +429,20 @@ def _add_loop_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=__app_name__.lower(),
-        description=f"{__app_name__} {__version__} —— 授权渗透测试 harness",
+        description=f"{__app_name__} {__version__} —— 自主渗透测试 harness\n"
+        f"直接运行 `{__app_name__.lower()}` 或 "
+        f"`{__app_name__.lower()} -t <目标>` 进入全屏 TUI;"
+        f"加 `-n/--non-interactive` 走 headless 执行。",
+        epilog="常用示例:\n"
+        f"  {__app_name__.lower()}                                 "
+        "直接进入全屏 TUI\n"
+        f"  {__app_name__.lower()} -t 10.0.0.1 --instruction '...'  "
+        "带目标进 TUI\n"
+        f"  {__app_name__.lower()} -n -t 10.0.0.1                  "
+        "headless 非交互运行\n"
+        f"  {__app_name__.lower()} --protected -t 10.0.0.0/24      "
+        "protected 网络隔离运行",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version", action="version", version=f"{__app_name__} {__version__}"
@@ -397,26 +451,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser(
         "run",
-        help="headless 跑一个 objective(新 engagement)",
+        help="headless 跑一个目标/objective(新 engagement)",
         epilog="Ctrl-C 一次触发 kill switch(杀活动 job 与会话、写审计、退出码 "
         "130);再按一次立即强制退出。",
     )
-    scope_group = run.add_mutually_exclusive_group(required=True)
-    scope_group.add_argument("--scope", help="scope 授权范围文件路径")
+    scope_group = run.add_mutually_exclusive_group(required=False)
+    scope_group.add_argument(
+        "--scope", default=None, help="scope 授权范围文件路径(启用参数级硬护栏)"
+    )
     scope_group.add_argument(
         "--scope-text",
+        default=None,
         metavar="NL",
         help="自然语言授权声明(headless 非交互自动确认,Q6):经 WP-14a 编译器"
         "一次性编译 → canonical 全文上屏 + 自动冻结;编译失败中文报错 + "
         "退出码 2,无进程内重试,修正声明后重跑",
     )
-    run.add_argument("--objective", required=True, help="本次 engagement 的目标描述")
+    run.add_argument(
+        "--objective",
+        default="",
+        help="本次 engagement 的目标描述(可用 -t/--instruction 替代)",
+    )
     run.add_argument(
         "--workdir",
         default=None,
         help="engagement 目录(默认 engagements/<日期>-<目标 slug>;"
         "已存在且参数一致时幂等复开)",
     )
+    _add_target_args(run)
     _add_backend_args(run)
     _add_loop_args(run)
 
@@ -499,17 +561,64 @@ def build_parser() -> argparse.ArgumentParser:
     tui = sub.add_parser(
         "tui",
         help="全屏 TUI(textual 界面;依赖缺失时给出明确报错)",
-        description="TUI 入口(WP-09 定案):scope/backend 走本命令参数,"
-        "objective 由主界面输入框首条消息提供。",
+        description=(
+            "TUI 入口:直接运行 CLI 默认进入本界面;支持 -t/--target 与 --instruction。"
+        ),
     )
-    tui.add_argument(
+    tui_scope_group = tui.add_mutually_exclusive_group(required=False)
+    tui_scope_group.add_argument(
         "--scope",
         default=None,
-        help="scope 授权范围文件路径;缺席进入 NL 确认仪式(WP-14c,本片只放行)",
+        help="可选:scope 授权范围文件路径(传入即启用参数级硬护栏)",
     )
+    tui_scope_group.add_argument(
+        "--scope-text",
+        default=None,
+        metavar="NL",
+        help="可选:自然语言授权声明(在 TUI 中确认后启用参数级硬护栏)",
+    )
+    tui.add_argument("--objective", default="", help="可选:预填本次评估目标描述")
     tui.add_argument("--workdir", default=None, help="engagement 目录(同 run)")
+    _add_target_args(tui)
     _add_backend_args(tui)
     _add_loop_args(tui)
+    return parser
+
+
+def _build_root_launch_parser() -> argparse.ArgumentParser:
+    """顶层 Strix 风格直入解析器(默认进入 TUI,加 -n/--non-interactive 走 headless)。"""
+    parser = argparse.ArgumentParser(
+        prog=__app_name__.lower(),
+        description=(
+            f"{__app_name__} {__version__} —— 直接运行进入全屏 TUI;-n 切换 headless"
+        ),
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"{__app_name__} {__version__}"
+    )
+    parser.add_argument(
+        "-n",
+        "--non-interactive",
+        action="store_true",
+        help="非交互 headless 模式执行(等价 `run` 子命令)",
+    )
+    scope_group = parser.add_mutually_exclusive_group(required=False)
+    scope_group.add_argument(
+        "--scope",
+        default=None,
+        help="可选:scope 授权范围文件路径(启用参数级硬护栏)",
+    )
+    scope_group.add_argument(
+        "--scope-text",
+        default=None,
+        metavar="NL",
+        help="可选:自然语言授权声明",
+    )
+    parser.add_argument("--objective", default="", help="本次评估的目标描述")
+    parser.add_argument("--workdir", default=None, help="engagement 目录")
+    _add_target_args(parser)
+    _add_backend_args(parser)
+    _add_loop_args(parser)
     return parser
 
 
@@ -751,6 +860,101 @@ class _Runtime(RunRuntime):
     toolmap_line: str = ""
     #: 装配时落链的 scope_loaded 记录(R02:仅 --objective 覆盖时的提交标记点)。
     scope_loaded_record: dict[str, Any] | None = None
+    #: 装配时落链的 target_declared 记录(无 scope 时 --objective 覆盖锚点)。
+    target_declared_record: dict[str, Any] | None = None
+
+
+def _resolve_execution_mode(args: argparse.Namespace) -> str:
+    """解析执行边界:默认 legacy;--protected 等价 --execution-mode protected。"""
+    protected = bool(getattr(args, "protected", False))
+    mode = getattr(args, "execution_mode", None)
+    if protected:
+        if mode == "legacy":
+            raise ConfigError("--protected 与 --execution-mode legacy 冲突;请二选一")
+        args.execution_mode = "protected"
+    elif not mode:
+        args.execution_mode = "legacy"
+    return str(args.execution_mode)
+
+
+def _load_targets_and_instruction(
+    args: argparse.Namespace,
+) -> tuple[list[str], str]:
+    """收集并清洗 -t/--target、--target-list 与 --instruction/--instruction-file。"""
+    raw_targets = list(getattr(args, "targets", None) or [])
+    target_list_path = getattr(args, "target_list", None)
+    if target_list_path:
+        try:
+            text = Path(target_list_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"目标清单文件读取失败: {exc}") from exc
+        for line in text.splitlines():
+            cleaned = line.split("#", 1)[0].strip()
+            if cleaned:
+                raw_targets.append(cleaned)
+    targets: list[str] = []
+    seen: set[str] = set()
+    for item in raw_targets:
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            targets.append(cleaned)
+
+    raw_inst = getattr(args, "instruction", None)
+    inst_file = getattr(args, "instruction_file", None)
+    if raw_inst is not None and inst_file is not None:
+        raise ConfigError("--instruction 与 --instruction-file 不能同时指定")
+    instruction = ""
+    if inst_file is not None:
+        try:
+            instruction = Path(inst_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(f"指示文件读取失败: {exc}") from exc
+    elif raw_inst is not None:
+        instruction = str(raw_inst).strip()
+    return targets, instruction
+
+
+def _synthesize_objective(
+    objective: str | None, targets: Sequence[str], instruction: str
+) -> str:
+    """当未显式传 --objective 时,由 -t/--instruction 自动合成 objective。"""
+    obj = str(objective or "").strip()
+    if obj:
+        return obj
+    if targets and instruction:
+        return f"对目标 {', '.join(targets)} 执行评估:{instruction}"
+    if targets:
+        return f"对目标 {', '.join(targets)} 进行安全评估"
+    if instruction:
+        return instruction
+    return ""
+
+
+def _scope_from_cidr_targets(
+    targets: Sequence[str],
+) -> tuple[Scope, str, bytes, str]:
+    """protected 无 --scope 时,要求 targets 全为 IP/CIDR 并编译边界(fail-closed)。"""
+    cleaned = [t.strip() for t in targets if t and t.strip()]
+    if not cleaned:
+        raise ConfigError(
+            "protected 模式必须通过 --scope/--scope-text 或 IP/CIDR 类型的 -t/--target "
+            "指定网络边界;拒绝启动且不回退 legacy"
+        )
+    cidr_lines: list[str] = []
+    for item in cleaned:
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            raise ConfigError(
+                f"protected 模式仅接受 IP/CIDR 边界,无法将目标 {item!r} 转为 CIDR;"
+                "请改用 --scope 指定 CIDR 文件或改用 default(legacy)模式,不回退 legacy"
+            ) from None
+        cidr_lines.append(str(net))
+    canonical_text = "\n".join(cidr_lines) + "\n"
+    data = canonical_text.encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    return parse_scope(canonical_text), "<targets>", data, digest
 
 
 def _report_cleanup_pending(report: dict[str, Any]) -> None:
@@ -828,12 +1032,14 @@ def _assemble_runtime(
     args: argparse.Namespace,
     *,
     runtime: _Runtime,
-    scope: Scope,
-    scope_source: str,
-    scope_digest: str,
+    scope: Scope | None,
+    scope_source: str | None,
+    scope_digest: str | None,
     backend: LLMBackend,
     observer: LoopObserver,
     budget: BudgetLedger | None = None,
+    targets: Sequence[str] = (),
+    instruction: str = "",
 ) -> _Runtime:
     """engagement 布局 + 三组工具 + 主环的一次性装配(WP-10 接线点①③)。
 
@@ -843,11 +1049,29 @@ def _assemble_runtime(
     engagement = runtime.engagement
     audit = AuditLog(engagement.paths.audit_jsonl)
     runtime.audit = audit
-    runtime.scope_loaded_record = audit.append(
-        KIND_SCOPE_LOADED, scope_payload(scope, scope_source)
-    )
+    if scope is not None:
+        runtime.scope_loaded_record = audit.append(
+            KIND_SCOPE_LOADED, scope_payload(scope, scope_source or "")
+        )
+    else:
+        runtime.scope_loaded_record = None
+    cleaned_targets = [t.strip() for t in targets if t and t.strip()]
+    cleaned_inst = instruction.strip()
+    if cleaned_targets or cleaned_inst or scope is None:
+        runtime.target_declared_record = audit.append(
+            KIND_TARGET_DECLARED,
+            {
+                "targets": cleaned_targets,
+                "instruction": cleaned_inst,
+                "guard_mode": "scope_guard" if scope is not None else "target_only",
+            },
+        )
     executor = ToolExecutor()
     if args.execution_mode == "protected":
+        if scope is None or scope_digest is None:
+            raise BoundaryError(
+                "protected 模式缺少冻结 scope 边界;拒绝启动且不回退 legacy"
+            )
         boundary = NetworkBoundary.create(scope, digest=scope_digest)
         runtime.boundary = boundary
         executor = ToolExecutor(boundary=boundary)
@@ -868,6 +1092,9 @@ def _assemble_runtime(
         workdir=engagement.paths.root,
         tool_map_text=render_tool_map(scan),
         execution_mode=args.execution_mode,
+        guard_enabled=scope is not None,
+        targets=cleaned_targets,
+        instruction=cleaned_inst,
     )
     loop_kwargs: dict[str, Any] = {}
     if args.max_context_tokens is not None:
@@ -901,16 +1128,23 @@ def _assemble_runtime(
     runtime.loop = loop
     runtime.toolmap_line = render_startup_line(scan)
     runtime.backend = backend
-    if runtime.boundary is None:
-        print(
-            "[execution] mode=legacy;仅 Bash 参数级护栏,无网络强制,"
-            "继承完整环境,已有连接不随 scope 撤销",
-            flush=True,
-        )
-    else:
+    if runtime.boundary is not None:
         print(
             f"[execution] mode=protected boundary={runtime.boundary.boundary_id} "
             f"epoch={runtime.boundary.epoch}",
+            flush=True,
+        )
+    elif scope is not None:
+        print(
+            "[execution] mode=legacy (scope 参数级硬护栏已启用,无网络强制)",
+            flush=True,
+        )
+    else:
+        target_summary = (
+            ", ".join(cleaned_targets) if cleaned_targets else "(对话/objective)"
+        )
+        print(
+            f"[execution] mode=target_only targets={target_summary}",
             flush=True,
         )
     return runtime
@@ -987,7 +1221,12 @@ async def _drive(
 
 
 def _create_engagement(
-    args: argparse.Namespace, *, scope_bytes: bytes | None = None
+    args: argparse.Namespace,
+    *,
+    scope_bytes: bytes | None = None,
+    targets: Sequence[str] = (),
+    instruction: str = "",
+    guard_mode: str | None = None,
 ) -> Engagement:
     """WP-10 接线点①:目录创建走 WP-06 Engagement.create(幂等复开)。
 
@@ -1004,9 +1243,17 @@ def _create_engagement(
             scope_path=scope_path,
             engagement_id=root.name,
             scope_bytes=scope_bytes,
+            targets=targets,
+            instruction=instruction,
+            guard_mode=guard_mode,
         )
     return Engagement.create(
-        objective=args.objective, scope_path=scope_path, scope_bytes=scope_bytes
+        objective=args.objective,
+        scope_path=scope_path,
+        scope_bytes=scope_bytes,
+        targets=targets,
+        instruction=instruction,
+        guard_mode=guard_mode,
     )
 
 
@@ -1088,15 +1335,50 @@ def _format_protected_boundary_error(exc: BoundaryError) -> str:
 
 
 async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
-    resolve_backend_args(args)  # P1-1:flag > env > profile > 内置默认,就地回填
-    if args.scope_text is not None:
-        return await _cmd_run_nl(args, backend_factory)
     try:
-        # R02 单次读盘绑定:parse/meta/审计/动态段共用同一份字节与其 sha256
-        scope, scope_bytes, scope_digest = _read_scope_bytes(args.scope)
-    except (OSError, ValueError) as exc:
-        print(f"[错误] scope 加载失败: {exc}", file=sys.stderr)
+        _resolve_execution_mode(args)
+        targets, instruction = _load_targets_and_instruction(args)
+    except ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
         return EXIT_USAGE
+    objective = _synthesize_objective(
+        getattr(args, "objective", ""), targets, instruction
+    )
+    if not objective:
+        print(
+            "[错误] headless 执行至少需要 --target/-t、"
+            "--instruction 或 --objective 之一",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    args.objective = objective
+    resolve_backend_args(args)  # P1-1:flag > env > profile > 内置默认,就地回填
+    if getattr(args, "scope_text", None) is not None:
+        return await _cmd_run_nl(
+            args, backend_factory, targets=targets, instruction=instruction
+        )
+
+    scope: Scope | None = None
+    scope_bytes: bytes | None = None
+    scope_digest: str | None = None
+    scope_source: str | None = None
+    if args.scope:
+        try:
+            # R02 单次读盘绑定:parse/meta/审计/动态段共用同一份字节与其 sha256
+            scope, scope_bytes, scope_digest = _read_scope_bytes(args.scope)
+            scope_source = str(args.scope)
+        except (OSError, ValueError) as exc:
+            print(f"[错误] scope 加载失败: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+    elif args.execution_mode == "protected":
+        try:
+            scope, scope_source, scope_bytes, scope_digest = _scope_from_cidr_targets(
+                targets
+            )
+        except ConfigError as exc:
+            print(f"[错误] {exc}", file=sys.stderr)
+            return EXIT_USAGE
+
     try:
         backend = backend_factory(args)
         _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
@@ -1104,9 +1386,16 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
         print(f"[错误] {exc}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        engagement = _create_engagement(args, scope_bytes=scope_bytes)
+        engagement = _create_engagement(
+            args,
+            scope_bytes=scope_bytes,
+            targets=targets,
+            instruction=instruction,
+            guard_mode="scope_guard" if scope is not None else "target_only",
+        )
     except (OSError, ValueError) as exc:
         print(f"[错误] engagement 目录创建失败: {exc}", file=sys.stderr)
+        await backend.aclose()
         return EXIT_USAGE
     lock = _acquire_lock_or_report(engagement)
     if lock is None:
@@ -1122,28 +1411,35 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
             f"[run] engagement={engagement.paths.root} backend={args.backend}",
             flush=True,
         )
-        print(
-            f"[scope] {len(scope.rules)} 条规则已加载({args.scope});"
-            "越界命令将被护栏拒绝并记审计",
-            flush=True,
-        )
+        if scope is not None and scope_source is not None:
+            print(
+                f"[scope] {len(scope.rules)} 条规则已加载({scope_source});"
+                "越界命令将被护栏拒绝并记审计",
+                flush=True,
+            )
         try:
             _assemble_runtime(
                 args,
                 runtime=runtime,
                 scope=scope,
-                scope_source=str(args.scope),
+                scope_source=scope_source,
                 scope_digest=scope_digest,
                 backend=backend,
                 observer=_CliObserver(),
+                targets=targets,
+                instruction=instruction,
             )
         except BoundaryError as exc:
             print(_format_protected_boundary_error(exc), file=sys.stderr)
             return EXIT_ERROR
-        # Q8:file 流装配后补确认记录(与 scope_loaded 相邻、run_started 之前)
-        _append_file_scope_confirm(runtime.audit, scope, str(args.scope), scope_digest)
-        # D6 写入点①:file 流装配时落动态段
-        _write_scope_section(engagement, scope, str(args.scope), scope_digest)
+        if scope is not None and scope_source is not None and scope_digest is not None:
+            if args.scope:
+                # Q8:file 流装配后补确认记录(与 scope_loaded 相邻、run_started 之前)
+                _append_file_scope_confirm(
+                    runtime.audit, scope, scope_source, scope_digest
+                )
+            # D6 写入点①:装配时落动态段
+            _write_scope_section(engagement, scope, scope_source, scope_digest)
         driven = True
         return await _drive(runtime, objective=args.objective)
     finally:
@@ -1153,7 +1449,13 @@ async def _cmd_run(args: argparse.Namespace, backend_factory: BackendFactory) ->
             _report_cleanup_pending(report)
 
 
-async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
+async def _cmd_run_nl(
+    args: argparse.Namespace,
+    backend_factory: BackendFactory,
+    *,
+    targets: Sequence[str] = (),
+    instruction: str = "",
+) -> int:
     """run --scope-text:NL 一次性编译 → 自动冻结 → 装配(headless 非交互,Q6)。
 
     顺序(规格钉死):后端装配(ConfigError → 2 照旧)→ 建/开 engagement
@@ -1171,7 +1473,12 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
         print(f"[错误] {exc}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        engagement = _create_engagement(args)
+        engagement = _create_engagement(
+            args,
+            targets=targets,
+            instruction=instruction,
+            guard_mode="scope_guard",
+        )
     except (OSError, ValueError) as exc:
         print(f"[错误] engagement 目录创建失败: {exc}", file=sys.stderr)
         await backend.aclose()
@@ -1239,6 +1546,8 @@ async def _cmd_run_nl(args: argparse.Namespace, backend_factory: BackendFactory)
                 backend=backend,
                 observer=_CliObserver(),
                 budget=budget,
+                targets=targets,
+                instruction=instruction,
             )
         except BoundaryError as exc:
             print(_format_protected_boundary_error(exc), file=sys.stderr)
@@ -1270,12 +1579,9 @@ def _resolve_objective(
 
 def _resolve_scope(
     args: argparse.Namespace, meta: dict[str, Any], records: list[dict[str, Any]]
-) -> tuple[Scope, str, bytes, str]:
-    """scope 恢复:--scope > engagement.json(sha256 对账) > 审计链(摘要对账)。
-
-    成功返回 (scope, source, data, digest)——R02 单次读盘绑定:解析、对账、
-    落盘共用同一份字节(data)与其 sha256(digest);失败抛 ValueError
-    (调用方转明确报错)。
+) -> tuple[Scope | None, str | None, bytes | None, str | None]:
+    """scope 恢复:--scope > engagement.json(sha256 对账) > 审计链(摘要对账)
+    > target_only(仅当显式为无 scope 的 Target 模式且非 protected 时放行)。
     """
     if args.scope:
         data = Path(args.scope).read_bytes()
@@ -1301,6 +1607,20 @@ def _resolve_scope(
 
     record = recover_scope_record(records)
     if record is None:
+        target_rec = recover_target_record(records)
+        is_target_only = (
+            meta.get("guard_mode") == "target_only" or target_rec is not None
+        )
+        if is_target_only:
+            targets = list(
+                meta.get("targets") or (target_rec or {}).get("targets") or []
+            )
+            if getattr(args, "execution_mode", "legacy") == "protected":
+                try:
+                    return _scope_from_cidr_targets(targets)
+                except ConfigError as exc:
+                    raise ValueError(str(exc)) from exc
+            return None, None, None, None
         raise ValueError(
             "无法确定 scope:无 engagement.json 记录且审计链无 scope 记录"
             "(链上回退兼容 scope_loaded/scope_confirmed/scope_updated);"
@@ -1327,7 +1647,21 @@ def _resolve_scope(
 
 def _resume_preflight(
     args: argparse.Namespace,
-) -> tuple[Engagement, EngagementLock, Scope, str, str, str, str, int] | int:
+) -> (
+    tuple[
+        Engagement,
+        EngagementLock,
+        Scope | None,
+        str | None,
+        str | None,
+        str,
+        str,
+        int,
+        list[str],
+        str,
+    ]
+    | int
+):
     """resume 的同步前置:目录/审计链校验、单写者锁、meta↔链对账、
     objective/scope 恢复、legacy 修复。
 
@@ -1437,6 +1771,14 @@ def _resume_preflight(
 
     # R02:resume 置 active(复开 closed 目录清 closed_at,re-finish 刷新)
     engagement.mark_active()
+    target_rec = recover_target_record(records)
+    meta_after = engagement.metadata()
+    targets = list(
+        meta_after.get("targets") or (target_rec or {}).get("targets") or []
+    )
+    instruction = str(
+        meta_after.get("instruction") or (target_rec or {}).get("instruction") or ""
+    )
     briefing = build_resume_briefing(records, recent_rounds=args.recent_rounds)
     return (
         engagement,
@@ -1447,10 +1789,17 @@ def _resume_preflight(
         objective,
         briefing,
         len(records),
+        targets,
+        instruction,
     )
 
 
 async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory) -> int:
+    try:
+        _resolve_execution_mode(args)
+    except ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return EXIT_USAGE
     resolve_backend_args(args)  # P1-1:与 run 同一条解析链,就地回填
     prepared = _resume_preflight(args)
     if isinstance(prepared, int):
@@ -1464,12 +1813,15 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
         objective,
         briefing,
         record_count,
+        targets,
+        instruction,
     ) = prepared
     runtime = _Runtime(engagement=engagement, lock=lock)
     driven = False
     try:
-        # D6 写入点②:resume 对账完成,动态段幂等重写为恢复后 scope 的渲染。
-        _write_scope_section(engagement, scope, scope_source, scope_digest)
+        if scope is not None and scope_source is not None and scope_digest is not None:
+            # D6 写入点②:resume 对账完成,动态段幂等重写为恢复后 scope 的渲染。
+            _write_scope_section(engagement, scope, scope_source, scope_digest)
         try:
             backend = backend_factory(args)
             _save_profile_if_requested(args)  # 装配成功才落盘:坏配置/坏名不留痕
@@ -1496,11 +1848,13 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
                 backend=backend,
                 observer=_CliObserver(),
                 budget=budget,
+                targets=targets,
+                instruction=instruction,
             )
         except BoundaryError as exc:
             print(_format_protected_boundary_error(exc), file=sys.stderr)
             return EXIT_ERROR
-        if args.scope:
+        if args.scope and scope is not None and scope_digest is not None:
             # W14b-3:--scope 显式覆盖 = 命令行重新授权,与 run file 流同义补写
             # (Q8;plain resume 不补,确认计数不变)。R02 提交协议:确认记录
             # 落链后立即持久化 meta(绝对路径 + 提交标记)——E03 收口,再次
@@ -1517,12 +1871,12 @@ async def _cmd_resume(args: argparse.Namespace, backend_factory: BackendFactory)
                 marker=record,
             )
         elif args.objective:
-            # R02:仅 --objective 覆盖——marker 指向本次装配的 scope_loaded
-            # 记录;目标文本的链上锚点是随后的 run_started(loop.run 同步首步
-            # 落链),崩溃窗口由 reconcile_with_chain 从链重建(AC02)。
-            engagement.commit_revision(
-                objective=args.objective, marker=runtime.scope_loaded_record
-            )
+            marker = runtime.scope_loaded_record or runtime.target_declared_record
+            if marker is not None:
+                # R02:仅 --objective 覆盖——marker 指向本次装配的 scope_loaded/
+                # target_declared 记录;目标文本的链上锚点是随后的 run_started,
+                # 崩溃窗口由 reconcile_with_chain 从链重建(AC02)。
+                engagement.commit_revision(objective=args.objective, marker=marker)
         driven = True
         return await _drive(runtime, objective=objective, interject=briefing)
     finally:
@@ -1686,6 +2040,11 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+_KNOWN_SUBCOMMANDS = frozenset(
+    {"run", "resume", "replay", "report", "verify", "doctor", "status", "tui"}
+)
+
+
 def _cmd_tui(args: argparse.Namespace) -> int:
     """TUI 入口接线(WP-09 定案):入口约定 foam.tui.app:main(args)。
 
@@ -1700,10 +2059,19 @@ def _cmd_tui(args: argparse.Namespace) -> int:
             "(textual 依赖缺失或安装损坏)。\n"
             "处置:重装本项目及其依赖(如 pip install --force-reinstall .),"
             "确认 textual 可导入后重试。\n"
-            f"当前可用:`{__app_name__.lower()} run` 的 headless 模式。",
+            f"当前可用:`{__app_name__.lower()} -n` 或 "
+            f"`{__app_name__.lower()} run` 的 headless 模式。",
             file=sys.stderr,
         )
         return EXIT_USAGE
+    try:
+        _resolve_execution_mode(args)
+        targets, instruction = _load_targets_and_instruction(args)
+    except ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    args.targets = targets
+    args.instruction = instruction
     # P1-1:同一解析链就地回填(app.py 零改动,经 args 自然生效)。
     resolve_backend_args(args)
     # Fix-4(坏配置不落盘):--save-profile 落盘前先 _build_backend 预检——
@@ -1729,8 +2097,16 @@ def _cmd_tui(args: argparse.Namespace) -> int:
 def main(
     argv: Sequence[str] | None = None, *, backend_factory: BackendFactory | None = None
 ) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if raw_args and raw_args[0] in _KNOWN_SUBCOMMANDS:
+        args = parser.parse_args(raw_args)
+    elif raw_args in (["-h"], ["--help"], ["--version"]):
+        args = parser.parse_args(raw_args)
+    else:
+        root_parser = _build_root_launch_parser()
+        args = root_parser.parse_args(raw_args)
+        args.command = "run" if args.non_interactive else "tui"
     # P1-1:只读加载 ./.env(永不写它,红线)。只上屏键名,值绝不上屏;
     # 畸形行中文警告(带行号)走 stderr;文件不存在静默。
     # R09/R13:verify/doctor/status 的 stdout 预留给结果(--json 时必须纯

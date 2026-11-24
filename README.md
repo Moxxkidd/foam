@@ -65,13 +65,17 @@ pipx install .          # pipx 仅用于 legacy;protected 见下文
 # 1. 配置后端(openai_compat 万能适配;实弹使用 Kimi K3 系)
 export FOAM_LLM_API_KEY=... FOAM_LLM_BASE_URL=... FOAM_LLM_MODEL=...
 
-# 2. 显式选择传统执行路径并启动 TUI,首条消息声明目标与授权范围
-foam tui --execution-mode legacy
-#    → 确认卡展示编译出的 scope 规则(canonical 形态 + sha256 短哈希):
-#      确认冻结 / 用自然语言修正重编译 / 取消;确认后冻结进审计链
-#    → 运行中随时 /scope 查看当前规则,/scope <描述> 经同一仪式修改
+# 2. 直接输入 foam 进入全屏 TUI(默认 Target + Instruction 模式,对齐 Strix)
+foam
+foam -t 192.168.56.10 --instruction "重点测试 HTTP 服务与认证逻辑"
+#    → 直接进入主对话区(顶部紧凑欢迎条 + 右侧目标/状态栏),首条输入即开跑
+#    → 运行中随时 `/target` 设定或更新目标;需要代码级硬护栏时可按需使用 `/scope <描述>`
 
-# 3. 回放、证据核验与报告
+# 3. headless 非交互模式(`-n/--non-interactive` 或 `run`)
+foam -n -t 192.168.56.10 --instruction "对目标主机侦察并汇总开放服务"
+foam -n --target-list targets.txt --instruction-file task.txt
+
+# 4. 回放、证据核验与报告
 foam replay engagements/<id>
 foam verify engagements/<id>          # 人读;--json 输出机读结果
 foam report engagements/<id> --out report.md
@@ -79,30 +83,29 @@ foam report engagements/<id> --out report.md
 foam report engagements/<id> --redact --out report-share.md
 ```
 
-`run` / `resume` / `tui` 必须显式给 `--execution-mode protected` 或
-`--execution-mode legacy`;不从环境变量或 profile 猜测。legacy 仅提供
-Bash 参数级护栏,不做网络强制,工具继承完整环境,已有连接不随 scope
-撤销。protected 当前仅支持已以 root 启动 Foam 的 Linux,且 scope 只能
-含 CIDR;创建或换代失败会停止执行,绝不自动回退 legacy。protected 的
-`/scope` 换代会作废旧 job/PTY 并终止其已有连接,成功后才恢复新派发。
+默认以 `legacy` + Target + Instruction 模式运行(不强制 `--execution-mode` 或
+`scope` 硬拦截);显式传入 `--scope`/`--scope-text` 或在 TUI 执行 `/scope <描述>`
+可按需启用 Bash 参数级护栏(无网络强制,工具继承完整环境)。显式传入
+`--protected` 或 `--execution-mode protected` 启用 Linux 网络隔离边界——当前仅支持
+已以 root 启动 Foam 的 Linux,且 scope/CIDR 目标只能含 CIDR;创建或换代失败会
+停止执行,绝不自动回退 legacy。protected 的 `/scope` 换代会作废旧 job/PTY 并
+终止其已有连接,成功后才恢复新派发。
 
-headless/CI 场景可用 scope 文件(零确认仪式,行为照旧;每行一条:
-CIDR / 主机名 / 通配域 / URL——URL 规则按规范化 origin(scheme/host/
+headless/CI 如需启用代码级 scope 护栏,仍可使用 `--scope` / `--scope-text`
+(每行一条:CIDR / 主机名 / 通配域 / URL——URL 规则按规范化 origin(scheme/host/
 有效端口)匹配,再按路径前缀收窄;畸形 URL 目标与畸形 URL 规则一律拒绝;
 protected 不支持其中的主机名、通配域或 URL):
 
 ```bash
 printf '192.168.56.0/24\n' > my.scope
-foam run --execution-mode legacy --scope my.scope \
+foam run --scope my.scope \
   --objective "对 scope 内主机做侦察,汇总存活主机与开放服务"
 # 或一句话声明(headless 非交互自动确认,编译结果上屏+落审计):
-foam run --execution-mode legacy \
-  --scope-text "仅限 192.168.56.0/24 网段" --objective "..."
+foam run --scope-text "仅限 192.168.56.0/24 网段" --objective "..."
 ```
 
-全屏 TUI 也接受 `foam tui --execution-mode legacy --scope my.scope`
-(文件流零仪式照旧);TUI 内 objective 即首条消息,支持随时插话;
-Ctrl-C 触发 kill switch,回收全部活动任务与会话。
+全屏 TUI 也支持 `--scope my.scope` 或 `--scope-text`;Ctrl-C 触发 kill switch,
+回收全部活动任务与会话。
 
 ## protected 安装
 
@@ -172,17 +175,15 @@ Rolling 2025.3)默认 `sudo` 配置下 `HOME` 会重置为 `/root`,此时 profil
 
 后端、模型与 base-url 可存为命名 profile,免去每次重给;存于
 `~/.foam/config.json`(写入后权限 0600,与 TUI 呼号同文件、互不影响)。
-`run` / `resume` / `tui` 均支持 `--profile` 与 `--save-profile`;
-执行模式仍需每次显式选择,不写入 profile:
+CLI 主入口与 `run` / `resume` / `tui` 均支持 `--profile` 与 `--save-profile`;
+`protected` 境界仍需显式指定,不写入 profile:
 
 ```bash
 # 本次装配成功后存为 profile,并记为默认(之后不带参数即沿用)
-foam run --execution-mode legacy --scope my.scope \
-  --objective "..." --save-profile k3
+foam -t 192.168.56.10 --save-profile k3
 
 # 显式选用某个 profile
-foam run --execution-mode legacy --scope my.scope \
-  --objective "..." --profile k3
+foam -n -t 192.168.56.10 --profile k3
 ```
 
 profile 生效时启动行打印 `[config] profile 'k3':backend=… model=…`
@@ -200,9 +201,11 @@ key/token/secret 字样的键一律剔除、不落盘。
 
 | 命令 | 作用 |
 |---|---|
-| `foam run` | headless 执行一个 objective(`--max-rounds` 等兜底阀可调) |
-| `foam tui` | 全屏 TUI(NL scope 确认仪式 + `/scope` 热换;连续对话、插话、斜杠命令、侧栏状态) |
-| `foam resume <dir>` | 审计链校验 + objective/scope 对账后从现场继续 |
+| `foam` / `foam -t <target>` | 直接进入全屏 TUI(默认 Target + Instruction 模式,支持 `--instruction`、`/target`、可选 `/scope`) |
+| `foam -n -t <target>` | headless 非交互执行(等价 `foam run -t <target>`) |
+| `foam run` | headless 执行目标/objective(`--target`、`--instruction`、可选 `--scope`/`--scope-text`) |
+| `foam tui` | 全屏 TUI 子命令(与直接运行 `foam` 等价) |
+| `foam resume <dir>` | 审计链校验 + objective/scope/targets 对账后从现场继续 |
 | `foam replay <dir>` | 哈希链校验 + 只读重放审计时间线 |
 | `foam verify <dir>` | 只读核验证据;0=pass,1=fail,2=使用错误,3=unknown/pending |
 | `foam doctor` | R13-B 只读诊断配置/后端/工具/workdir/protected;默认零网络,`--online` 仅 DNS/TCP/TLS |

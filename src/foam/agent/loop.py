@@ -73,6 +73,7 @@ from foam.agent.prompts import (
 from foam.agent.refusal import KIND_REFUSAL_DETECTED
 from foam.agent.refusal import detect as refusal_detect
 from foam.guard.audit import (
+    KIND_EXEC_REQUEST,
     KIND_EXEC_RESULT_META,
     KIND_JOB_EXIT,
     KIND_KILL_SWITCH,
@@ -490,7 +491,7 @@ class AgentLoop:
         *,
         backend: LLMBackend,
         bash: BashTool,
-        scope: Scope,
+        scope: Scope | None = None,
         audit: AuditLog,
         workdir: str | Path,
         system_prompt: str,
@@ -728,6 +729,9 @@ class AgentLoop:
                 "provider": self._backend.provider,
                 "workdir": str(self._workdir),
                 "run_id": self._run_id,  # R06 决策 5:纯追加字段,重放兼容
+                "guard_mode": (
+                    "scope_guard" if self._scope is not None else "target_only"
+                ),
                 "budget_opening": self._budget.snapshot(),
             },
         )
@@ -1093,14 +1097,26 @@ class AgentLoop:
             command = call.arguments.get("command")
             if not isinstance(command, str) or not command.strip():
                 return {"error": "run_command 需要非空字符串参数 command。"}
-            decision = check_command(command, self._scope, self._audit)
-            self._observer.on_guard(decision)
-            if not decision.allowed:
-                return {
-                    "status": "denied_by_scope_guard",
-                    "violations": list(decision.violations),
-                    "reason": decision.reason,
-                }
+            if self._scope is not None:
+                decision = check_command(command, self._scope, self._audit)
+                self._observer.on_guard(decision)
+                if not decision.allowed:
+                    return {
+                        "status": "denied_by_scope_guard",
+                        "violations": list(decision.violations),
+                        "reason": decision.reason,
+                    }
+            else:
+                self._audit.append(
+                    KIND_EXEC_REQUEST,
+                    {
+                        "command": command,
+                        "targets": [],
+                        "decision": "allowed",
+                        "warnings": [],
+                        "mode": "target_only",
+                    },
+                )
             if self._executor.capabilities().get("execution_mode") == "protected":
                 candidate = _capability_command(command)
                 key = (

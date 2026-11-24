@@ -48,11 +48,12 @@
 from __future__ import annotations
 
 import asyncio
+import getpass
 import hashlib
 import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,7 +80,10 @@ from foam.agent.loop import (
     ToolRegistry,
     estimate_tokens,
 )
-from foam.agent.prompts import build_system_prompt, render_scope_section
+from foam.agent.prompts import (
+    build_system_prompt,
+    render_scope_section,
+)
 from foam.agent.scope_compiler import (
     ScopeCompilation,
     ScopeCompileError,
@@ -93,6 +97,7 @@ from foam.guard.audit import (
     KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
     KIND_SCOPE_UPDATED,
+    KIND_TARGET_DECLARED,
     AuditLog,
 )
 from foam.guard.network import (
@@ -140,6 +145,7 @@ from foam.tui.widgets import (
     ScopeConfirmCard,
     SidebarPane,
     StatusBar,
+    WelcomeBanner,
 )
 
 #: 侧栏自动隐藏阈值(D3:终端宽度 <110 列时默认隐藏,F2 唤出)。
@@ -175,13 +181,14 @@ _HELP_TEXT = """斜杠命令(输入 / 有补全):
   /status   run 状态与索引摘要
   /budget   裸命令=查看总预算;/budget <维度> <N> 显式变更(0=累计不限)
             维度:context / tokens / rounds / wall-time(秒)
-  /scope    裸命令=查看当前授权 scope;/scope <描述> 经确认仪式修改
+  /target   裸命令=查看目标与指示;/target <t1> [t2...] 设置/更新目标
+  /scope    裸命令=查看授权 scope;/scope <描述> 可选启用参数级护栏
 快捷键:
   Ctrl-X / Ctrl-C  kill(二次确认,Esc 取消)
   Ctrl-P           暂停/继续切换
   F2               侧栏显隐(终端 <110 列时自动隐藏)
   Enter            提交;聚焦卡片/思考块时展开/折叠
-普通文本 = 插话(首条消息为 objective,发出后 loop 启动),不重置预算。"""
+普通文本 = 对话/任务或插话(不重置预算)。"""
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +235,12 @@ class TUIConfig:
     loop_factory: LoopFactory | None = None
     config_home: str | Path | None = None
     scope_bytes: bytes | None = None
+    targets: Sequence[str] = ()
+    instruction: str = ""
+    operator: str = ""
+    require_welcome: bool = False
+    require_scope_ceremony: bool = False
+    scope_text: str | None = None
 
     @property
     def home_path(self) -> Path:
@@ -295,6 +308,9 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
             workdir=engagement.paths.root,
             tool_map_text=render_tool_map(scan_tools()),
             execution_mode=config.execution_mode,
+            guard_enabled=config.scope is not None,
+            targets=config.targets,
+            instruction=config.instruction,
         )
         heartbeat = HeartbeatWriter(
             engagement.paths.root, run_id="", entry="tui"
@@ -527,7 +543,34 @@ class MainScreen(Screen):
     def on_mount(self) -> None:
         self.set_interval(PANEL_REFRESH_SECONDS, self.refresh_panels)
         self._apply_sidebar_visibility()
+        app = self.tui
+        config = app.config
+        self.sidebar.set_targets(list(config.targets), config.instruction)
+        if config.scope is not None:
+            meta_items = [
+                app.backend_label,
+                f"scope: {len(config.scope.rules)} 条规则",
+            ]
+        elif config.targets:
+            meta_items = [
+                app.backend_label,
+                f"目标: {', '.join(config.targets)}",
+            ]
+        else:
+            meta_items = [app.backend_label, "自由交互模式"]
+        if config.execution_mode == "protected":
+            meta_items.append("protected")
+        if config.instruction.strip():
+            meta_items.append("已附加指令")
+        banner = WelcomeBanner(
+            title=f"{__app_name__} v{__version__}",
+            meta=" · ".join(meta_items),
+            hint="/help 命令 · /target 设定目标 · /scope 可选护栏",
+        )
+        self.narrative.mount(banner)
         self.input_dock.input_box.focus()
+        if config.scope_text and config.scope is None and not app.ceremony_running:
+            app.start_scope_ceremony(config.scope_text, mode="predeclare")
 
     # ---------- 部件速取 ----------
 
@@ -732,6 +775,10 @@ class MainScreen(Screen):
                         f"{shown(change['old_limit'])} → {shown(change['new_limit'])}"
                         "(已写 operator 审计)",
                     )
+        elif command == "/target":
+            parts = raw.split(maxsplit=1)
+            argument = parts[1].strip() if len(parts) > 1 else ""
+            self._handle_target_command(argument)
         elif command == "/scope":
             parts = raw.split(maxsplit=1)
             argument = parts[1].strip() if len(parts) > 1 else ""
@@ -744,6 +791,63 @@ class MainScreen(Screen):
                 "error", f"未知命令 {command};/help 查看可用命令"
             )
 
+    def _handle_target_command(self, argument: str) -> None:
+        """查看或设置/更新目标(-t)与附加指示。"""
+        app = self.tui
+        if not argument:
+            targets = list(app.config.targets)
+            inst = str(app.config.instruction or "").strip()
+            guard_label = (
+                f"已启用 ({len(app.config.scope.rules)} 条规则)"
+                if app.config.scope is not None
+                else "未启用(Target + Instruction 模式)"
+            )
+            lines = [
+                "当前目标(targets): "
+                + (", ".join(targets) if targets else "(未设定固定目标)"),
+                f"参数级 scope 护栏: {guard_label}",
+            ]
+            if inst:
+                lines.append(f"附加指示(instruction): {inst}")
+            lines.append("设置/更新用法: /target <目标1> [目标2 ...]")
+            self.narrative.add_notice("info", "\n".join(lines))
+            return
+        if app.run_handle is not None and app.active_loop is None:
+            self.narrative.add_notice("info", "run 已结束,目标不可更改")
+            return
+        new_targets: list[str] = []
+        for token in argument.replace(",", " ").split():
+            cleaned = token.strip()
+            if cleaned and cleaned not in new_targets:
+                new_targets.append(cleaned)
+        if not new_targets:
+            self.narrative.add_notice("error", "用法: /target <目标1> [目标2 ...]")
+            return
+        app.config.targets = new_targets
+        self.sidebar.set_targets(new_targets, str(app.config.instruction or ""))
+        if app.engagement is not None:
+            try:
+                app.engagement.update_targets(new_targets)
+            except (OSError, ValueError) as exc:
+                self.narrative.add_notice("error", f"目标写入工作笔记失败:{exc}")
+            if app._audit is not None and not app.runtime_closed:
+                app._audit.append(
+                    KIND_TARGET_DECLARED,
+                    {
+                        "targets": new_targets,
+                        "instruction": str(app.config.instruction or "").strip(),
+                        "guard_mode": "scope_guard"
+                        if app.config.scope is not None
+                        else "target_only",
+                    },
+                )
+        loop = app.active_loop
+        if loop is not None:
+            loop.interject(f"[目标更新] 当前关注目标已更新为: {', '.join(new_targets)}")
+        self.narrative.add_notice(
+            "success", f"目标已更新: {', '.join(new_targets)}"
+        )
+
     # ---------- /scope(WP-14c:裸=只读展示 D3/D10;带参=同一仪式热换 Q5) ----------
 
     def _show_scope(self) -> None:
@@ -754,8 +858,8 @@ class MainScreen(Screen):
         if scope is None:
             self.narrative.add_notice(
                 "info",
-                "尚未声明授权 scope——发送首条消息(自然语言描述目标与范围),"
-                "或 /scope <描述> 启动确认仪式",
+                "未启用参数级 scope 硬护栏(当前按 Target + Instruction 模式运行);"
+                "如需启用请输入 /scope <自然语言描述>",
             )
             return
         canonical = render_canonical_rules(scope.rules)
@@ -1087,6 +1191,19 @@ class TuiApp(App[None]):
     # ---------- 屏幕流 ----------
 
     async def on_mount(self) -> None:
+        if not self.config.require_welcome:
+            resolved = str(self.config.operator or "").strip()
+            if not resolved:
+                resolved = load_operator(self.config.home_path).strip()
+            if not resolved:
+                try:
+                    resolved = getpass.getuser().strip()
+                except Exception:
+                    resolved = ""
+            self.operator = resolved or "operator"
+            self._main = MainScreen()
+            await self.push_screen(self._main)
+            return
         declared = self.config.scope is not None
         info = WelcomeInfo(
             wordmark=_gradient_wordmark(
@@ -1148,6 +1265,11 @@ class TuiApp(App[None]):
         held = self._engagement_lock
         if held is not None and held.path.parent.resolve() != root.resolve():
             raise RuntimeError("TUI 当前持有另一个 engagement 的写者锁")
+        guard_mode = (
+            "scope_guard"
+            if (scope_path is not None or self.config.scope is not None)
+            else "target_only"
+        )
         if create:
             engagement = Engagement.create(
                 self.config.engagements_dir,
@@ -1155,6 +1277,9 @@ class TuiApp(App[None]):
                 scope_path=scope_path,
                 engagement_id=engagement_id,
                 scope_bytes=scope_bytes,
+                targets=self.config.targets,
+                instruction=self.config.instruction,
+                guard_mode=guard_mode,
             )
         elif (root / "engagement.json").exists():
             engagement = Engagement.open(root)
@@ -1165,6 +1290,9 @@ class TuiApp(App[None]):
                 scope_path=scope_path,
                 engagement_id=engagement_id,
                 scope_bytes=scope_bytes,
+                targets=self.config.targets,
+                instruction=self.config.instruction,
+                guard_mode=guard_mode,
             )
         if held is not None:
             return engagement
@@ -1209,13 +1337,17 @@ class TuiApp(App[None]):
             )
             return
         if self.run_handle is None:
-            main.narrative.add_notice(
-                "objective", f"目标(呼号 {self.operator}):{text}"
-            )
+            main.narrative.add_notice("objective", f"❯ {text}")
             if self.config.scope is None:
-                # NL 仪式流(Q5):首条消息承载 objective+NL scope,冻结完成前
-                # loop 不启动(「scope 冻结前 loop 不启动」)。
-                self.start_scope_ceremony(text, mode="startup")
+                if (
+                    self.config.execution_mode == "protected"
+                    or self.config.require_scope_ceremony
+                ):
+                    # protected 或显式仪式开关仍先冻结边界才启动 loop。
+                    self.start_scope_ceremony(text, mode="startup")
+                    return
+                # 默认 Target+Instruction 模式直接开跑,不强弹 scope 仪式。
+                self.start_run(text)
                 return
             if self._scope_frozen_via_nl:
                 # NL 冻结后首条消息:先把 run engagement 预备齐(meta 对账+
@@ -1240,9 +1372,7 @@ class TuiApp(App[None]):
                 main.narrative.add_notice("info", _PLACEHOLDER_ENDED)
             return
         loop.interject(text)
-        main.narrative.add_notice(
-            "interject", f"插话(呼号 {self.operator}):{text}"
-        )
+        main.narrative.add_notice("interject", f"❯ {text}")
 
     def _append_file_scope_confirm(self) -> None:
         """Q8:file 流在 ``start_run`` 内、run task 创建前且仍持锁时补写
@@ -1714,9 +1844,14 @@ class TuiApp(App[None]):
         if self.run_handle is not None or self._main is None:
             return  # 单 run 会话:重复触发直接忽略
         main = self._main
+        scope_path_arg = (
+            self.config.scope_source
+            if self.config.scope is not None and self.config.scope_source
+            else None
+        )
         try:
             engagement = self._open_engagement_locked(
-                objective, scope_path=self.config.scope_source, create=True
+                objective, scope_path=scope_path_arg, create=True
             )
         except EngagementLockedError as exc:
             self._report_lock_failure(exc)
@@ -1730,10 +1865,28 @@ class TuiApp(App[None]):
         try:
             engagement.set_operator(self.operator)
             audit = AuditLog(engagement.paths.audit_jsonl)
-            audit.append(
-                KIND_SCOPE_LOADED,
-                scope_payload(self.config.scope, self.config.scope_source),
-            )
+            if self.config.scope is not None:
+                audit.append(
+                    KIND_SCOPE_LOADED,
+                    scope_payload(self.config.scope, self.config.scope_source),
+                )
+            if (
+                self.config.targets
+                or str(self.config.instruction or "").strip()
+                or self.config.scope is None
+            ):
+                audit.append(
+                    KIND_TARGET_DECLARED,
+                    {
+                        "targets": [
+                            t.strip() for t in self.config.targets if t and t.strip()
+                        ],
+                        "instruction": str(self.config.instruction or "").strip(),
+                        "guard_mode": "scope_guard"
+                        if self.config.scope is not None
+                        else "target_only",
+                    },
+                )
             ctx = RunContext(
                 objective=objective,
                 operator=self.operator,
@@ -1793,21 +1946,16 @@ class TuiApp(App[None]):
             boundary=handle.boundary,
         )
         try:
-            if not self._scope_frozen_via_nl:
+            if not self._scope_frozen_via_nl and self.config.scope is not None:
                 self._append_file_scope_confirm()
             main.statusbar.set_engagement(engagement.paths.root.name, self.operator)
             main.input_dock.input_box.placeholder = _PLACEHOLDER_RUNNING
-            if handle.boundary is None:
-                execution = (
-                    "执行模式:legacy;仅 Bash 参数级护栏,无网络强制,"
-                    "继承完整环境,已有连接不随 scope 撤销"
-                )
-            else:
-                execution = (
+            if handle.boundary is not None:
+                main.narrative.add_notice(
+                    "info",
                     f"执行模式:protected boundary={handle.boundary.boundary_id} "
-                    f"epoch={handle.boundary.epoch}"
+                    f"epoch={handle.boundary.epoch}",
                 )
-            main.narrative.add_notice("info", execution)
         except Exception as exc:
             self.run_handle = None
             self._run_task = asyncio.create_task(
@@ -1846,6 +1994,7 @@ class TuiApp(App[None]):
             warning = cleanup_warning_text(report)
             if warning and self._main is not None:
                 self._main.narrative.add_notice("error", warning)
+            self._audit = None
         # R09:终态证据 manifest(close_run 之后,纯读源;失败只上屏,
         # 不反转 run 结果;无 run_finished 不写、不补造)
         if self.engagement is not None:
@@ -1925,26 +2074,39 @@ def run_tui(config: TUIConfig) -> int:
 
 
 def main(args) -> int:
-    """``foam tui`` 子命令入口(WP-10 占位约定的接线点)。
+    """TUI 入口(直接运行 CLI 或 ``tui`` 子命令)。
 
-    args 携带 ``--scope/--workdir/--backend/--model/--base-url`` 与 loop
-    参数(``--max-context-tokens/--max-rounds/--first-event-timeout``);
-    objective 由主界面输入框首条消息提供(定案 Q1)。scope/后端装配复用
-    cli 的公开构件与其 ``_build_backend``(cli 注释明示「tui 就绪后也可
-    复用」);密钥只由后端从环境变量读取,本层不接触。
-
-    WP-14c:``--scope`` 由 CLI 侧改可选(cli.py 归属 14b);``args.scope``
-    为 None 时跳过加载,以 ``scope=None, scope_source=""`` 进 NL 确认仪式流。
-    R02-C:给定时一次 read_bytes 完成解析与字节绑定(``scope_bytes`` 随
-    config 下行),迎宾等待期外部文件被改不二次读盘。
+    支持 Strix 对齐的 ``-t/--target`` 与 ``--instruction``,默认 Target+Instruction
+    模式直入主界面;传入 ``--scope``/``--scope-text`` 或 ``--protected`` 时按需
+    启用参数级/网络级硬护栏。
     """
-    from foam.cli import ENV_MODEL, EXIT_USAGE, _build_backend
+    from foam.cli import (
+        ENV_MODEL,
+        EXIT_USAGE,
+        _build_backend,
+        _resolve_execution_mode,
+        _scope_from_cidr_targets,
+    )
     from foam.guard.scope import parse_scope
+
+    try:
+        _resolve_execution_mode(args)
+    except ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    targets = [
+        str(t).strip()
+        for t in (getattr(args, "targets", None) or ())
+        if str(t).strip()
+    ]
+    instruction = str(getattr(args, "instruction", "") or "").strip()
+    scope_text = getattr(args, "scope_text", None)
 
     scope: Scope | None = None
     scope_source = ""
     scope_bytes: bytes | None = None
-    if args.scope is not None:
+    if getattr(args, "scope", None) is not None:
         try:
             scope_bytes = Path(args.scope).read_bytes()
             scope = parse_scope(scope_bytes.decode("utf-8"))
@@ -1952,6 +2114,15 @@ def main(args) -> int:
             print(f"[错误] scope 加载失败: {exc}", file=sys.stderr)
             return EXIT_USAGE
         scope_source = str(args.scope)
+    elif args.execution_mode == "protected" and scope_text is None:
+        if targets:
+            try:
+                scope, scope_source, scope_bytes, _ = _scope_from_cidr_targets(targets)
+            except ConfigError as exc:
+                print(f"[错误] {exc}", file=sys.stderr)
+                return EXIT_USAGE
+        # protected 无 --scope 且无 -t 时仍允许进主屏走 startup scope 确认仪式
+        # (如果启动时边界创建失败,start_run 仍 fail-closed 且不回退 legacy)
     try:
         backend = _build_backend(args)
     except ConfigError as exc:
@@ -1966,13 +2137,16 @@ def main(args) -> int:
         scope=scope,
         scope_source=scope_source,
         backend=backend,
-        model_label=args.model or os.environ.get(ENV_MODEL) or "",
+        model_label=getattr(args, "model", None) or os.environ.get(ENV_MODEL) or "",
         execution_mode=args.execution_mode,
-        engagements_dir=args.workdir or DEFAULT_ENGAGEMENTS_DIR,
+        engagements_dir=getattr(args, "workdir", None) or DEFAULT_ENGAGEMENTS_DIR,
         max_rounds=getattr(args, "max_rounds", 0) or 0,
         max_total_tokens=getattr(args, "max_total_tokens", 0) or 0,
         max_wall_time=getattr(args, "max_wall_time", 0) or 0,
         scope_bytes=scope_bytes,
+        targets=targets,
+        instruction=instruction,
+        scope_text=scope_text,
         **kwargs,
     )
     return run_tui(config)

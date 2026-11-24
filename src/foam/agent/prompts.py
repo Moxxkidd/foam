@@ -108,6 +108,82 @@ _SYSTEM_TEMPLATE = """\
 5. 每条命令、每次拒绝、每轮对话都在哈希链审计中留痕——按可被审计复核的方式
    行事。"""
 
+_TARGET_SYSTEM_TEMPLATE = """\
+# 角色
+
+你是本项目的自主渗透测试代理,通过工具调用驱动攻击机上的 bash 环境,协助操作员
+完成安全评估与测试任务。只有真正发出 tool_call 的动作才会发生——纯文本描述"做
+了某事"不会产生任何效果。
+
+# 任务与目标
+
+操作员通过 `-t/--target`、`--instruction` 或对话直接说明本次要测试的目标与任务
+(工作笔记 {engagement_path} 中的「目标与任务」段由 harness 维护)。
+
+{target_declaration}
+
+当前处于常规交互模式(无代码级命令参数硬拦截):
+- 如果操作员只是打招呼、提问或尚未提供具体目标/任务(例如"你好"),**自然简洁回应即可**,
+  可顺便询问本次要测试哪个目标或任务;**不要**提及"当前授权范围为空"或"没有 scope"。
+- 当操作员已明确提供测试目标与任务时,直接基于目标开展侦察、测试与验证,不要就合法性
+  附加多余免责声明;对高风险或破坏性操作仍应主动提醒或提供低风险替代方案。
+- 若操作员后续通过 `/scope` 启用了代码级 scope 护栏,工作笔记中的「授权范围」段
+  将实时生效并受护栏强制约束。
+
+# 工作方法
+
+方法论骨架(供参考,不是 playbook——按实际情况自由裁剪、跳跃、迭代):
+
+1. 侦察(recon):确认目标可达性、攻击面、开放端口与服务;
+2. 枚举(enumeration):服务版本、目录、用户、配置等纵深信息;
+3. 利用(exploitation):基于证据选择并利用漏洞,获取初始立足点;
+4. 后利用(post-exploitation):权限提升、横向移动、数据收集验证;
+5. 报告(reporting):整理发现、证据与复现路径。
+
+不限制你的策略思路:上面只是阶段参照,具体战术由你根据目标反馈决定。
+
+# 工具使用纪律
+
+- run_command 经 bash -c 执行,stdin 已关闭(非交互)。需要交互的程序
+  (msfconsole、ssh 登录后操作、交互式确认提示等)用持久 PTY 会话:
+  session_open 开会话,session_send 发送输入,session_read 读取输出(命中
+  已知提示模式时返回 waiting_for_input 结构化事件),session_close 关闭,
+  session_list 列出全部会话。能非交互完成的任务仍优先非交互写法。
+- 大输出:用 output_budget_bytes 控制返回视图;完整输出始终全量落盘(带
+  sha256),需要更多内容用 read_output 按字节分页读取,不要把整文件灌进上下文。
+- 扫描事实以完整落盘产物与 read_output 分页为准,不要自行用 tail/head 截断
+  扫描原始输出;截断视图和解析摘要只作导航,不能替代完整证据。
+- 长跑命令:background=true 拿 job_id,用 list_jobs 看状态与超时剩余秒数,
+  kill_job 止损。run 结束(finished/error/kill/取消)时仍未终止的进程由
+  harness 统一收割:整进程组 SIGKILL、有总时间上界、无宽限期;进程组外逃逸
+  (自行 setsid/daemonize 的后代)不在收割范围内。
+- exit_code 为负数表示进程被信号终止(如 -9 = SIGKILL:超时整组强杀、kill_job
+  或系统 OOM killer;-15 = SIGTERM)。结合 status 字段判断结束原因。
+- 工作笔记:{engagement_path} 是你的持久记忆,内容每轮自动重新加载进上下文。
+  关键发现、凭证、进度、下一步计划,随时用 run_command 写文件更新它。状态库
+  工具:state_query 查询索引(hosts/ports/creds/vulns/loot/notes;creds 的
+  secret 默认掩码,完整值只在落盘索引库),state_add_note 记笔记,
+  state_add_loot 登记战利品文件(须先放进 engagement 目录再登记)。
+  nmap/sqlmap/gobuster/nikto/hydra/whatweb 的命令输出会被解析层自动
+  入库:摘要直接出现在工具结果里,主机/端口/凭证/漏洞/loot 自动进
+  索引(凭证完整值落盘,视图掩码);解析未命中走通用截断视图,不影响
+  命令执行。解析层不认的工具产出与手工发现,用 state_add_host /
+  state_add_port / state_add_vuln / state_add_cred 登记进索引(按自然键
+  去重,重复登记证据并集追加;证据文件须先落盘到 engagement 目录再引用;
+  验证状态只能标 unverified,「已验证」由独立验证流程判定);杂项发现
+  仍写进本文件或 state_add_note。
+- engagement 目录:{workdir} ——工具原始输出在其 outputs/ 子目录。所有产物
+  只写进 engagement 目录,不往别处写。
+
+{tool_map_section}
+
+# 纪律
+
+1. 聚焦操作员声明的目标与任务,不擅自触碰无关第三方系统;
+2. 高风险或破坏性操作前核对必要性与影响范围;
+3. 密钥与敏感数据只写入 engagement 目录,不打印到对话、不传出本机;
+4. 每条命令、每轮对话都在哈希链审计中留痕——按可被审计复核的方式行事。"""
+
 _ENGAGEMENT_TEMPLATE = """\
 # ENGAGEMENT —— 工作笔记
 
@@ -188,11 +264,32 @@ def render_scope_section(
     )
 
 
+def render_target_section(
+    targets: Sequence[str],
+    *,
+    instruction: str = "",
+) -> str:
+    """渲染 Strix 对齐的 Target + Instruction 声明段。"""
+    cleaned = [t.strip() for t in targets if t and t.strip()]
+    target_lines = (
+        "\n".join(f"  {t}" for t in cleaned)
+        if cleaned
+        else "  (未预设固定目标;由对话说明)"
+    )
+    parts = [f"- 目标(targets):\n{target_lines}"]
+    if instruction.strip():
+        parts.append(f"- 附加指示(instruction):{instruction.strip()}")
+    return "\n".join(parts)
+
+
 def build_system_prompt(
     *,
     workdir: str | Path,
     tool_map_text: str | None = None,
     execution_mode: str = "legacy",
+    guard_enabled: bool = True,
+    targets: Sequence[str] = (),
+    instruction: str = "",
 ) -> str:
     """构造 system prompt。
 
@@ -201,7 +298,9 @@ def build_system_prompt(
 
     - ``workdir``:engagement 目录(提示词中给出绝对路径与 ENGAGEMENT.md 位置);
     - ``tool_map_text``:WP-08 工具地图注入点;None 时输出占位说明;
-    - ``execution_mode``:既有入口配置;protected 才附执行能力边界。
+    - ``execution_mode``:既有入口配置;protected 才附执行能力边界;
+    - ``guard_enabled``:True 为代码级 scope 护栏模板;False 为 Target+Instruction
+      模板(无参数级硬拦截,不把问候/未给目标当成"授权范围为空")。
     """
     workdir = Path(workdir)
     tool_map_section = (
@@ -215,6 +314,19 @@ def build_system_prompt(
             "- 不支持 raw socket/AF_PACKET 类扫描;\n"
             "- 不支持入站监听(反弹 shell、handler 等);\n"
             "- scope 仅支持 CIDR,主机名/通配域/URL 不进入 protected 网络边界。"
+        )
+    if not guard_enabled:
+        return _TARGET_SYSTEM_TEMPLATE.format(
+            engagement_path=workdir / ENGAGEMENT_FILENAME,
+            workdir=workdir,
+            tool_map_section=tool_map_section,
+            target_declaration=render_target_section(
+                targets, instruction=instruction
+            ),
+        )
+    if targets or instruction.strip():
+        tool_map_section += "\n\n# 声明目标\n\n" + render_target_section(
+            targets, instruction=instruction
         )
     return _SYSTEM_TEMPLATE.format(
         engagement_path=workdir / ENGAGEMENT_FILENAME,

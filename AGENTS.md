@@ -63,6 +63,20 @@
 - engagement 运行时产物(工具原始输出、loot、索引库)永不入库
   (`.gitignore` 已挡,提交前自查 `git status`)。
 
+### 4.1 Target + Instruction 模式（2026-11-24 生效，对齐 Strix）
+
+- 2026-11-24 起，CLI 与 TUI 默认交互体验与目标声明机制全面对齐 Strix：
+  - 终端直接输入 `foam`（或 `fm`）默认直接进入全屏 TUI（跳过独立呼号迎宾屏，
+    自动解析 operator），加 `-n/--non-interactive` 切换 headless 运行；
+  - 默认以 `legacy` + Target + Instruction 模式运行（`-t/--target`、
+    `--target-list`、`--instruction`、`--instruction-file`）：声明的目标与指示
+    注入系统上下文、`ENGAGEMENT.md` 与 `target_declared` 审计事件，默认不开启
+    Bash CLI 命令参数级硬拦截；
+  - 以下显式入口仍按既有 fail-closed 契约启用代码级护栏与/或网络隔离：
+    传入 `--scope`/`--scope-text`、在 TUI 中主动执行 `/scope <描述>`、恢复已有
+    冻结 `scope` 的 engagement，或显式指定 `--protected` /
+    `--execution-mode protected`（protected 仍要求 CIDR 边界且绝不回退 legacy）。
+
 ## 5. 工程纪律
 
 - Python ≥ 3.12,`asyncio`;依赖保持保守(长期目标 Kali/Debian 官方源),

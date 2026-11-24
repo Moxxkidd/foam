@@ -1394,3 +1394,31 @@ WP-13(整合)依赖全部
   回归后 `test_network.py` `68 passed`；最终提交流水线全量 `pytest -q`、`ruff`
   与 `git diff --check` 见本轮交付报告。根目录调试 zip 继续排除；下一步可按
   [v0.3.0 清单](releases/v0.3.0.md) 与评估序列推进 R20-A 基线采集。
+
+
+## 当前状态（2026-11-24：UX 与 Target + Instruction 模式对齐 Strix）
+
+- CLI 与 TUI 默认交互全面对齐 Strix，并新增契约节 `AGENTS.md` §4.1：
+  - 终端直接运行 `foam`（或 `fm`）及 `foam -t <目标>` 默认直接进入全屏 TUI
+    （跳过独立呼号迎宾屏，自动解析 operator）；`-n/--non-interactive` 切换
+    headless 执行，`--execution-mode` 默认为 `legacy`。
+  - 默认以 `legacy` + Target + Instruction 模式运行（新增 `-t/--target`、
+    `--target-list`、`--instruction`、`--instruction-file`）：目标与指示写入
+    system prompt（无“当前授权范围为空”式拒答）、`ENGAGEMENT.md`「目标与任务」
+    动态段、metadata 与 `target_declared` 审计事件；默认不对 `run_command` 施加
+    参数级硬拦截。
+  - 显式入口仍按既有 fail-closed 契约启用护栏或隔离：`--scope`/`--scope-text`、
+    TUI 中 `/scope <描述>`（支持运行期按需热开启）、恢复已有冻结 scope 的
+    engagement，以及 `--protected` / `--execution-mode protected`（支持纯 IP/CIDR
+    `-t` 目标自动转网络边界，非 CIDR 或无边界绝不回退 `legacy`）。
+  - TUI 修复与简化：`styles.tcss` 为 `.thinking`/`.toolcard`/`.stream`/`.notice`
+    等 `Vertical` 子部件补充 `height: auto;`，消除 Textual 8.x 折叠块撑满整屏
+    高度的空白竖线缺陷；主屏顶部改为紧凑 `WelcomeBanner`，用户输入统一回显为
+    `❯ {text}`，移除 `执行模式:legacy;仅 Bash 参数级护栏...` 对话流噪音，新增
+    `/target` 命令与侧栏 `#side-targets` 目标展示。
+- 文档同步：`AGENTS.md`（新增 §4.1）与 `README.md` 快速开始/命令速览已更新，
+  `README.md` 既有 `## protected 安装` 公开契约全部保留。
+- 代码与测试全改完后实测全量门禁：`.venv/bin/python -m pytest -q` 通过
+  **1019 passed, 41 skipped in 200.10s**（含 Textual 折叠高度、Strix `-t`/
+  `-n`/`--protected` 端到端与 `/target`/`/scope` 增量回归），`ruff check .`
+  与 `git diff --check` 全绿；历史 `v0.2.0` tag 不动，根目录调试 zip 继续排除。

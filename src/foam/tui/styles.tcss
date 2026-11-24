@@ -115,6 +115,7 @@ WelcomeScreen {
 
 .stream {
     color: #e6edf3;
+    height: auto;
 }
 
 .phase-divider {
@@ -122,10 +123,12 @@ WelcomeScreen {
     text-style: bold;
     text-align: center;
     margin-top: 1;
+    height: auto;
 }
 
 .notice {
     padding: 0 1;
+    height: auto;
 }
 
 .notice.ok { color: #3fb950; }
@@ -135,11 +138,38 @@ WelcomeScreen {
 .notice.phase { color: #56d4dd; }
 .notice.blue { color: #58a6ff; }
 
+/* ---------- 内联欢迎条(Strix 对齐) ---------- */
+
+#welcome-banner {
+    border: round #30363d;
+    background: #161b22;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    height: auto;
+}
+
+#banner-title {
+    color: #56d4dd;
+    text-style: bold;
+    height: auto;
+}
+
+#banner-meta {
+    color: #8b949e;
+    height: auto;
+}
+
+#banner-hint {
+    color: #c9d1d9;
+    height: auto;
+}
+
 /* ---------- 思考块(gray,默认折叠) ---------- */
 
 .thinking {
     border-left: solid #30363d;
     padding-left: 1;
+    height: auto;
 }
 
 .thinking:focus {
@@ -148,6 +178,7 @@ WelcomeScreen {
 
 .thinking-header {
     color: #8b949e;
+    height: auto;
 }
 
 .thinking-body {
@@ -155,6 +186,7 @@ WelcomeScreen {
     text-style: italic;
     background: #161b22;
     padding: 0 1;
+    height: auto;
 }
 
 /* ---------- 工具卡(紧凑流) ---------- */
@@ -162,10 +194,15 @@ WelcomeScreen {
 .toolcard {
     border-left: solid #30363d;
     padding-left: 1;
+    height: auto;
 }
 
 .toolcard:focus {
     border-left: solid #e6edf3;
+}
+
+.card-header {
+    height: auto;
 }
 
 .toolcard.running .card-header { color: #e6edf3; }
@@ -181,6 +218,7 @@ WelcomeScreen {
     color: #c9d1d9;
     background: #161b22;
     padding: 0 1;
+    height: auto;
 }
 
 /* ---------- scope 确认卡(WP-14c) ---------- */
@@ -195,6 +233,7 @@ WelcomeScreen {
 #scope-card-title {
     text-style: bold;
     color: #56d4dd;
+    height: auto;
 }
 
 #scope-card-body {
@@ -202,6 +241,7 @@ WelcomeScreen {
     background: #161b22;
     padding: 0 1;
     margin: 1 0;
+    height: auto;
 }
 
 /* Q9 空规则集 / 编译失败:颜色 + 粗体第二通道(不只靠颜色) */
@@ -216,6 +256,7 @@ WelcomeScreen {
 
 #scope-card-status {
     color: #8b949e;
+    height: auto;
 }
 
 #scope-card-buttons {
@@ -230,6 +271,7 @@ WelcomeScreen {
 #scope-correction {
     border: solid #30363d;
     background: #161b22;
+    height: auto;
 }
 
 #scope-correction:focus {
@@ -243,6 +285,7 @@ WelcomeScreen {
     color: #0d1117;
     text-style: bold;
     padding: 0 1;
+    height: auto;
 }
 
 /* ---------- 输入坞 ---------- */

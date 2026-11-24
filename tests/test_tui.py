@@ -57,11 +57,13 @@ from foam.agent.loop import (
 from foam.agent.prompts import build_system_prompt
 from foam.cli import main as cli_main
 from foam.guard.audit import (
+    KIND_EXEC_DENIED,
     KIND_KILL_SWITCH,
     KIND_OPERATOR_INTERJECT,
     KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
     KIND_SCOPE_UPDATED,
+    KIND_TARGET_DECLARED,
     AuditLog,
     verify,
 )
@@ -89,6 +91,7 @@ from foam.tui.widgets import (
     StreamBlock,
     ThinkingBlock,
     ToolCard,
+    WelcomeBanner,
     _budget_text,
     format_bytes,
     format_duration_ms,
@@ -205,10 +208,18 @@ async def wait_card_part(card, selector: str) -> str:
 
 
 async def enter_main(app: TuiApp, pilot, callsign: str = "nightowl"):
-    """迎宾屏输入呼号进入主界面;返回 MainScreen。"""
-    await pilot.press(*callsign)
-    await pilot.press("enter")
+    """进入主界面;require_welcome=True 时走呼号门,默认直接进入主屏。"""
+    from foam.tui.app import WelcomeScreen
+
+    await wait_for(
+        lambda: isinstance(app.screen, WelcomeScreen) or app._main is not None
+    )
+    if isinstance(app.screen, WelcomeScreen):
+        await pilot.press(*callsign)
+        await pilot.press("enter")
     await wait_for(lambda: app._main is not None)
+    if callsign and not isinstance(app.screen, WelcomeScreen):
+        app.operator = callsign
     await pilot.pause(0.2)
     return app._main
 
@@ -569,8 +580,8 @@ async def test_loop_kill_from_idle_cleanup_audit(tmp_path):
 
 
 async def test_welcome_gate_rejects_empty_callsign(tmp_path):
-    """验收 1:空呼号被拒——报错可见、停在迎宾屏、不建 engagement。"""
-    app = TuiApp(make_config(tmp_path, []))
+    """验收 1:require_welcome=True 时空呼号拒收——报错停在迎宾屏、不建目录。"""
+    app = TuiApp(make_config(tmp_path, [], require_welcome=True))
     async with app.run_test(headless=True, size=(140, 40)) as pilot:
         await pilot.pause(0.3)
         from foam.tui.app import WelcomeScreen
@@ -588,7 +599,7 @@ async def test_welcome_gate_rejects_empty_callsign(tmp_path):
 
 
 async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
-    """验收 1+2:呼号门 → 主界面 → objective 开跑 → 叙述流/卡片/侧栏/jobs。"""
+    """验收 1+2:直入主界面 → objective 开跑 → 叙述流/卡片/侧栏/jobs。"""
     script = [
         [
             ReasoningDelta("先看目标可达性。"),
@@ -604,20 +615,14 @@ async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
     ]
     app = TuiApp(make_config(tmp_path, script))
     async with app.run_test(headless=True, size=(140, 40)) as pilot:
-        await pilot.pause(0.3)
-        # 迎宾屏要素:字标/后端/scope/红线/呼号框
-        logo = app.screen.query_one("#wm-logo").content
-        assert logo  # 字标非空(具体内容验收 5 已锁)
-        meta = app.screen.query_one("#wm-meta").content
-        assert "fake-k3" in meta and "lab.scope" in meta
-        assert "scope 护栏" in app.screen.query_one("#wm-redline").content
-
         main = await enter_main(app, pilot)
-        # 主界面挂载:四大件就位,loop 未启动(Q1:首条消息前不启动)
+        # 主界面直接挂载:四大件 + 内联欢迎条就位,loop 未启动(首条消息前不启动)
         assert main.query_one("#statusbar", StatusBar)
         assert main.query_one("#narrative", NarrativeView)
         assert main.query_one("#sidebar", SidebarPane)
         assert main.query_one("#inputdock", InputDock)
+        assert main.query_one("#welcome-banner", WelcomeBanner)
+        assert "fake-k3" in main.query_one("#banner-meta").content
         assert app.run_handle is None
 
         await start_run_and_wait(app, pilot)
@@ -626,12 +631,12 @@ async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
         # 顶栏:engagement id + 呼号;状态 finished
         assert "呼号 nightowl" in main.query_one("#sb-center").content
         assert "已完成" in str(main.query_one("#sb-right").render())
-        # 叙述流:objective 回显 → 执行模式 → 思考块① → 正文① → 工具卡
+        # 叙述流:内联欢迎条 → objective 回显 → 思考块① → 正文① → 工具卡
         # → 思考块② → 正文② → 结项证据通知 → final。
         kinds = [type(w).__name__ for w in main.narrative.children]
         assert kinds == [
+            "WelcomeBanner",
             "NoticeBlock",
-            "NoticeBlock",  # R11:显式执行模式与能力边界
             "ThinkingBlock",
             "StreamBlock",
             "ToolCard",
@@ -648,7 +653,7 @@ async def test_full_flow_narrative_cards_and_sidebar(tmp_path):
         assert "未外部锚定" in evidence_notice.content
         objective = narrative_blocks(main, NoticeBlock)[0]
         assert objective.kind == "objective"
-        assert "nightowl" in objective.content and "recon lab" in objective.content
+        assert "❯" in objective.content and "recon lab" in objective.content
         thinkings = narrative_blocks(main, ThinkingBlock)
         assert [t.text for t in thinkings] == ["先看目标可达性。", "齐了。"]
         assert all(t.expanded is False and t.done is True for t in thinkings)
@@ -863,10 +868,10 @@ async def test_slash_commands_and_completion_popup(tmp_path):
         dock = main.query_one("#inputdock", InputDock)
         popup = dock.popup
 
-        # 输入 "/" → 弹层出 9 条候选(R12 增 /budget,8→9 有意变更)
+        # 输入 "/" → 弹层出 10 条候选(含 /target)
         await pilot.press("/")
         await wait_for(lambda: dock.popup_visible)
-        assert len(popup.children) == 9
+        assert len(popup.children) == 10
         # 继续输入 "sta" → 过滤到 /status;Enter 接受高亮(不直接提交)
         await pilot.press("s", "t", "a")
         await wait_for(lambda: len(popup.children) == 1)
@@ -1100,9 +1105,9 @@ async def test_sidebar_visible_on_wide_terminal(tmp_path):
 
 
 async def test_operator_persisted_and_prefilled_next_launch(tmp_path):
-    """D1:呼号写 ~/.foam/config.json(0600),下次启动迎宾屏预填。"""
+    """D1:require_welcome=True 时呼号写 ~/.foam/config.json(0600),下次预填。"""
     home = tmp_path / "home"
-    app = TuiApp(make_config(tmp_path, []))
+    app = TuiApp(make_config(tmp_path, [], require_welcome=True))
     async with app.run_test(headless=True, size=(140, 40)) as pilot:
         await pilot.pause(0.2)
         await enter_main(app, pilot, callsign="nightowl")
@@ -1114,7 +1119,7 @@ async def test_operator_persisted_and_prefilled_next_launch(tmp_path):
     assert load_operator(home) == "nightowl"
 
     # 第二次启动:呼号预填进输入框
-    app2 = TuiApp(make_config(tmp_path, []))
+    app2 = TuiApp(make_config(tmp_path, [], require_welcome=True))
     async with app2.run_test(headless=True, size=(140, 40)) as pilot2:
         await pilot2.pause(0.3)
         assert app2.screen.query_one("#callsign").value == "nightowl"
@@ -1143,8 +1148,14 @@ NL_OBJECTIVE = "recon 192.0.2.0/24 only"
 
 
 def make_nl_config(tmp_path: Path, script, **overrides) -> TUIConfig:
-    """NL 仪式流配置(scope=None,D9);其余与 make_config 同。"""
-    return make_config(tmp_path, script, scope=None, scope_source="", **overrides)
+    """NL 仪式流测试配置(默认显式开启 require_scope_ceremony=True)。"""
+    params = {
+        "scope": None,
+        "scope_source": "",
+        "require_scope_ceremony": True,
+    }
+    params.update(overrides)
+    return make_config(tmp_path, script, **params)
 
 
 def scope_card(main) -> ScopeConfirmCard | None:
@@ -1831,7 +1842,9 @@ async def test_scope_command_rejected_states(tmp_path):
         main = await enter_main(app3, pilot)
         await pilot.press(*"/scope")
         await pilot.press("enter")
-        await wait_for(lambda: notices_containing(main, "尚未声明") != [])
+        await wait_for(
+            lambda: notices_containing(main, "未启用参数级 scope 硬护栏") != []
+        )
 
 
 async def test_file_flow_zero_ceremony_and_scope_confirmed(tmp_path):
@@ -1874,9 +1887,8 @@ async def test_file_flow_zero_ceremony_and_scope_confirmed(tmp_path):
 
 
 async def test_welcome_and_bare_scope_without_scope(tmp_path):
-    """D9 迎宾无 scope 分支:单行「scope 待声明(主界面确认)」+ 占位「—」;
-    file 流迎宾渲染不变(既有用例锁)。"""
-    app = TuiApp(make_nl_config(tmp_path, []))
+    """D9 迎宾无 scope 分支(require_welcome=True 回归测试)。"""
+    app = TuiApp(make_nl_config(tmp_path, [], require_welcome=True))
     async with app.run_test(headless=True, size=(140, 40)) as pilot:
         await pilot.pause(0.3)
         meta = app.screen.query_one("#wm-meta").content
@@ -2897,11 +2909,12 @@ async def test_tui_displays_execution_capabilities_and_cleans_boundary(
         main = await enter_main(app, pilot)
         await start_run_and_wait(app, pilot)
         assert app._final_result.status == "finished"
-        notice = notices_containing(main, f"执行模式:{mode}")[-1].content
         if mode == "legacy":
-            assert "无网络强制" in notice and "继承完整环境" in notice
+            # Strix 对齐:legacy 不在对话流刷「仅 Bash 参数级护栏」噪音通知
+            assert notices_containing(main, "执行模式:legacy") == []
             assert not boundary.closed
         else:
+            notice = notices_containing(main, f"执行模式:{mode}")[-1].content
             assert "b-tui" in notice and "epoch=1" in notice
             assert created[0][1]["digest"] == hashlib.sha256(scope_bytes).hexdigest()
             assert boundary.closed
@@ -3829,3 +3842,163 @@ def test_timeout_summary_shows_wall_deadline():
     assert expand is True
     assert "wall_clock_deadline" in summary
     assert "0.3s" in summary
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-24 UX 整改:Textual 折叠高度修复 + Strix 默认无迎宾/无 scope 仪式
+# ---------------------------------------------------------------------------
+
+
+async def test_tui_collapsed_thinking_and_toolcard_compact_height(tmp_path):
+    """Textual 8.x 布局回归:折叠态 ThinkingBlock/ToolCard 不撑满全屏高度。"""
+    script = [
+        [
+            ReasoningDelta("分析服务暴露面..."),
+            TextDelta("执行探测。\n"),
+            ToolCall(
+                id="c1",
+                name="run_command",
+                arguments={"command": "echo hi 127.0.0.1"},
+            ),
+            Usage(5, 2),
+        ],
+        [TextDelta("完毕。"), Usage(2, 1)],
+    ]
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            script,
+            scope=None,
+            scope_source="",
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot)
+        thinking = narrative_blocks(main, ThinkingBlock)[0]
+        card = narrative_blocks(main, ToolCard)[0]
+        banner = main.query_one("#welcome-banner", WelcomeBanner)
+        assert thinking.expanded is False
+        assert card.expanded is False
+        assert thinking.size.height <= 2
+        assert card.size.height <= 2
+        assert banner.size.height <= 6
+
+
+async def test_tui_default_strix_target_mode_no_welcome_and_slash_target(tmp_path):
+    """默认直入主界面 + Target+Instruction 自由对话 + /target 命令更新。"""
+    from foam.tui.app import MainScreen
+
+    script = [
+        [TextDelta("你好!请告诉我这次要测试的目标。"), Usage(5, 3)],
+        [TextDelta("目标已收悉。"), Usage(3, 1)],
+    ]
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            script,
+            scope=None,
+            scope_source="",
+            targets=("10.0.0.1",),
+            instruction="只测 HTTP",
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        await wait_for(lambda: app._main is not None)
+        assert isinstance(app.screen, MainScreen)
+        main = app._main
+        assert "10.0.0.1" in main.query_one("#banner-meta").content
+        assert "10.0.0.1" in str(main.query_one("#side-targets").render())
+
+        await pilot.press(*"你好")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: app.active_loop is not None and app.active_loop.status == "idle"
+        )
+        assert scope_card(main) is None
+        assert notices_containing(main, "执行模式:legacy") == []
+        echo = narrative_blocks(main, NoticeBlock)[0]
+        assert "❯ 你好" in echo.content
+
+        records = audit_records(app)
+        assert any(
+            r["kind"] == KIND_TARGET_DECLARED
+            and r["payload"]["targets"] == ["10.0.0.1"]
+            and r["payload"]["guard_mode"] == "target_only"
+            for r in records
+        )
+
+        # 运行期 /target 查看与更新目标并写回侧栏、工作笔记与审计
+        await pilot.press(*"/target")
+        await pilot.press("enter")
+        await wait_for(lambda: notices_containing(main, "当前目标(targets)") != [])
+
+        await pilot.press(*"/target 10.0.0.9 example.com")
+        await pilot.press("enter")
+        await wait_for(lambda: notices_containing(main, "目标已更新") != [])
+        assert "10.0.0.9" in str(main.query_one("#side-targets").render())
+        meta = json.loads(
+            (app.engagement.paths.metadata).read_text(encoding="utf-8")
+        )
+        assert meta["targets"] == ["10.0.0.9", "example.com"]
+        assert any(
+            r["kind"] == KIND_TARGET_DECLARED
+            and r["payload"]["targets"] == ["10.0.0.9", "example.com"]
+            for r in audit_records(app)
+        )
+
+        # 结束 run 后 /target 更新被安全拒绝,裸 /target 仍可读
+        app.active_loop.kill("done")
+        await wait_for(lambda: app._final_result is not None)
+        await pilot.press(*"/target 1.2.3.4")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: notices_containing(main, "run 已结束,目标不可更改") != []
+        )
+
+
+async def test_tui_target_mode_can_opt_in_scope_later(tmp_path):
+    """Target-only TUI 可通过 /scope <描述> 按需启用硬护栏并拦截后续越界命令。"""
+    script = [
+        [ToolCall("c1", "run_command", {"command": "echo 8.8.8.8"}), Usage(3, 1)],
+        [TextDelta("第一轮结论。"), Usage(3, 1)],
+        # /scope 编译调用
+        [TextDelta('{"rules": ["127.0.0.0/8"]}'), Usage(4, 2)],
+        # 热启用 scope 后再次尝试越界目标 -> 被护栏拒
+        [ToolCall("c2", "run_command", {"command": "echo 8.8.8.8"}), Usage(3, 1)],
+        [TextDelta("越界结论。"), Usage(2, 1)],
+    ]
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            script,
+            scope=None,
+            scope_source="",
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        await pilot.press(*"探测一下")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: app.active_loop is not None and app.active_loop.status == "idle"
+        )
+        assert app.config.scope is None
+
+        # 运行中执行 /scope 启用硬护栏
+        await pilot.press(*"/scope only 127.0.0.0/8")
+        await pilot.press("enter")
+        card = await wait_scope_card(main)
+        press_card(card, "scope-confirm")
+        await wait_for(lambda: notices_containing(main, "scope 已确认冻结") != [])
+        assert app.config.scope is not None
+        assert app.config.scope.rules == ("127.0.0.0/8",)
+
+        # 下一条插话尝试访问 8.8.8.8 -> 触发 scope 拒绝审计
+        await pilot.press(*"继续测试 8.8.8.8")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: any(r["kind"] == KIND_EXEC_DENIED for r in audit_records(app))
+        )

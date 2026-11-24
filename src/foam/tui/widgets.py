@@ -505,17 +505,44 @@ def _budget_text(used: int | None, budget: int) -> Text:
     return text
 
 
+class WelcomeBanner(Vertical):
+    """主界面内联紧凑欢迎条(Strix 对齐:不阻塞首屏,仅占数行高度)。"""
+
+    DEFAULT_CSS = """
+    WelcomeBanner {
+        height: auto;
+    }
+    """
+
+    def __init__(self, *, title: str, meta: str, hint: str) -> None:
+        super().__init__(id="welcome-banner")
+        self._title = title
+        self._meta = meta
+        self._hint = hint
+
+    def compose(self):
+        yield Static(self._title, id="banner-title")
+        if self._meta:
+            yield Static(self._meta, id="banner-meta")
+        if self._hint:
+            yield Static(self._hint, id="banner-hint")
+
+
 class SidebarPane(VerticalScroll):
     """右侧栏(~30 列):全部内容为本项目生成的结构化文本(可放心用样式)。"""
 
     def __init__(self) -> None:
         super().__init__(id="sidebar")
         self.phase = ""
+        self.targets: list[str] = []
+        self.instruction = ""
         self.counts: dict[str, int] = {}
         self.jobs: list[dict[str, Any]] = []
         self.sessions: list[dict[str, Any]] = []
 
     def compose(self):
+        yield Static("目标", classes="side-title")
+        yield Static(Text("—", style="dim"), id="side-targets")
         yield Static("阶段", classes="side-title")
         yield Static(Text("—", style="dim"), id="side-phase")
         yield Static("索引", classes="side-title")
@@ -526,6 +553,24 @@ class SidebarPane(VerticalScroll):
         yield Static(Text("—", style="dim"), id="side-jobs")
         yield Static("sessions", classes="side-title")
         yield Static(Text("—", style="dim"), id="side-sessions")
+
+    def set_targets(self, targets: list[str], instruction: str = "") -> None:
+        self.targets = [t.strip() for t in targets if t and t.strip()]
+        self.instruction = instruction.strip()
+        widget = self.query_one("#side-targets", Static)
+        if not self.targets and not self.instruction:
+            widget.update(Text("—", style="dim"))
+            return
+        text = Text()
+        for idx, item in enumerate(self.targets):
+            if idx:
+                text.append("\n")
+            text.append(f"• {_clip(item, 26)}", style="cyan")
+        if self.instruction:
+            if self.targets:
+                text.append("\n")
+            text.append(f"» {_clip(self.instruction, 26)}", style="dim")
+        widget.update(text)
 
     def set_phase(self, phase: str) -> None:
         self.phase = phase
@@ -827,7 +872,8 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/sessions", "列出 PTY 会话"),
     ("/status", "run 状态与索引摘要"),
     ("/budget", "查看/显式修改总预算"),
-    ("/scope", "查看/修改授权 scope(确认仪式)"),
+    ("/target", "查看/设定授权目标(-t)"),
+    ("/scope", "查看/启用可选 scope 护栏"),
 ]
 
 
@@ -843,7 +889,7 @@ class CommandInput(Input):
     """底部输入框:补全弹层可见时接管 ↑/↓/Tab/Enter/Esc。"""
 
     def __init__(self) -> None:
-        super().__init__(id="input", placeholder="输入目标(objective)开始")
+        super().__init__(id="input", placeholder="输入目标或对话开始(/ 查看命令)")
         #: 由 InputDock 挂载时注入;弹层可见时按键先给弹层。
         self.dock: InputDock | None = None
 

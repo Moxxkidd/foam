@@ -471,7 +471,7 @@ def build_manifest(
     }
     if read_error is not None:
         chain["read_error"] = read_error
-    return {
+    manifest_data: dict[str, Any] = {
         "format": MANIFEST_FORMAT,
         "engagement_id": meta.get("id") or root.name,
         "run_id": run_id,
@@ -505,6 +505,12 @@ def build_manifest(
         },
         "external_anchor": EXTERNAL_ANCHOR,
     }
+    if meta.get("targets") or meta.get("instruction"):
+        manifest_data["target"] = {
+            "targets": list(meta.get("targets") or []),
+            "instruction": str(meta.get("instruction") or ""),
+        }
+    return manifest_data
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +543,7 @@ def render_summary_md(manifest: dict[str, Any]) -> str:
 
     lines += ["## 范围(scope)", ""]
     scope = manifest.get("scope")
+    target = manifest.get("target")
     if scope:
         lines.append(f"- 文件:{scope.get('path')}")
         lines.append(f"- 内容 sha256:{scope.get('sha256')}")
@@ -548,6 +555,14 @@ def render_summary_md(manifest: dict[str, Any]) -> str:
             )
         else:
             lines.append("- 修订标记:无(legacy 或未提交)")
+    elif target:
+        lines.append("- 模式:Target + Instruction(无参数级 scope 硬拦截)")
+        targets_list = target.get("targets") or []
+        lines.append(
+            f"- 目标(targets):{', '.join(targets_list) if targets_list else '(无)'}"
+        )
+        if target.get("instruction"):
+            lines.append(f"- 附加指示:{target['instruction']}")
     else:
         lines.append("(无 scope 记录)")
     lines.append("")

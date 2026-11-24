@@ -43,9 +43,21 @@ from foam.agent.prompts import render_scope_section
 from foam.agent.scope_compiler import scope_event_payload
 from foam.cli import _CliObserver
 from foam.cli import main as cli_main
-from foam.guard.audit import KIND_SCOPE_CONFIRMED, AuditLog, verify
+from foam.evidence import verify_engagement
+from foam.guard.audit import (
+    KIND_SCOPE_CONFIRMED,
+    KIND_TARGET_DECLARED,
+    AuditLog,
+    verify,
+)
 from foam.guard.scope import load_scope, parse_scope
-from foam.replay import ReportGenerationError, read_records, recover_scope_record
+from foam.replay import (
+    ReportGenerationError,
+    build_report,
+    format_timeline,
+    read_records,
+    recover_scope_record,
+)
 from foam.state.files import (
     SCOPE_SECTION_BEGIN,
     SCOPE_SECTION_END,
@@ -462,23 +474,48 @@ def test_no_hardcoded_brand_in_sources():
     assert "__app_name__" in cli_source  # 证明走的是常量
 
 
-def test_cli_no_subcommand_prints_help(capsys):
+def test_cli_no_subcommand_launches_tui_and_help_works(monkeypatch, capsys):
+    """Strix 对齐:直接运行 cli_main([]) 进入 TUI;--help 输出帮助。"""
+    import foam.tui.app as tui_app
+
+    seen = []
+    monkeypatch.setenv("FOAM_LLM_API_KEY", "TESTONLY")
+    monkeypatch.setenv("FOAM_LLM_BASE_URL", "https://example.com/v1")
+    monkeypatch.setattr(tui_app, "main", lambda args: seen.append(args) or 0)
     assert cli_main([]) == 0
+    assert len(seen) == 1
+    assert seen[0].execution_mode == "legacy"
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_main(["--help"])
+    assert excinfo.value.code == 0
     assert "run" in capsys.readouterr().out
 
 
-def test_run_resume_tui_require_explicit_execution_mode(tmp_path, capsys):
-    scope_file = write_scope(tmp_path)
-    commands = (
-        ["run", "--scope", str(scope_file), "--objective", "x"],
-        ["resume", str(tmp_path)],
-        ["tui"],
+def test_execution_mode_defaults_legacy_and_protected_conflicts_legacy(
+    tmp_path, monkeypatch, capsys
+):
+    """默认 legacy;--protected 等价 protected;二者与 legacy 并用报冲突 exit 2。"""
+    import foam.tui.app as tui_app
+
+    seen = []
+    monkeypatch.setenv("FOAM_LLM_API_KEY", "TESTONLY")
+    monkeypatch.setenv("FOAM_LLM_BASE_URL", "https://example.com/v1")
+    monkeypatch.setattr(tui_app, "main", lambda args: seen.append(args) or 0)
+
+    assert cli_main(["tui"]) == 0
+    assert seen[-1].execution_mode == "legacy"
+
+    # --protected 与 --execution-mode legacy 冲突
+    rc = cli_main(
+        ["run", "--protected", "--execution-mode", "legacy", "-t", "127.0.0.1"]
     )
-    for argv in commands:
-        with pytest.raises(SystemExit) as excinfo:
-            cli_main(argv)
-        assert excinfo.value.code == 2
-        assert "--execution-mode" in capsys.readouterr().err
+    assert rc == 2
+    assert "冲突" in capsys.readouterr().err
+
+    rc_tui = cli_main(["tui", "--protected", "--execution-mode", "legacy"])
+    assert rc_tui == 2
+    assert "冲突" in capsys.readouterr().err
 
 
 def test_protected_run_creation_failure_never_falls_back(
@@ -722,12 +759,12 @@ def run_nl_once(
 
 
 def test_run_scope_mutex_group(tmp_path, capsys):
-    """验收 1:--scope 与 --scope-text 两给/两缺均 argparse 退出码 2。"""
+    """--scope 与 --scope-text 互斥;无 scope 有 objective 走 Target-only;全空报 2。"""
     scope_file = write_scope(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
         cli_main(
             [
-                "run", *LEGACY,
+                "run",
                 "--scope",
                 str(scope_file),
                 "--scope-text",
@@ -740,10 +777,21 @@ def test_run_scope_mutex_group(tmp_path, capsys):
     # argparse 互斥组专属报错形态(旧 parser 的 unrecognized arguments 不含此句)
     assert "not allowed with argument" in capsys.readouterr().err
 
-    with pytest.raises(SystemExit) as excinfo:
-        cli_main(["run", *LEGACY, "--objective", "x"])
-    assert excinfo.value.code == 2
-    assert "--scope" in capsys.readouterr().err  # 必给其一
+    # 无 --target/-t、--instruction、--objective 时返回 2
+    rc_empty = cli_main(["run"], backend_factory=lambda _a: FakeBackend([FINISH]))
+    assert rc_empty == 2
+    assert "至少需要" in capsys.readouterr().err
+
+    # 有 --objective 无 --scope 时放行 Target-only 模式
+    workdir = tmp_path / "target-only-eng"
+    rc_ok = cli_main(
+        ["run", "--objective", "x", "--workdir", str(workdir)],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc_ok == 0
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["scope"] is None
+    assert meta["guard_mode"] == "target_only"
 
 
 def test_run_scope_text_success(tmp_path, capsys):
@@ -1964,3 +2012,148 @@ def test_cli_observer_shows_background_terminal_reason_and_actions():
     for expected in ("已完成", "超时", "终止", "1234", "read_output"):
         assert expected in rendered
     assert "wall_clock_deadline" in rendered
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-24 UX 整改:Strix 对齐入口、-t/--instruction、-n、--protected CIDR
+# ---------------------------------------------------------------------------
+
+
+def test_strix_root_target_instruction_launches_tui(monkeypatch):
+    import foam.tui.app as tui_app
+
+    seen = []
+    monkeypatch.setenv("FOAM_LLM_API_KEY", "TESTONLY")
+    monkeypatch.setenv("FOAM_LLM_BASE_URL", "https://example.com/v1")
+    monkeypatch.setattr(tui_app, "main", lambda args: seen.append(args) or 0)
+
+    rc = cli_main(["-t", "10.0.0.1", "-t", "example.com", "--instruction", "只测 web"])
+    assert rc == 0
+    assert seen[0].targets == ["10.0.0.1", "example.com"]
+    assert seen[0].instruction == "只测 web"
+    assert seen[0].execution_mode == "legacy"
+
+
+def test_strix_non_interactive_target_instruction_e2e(tmp_path):
+    workdir = tmp_path / "strix-eng"
+    backend = FakeBackend(
+        [
+            [ToolCall("c1", "run_command", {"command": "echo 8.8.8.8"}), Usage(2, 1)],
+            [TextDelta("完成测试"), Usage(3, 2)],
+        ]
+    )
+    rc = cli_main(
+        [
+            "-n",
+            "-t",
+            "10.0.0.1",
+            "--instruction",
+            "重点检查 HTTP 服务",
+            "--workdir",
+            str(workdir),
+        ],
+        backend_factory=lambda _a: backend,
+    )
+    assert rc == 0
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["scope"] is None
+    assert meta["targets"] == ["10.0.0.1"]
+    assert meta["instruction"] == "重点检查 HTTP 服务"
+    assert meta["guard_mode"] == "target_only"
+
+    records = read_records(workdir / "audit.jsonl")
+    assert verify(workdir / "audit.jsonl")
+    assert any(r["kind"] == KIND_TARGET_DECLARED for r in records)
+    assert verify_engagement(workdir).overall == "pass"
+
+    report = build_report(workdir)
+    assert "10.0.0.1" in report
+    assert "重点检查 HTTP 服务" in report
+    timeline = "\n".join(format_timeline(records))
+    assert "目标声明" in timeline
+
+    # Target-only engagement 支持无 --scope 直接 resume
+    backend2 = FakeBackend([[TextDelta("继续完成"), Usage(2, 1)]])
+    rc_resume = cli_main(
+        ["resume", str(workdir)],
+        backend_factory=lambda _a: backend2,
+    )
+    assert rc_resume == 0
+
+
+def test_target_list_and_instruction_file_and_conflict(tmp_path, capsys):
+    targets_file = tmp_path / "targets.txt"
+    targets_file.write_text(
+        "# comment\n10.0.0.1\n\nhttps://app.example.com # note\n", encoding="utf-8"
+    )
+    inst_file = tmp_path / "inst.txt"
+    inst_file.write_text("仅做只读枚举", encoding="utf-8")
+    workdir = tmp_path / "list-eng"
+    rc = cli_main(
+        [
+            "-n",
+            "--target-list",
+            str(targets_file),
+            "--instruction-file",
+            str(inst_file),
+            "--workdir",
+            str(workdir),
+        ],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc == 0
+    meta = json.loads((workdir / "engagement.json").read_text(encoding="utf-8"))
+    assert meta["targets"] == ["10.0.0.1", "https://app.example.com"]
+    assert meta["instruction"] == "仅做只读枚举"
+
+    # --instruction 与 --instruction-file 冲突 -> exit 2
+    rc_conflict = cli_main(
+        [
+            "-n",
+            "-t",
+            "10.0.0.1",
+            "--instruction",
+            "a",
+            "--instruction-file",
+            str(inst_file),
+        ],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc_conflict == 2
+    assert "不能同时指定" in capsys.readouterr().err
+
+
+def test_protected_cidr_targets_and_fail_closed(tmp_path, monkeypatch, capsys):
+    from foam.guard.network import ExecutionUnsupportedError, NetworkBoundary
+
+    calls = []
+
+    def capture_create(scope, **kwargs):
+        calls.append((scope.rules, kwargs))
+        raise ExecutionUnsupportedError("TESTONLY unsupported on macOS")
+
+    monkeypatch.setattr(NetworkBoundary, "create", capture_create)
+    # 纯 CIDR -t 可自动编译为 protected 网络边界
+    rc_cidr = cli_main(
+        ["-n", "--protected", "-t", "10.0.0.0/24", "--workdir", str(tmp_path / "p1")],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc_cidr == 1
+    assert calls and calls[0][0] == ("10.0.0.0/24",)
+    assert "未回退 legacy" in capsys.readouterr().err
+
+    # 非 CIDR 目标在 --protected 下直接 fail-closed 退出码 2
+    rc_host = cli_main(
+        ["-n", "--protected", "-t", "example.com"],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc_host == 2
+    assert "不回退 legacy" in capsys.readouterr().err
+
+    # --protected 无 scope 且无 -t 在 -n 下直接 fail-closed 退出码 2
+    rc_none = cli_main(
+        ["-n", "--protected", "--objective", "recon"],
+        backend_factory=lambda _a: FakeBackend([FINISH]),
+    )
+    assert rc_none == 2
+    assert "不回退 legacy" in capsys.readouterr().err

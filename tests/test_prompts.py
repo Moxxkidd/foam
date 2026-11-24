@@ -21,6 +21,7 @@ from foam.agent.prompts import (
     build_system_prompt,
     render_engagement_template,
     render_scope_section,
+    render_target_section,
 )
 
 FIXED_TS = "2026-08-21T00:00:00+00:00"
@@ -296,3 +297,29 @@ def test_protected_prompt_states_execution_boundaries():
     assert "raw socket/AF_PACKET" not in legacy
     assert "入站监听" not in legacy
     assert "scope 仅支持 CIDR" not in legacy
+
+
+def test_target_mode_system_prompt_and_greeting_guidance():
+    section = render_target_section(
+        ["10.0.0.1", "example.com"], instruction="只测 HTTP"
+    )
+    assert "10.0.0.1" in section and "example.com" in section
+    assert "只测 HTTP" in section
+
+    prompt = build_system_prompt(
+        execution_mode="legacy",
+        guard_enabled=False,
+        targets=("10.0.0.1",),
+        instruction="重点测登录接口",
+        **FIXED,
+    )
+    assert __app_name__ not in prompt
+    assert "kali" not in prompt.lower()
+    assert "10.0.0.1" in prompt
+    assert "重点测登录接口" in prompt
+    assert "自然简洁回应即可" in prompt and "授权范围为空" in prompt
+    assert "无代码级命令参数硬拦截" in prompt
+
+    # guard_enabled=True 缺省契约不变
+    default_prompt = build_system_prompt(**FIXED)
+    assert "每一条 run_command 命令在执行前都会经过 scope 护栏" in default_prompt
