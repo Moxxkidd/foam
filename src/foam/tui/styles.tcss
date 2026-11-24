@@ -61,6 +61,118 @@ WelcomeScreen {
     margin-top: 1;
 }
 
+/* ---------- 动效迎宾屏(Strix 对齐) ---------- */
+
+LandingScreen {
+    align: center middle;
+    background: #090d12;
+}
+
+#landing-shell {
+    width: 68;
+    max-width: 92%;
+    height: auto;
+    align: center middle;
+}
+
+#landing-logo {
+    width: 100%;
+    height: auto;
+    text-align: center;
+}
+
+#landing-tagline {
+    width: 100%;
+    height: auto;
+    text-align: center;
+    color: #8b949e;
+    margin: 1 0 1 0;
+}
+
+#landing-card {
+    width: 100%;
+    height: auto;
+    border: round #2dd4bf;
+    background: #0d1117;
+    padding: 1 2;
+}
+
+#landing-input-row {
+    width: 100%;
+    height: 1;
+}
+
+#landing-prompt-glyph {
+    width: 2;
+    height: 1;
+    color: #56d4dd;
+    text-style: bold;
+}
+
+#landing-input {
+    width: 1fr;
+    height: 1;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: #e6edf3;
+}
+
+#landing-input:focus {
+    border: none;
+}
+
+#landing-targets {
+    width: 100%;
+    height: auto;
+    color: #56d4dd;
+    margin-top: 1;
+}
+
+#landing-model-row {
+    width: 100%;
+    height: 1;
+    margin-top: 2;
+}
+
+#landing-model {
+    width: 100%;
+    height: 1;
+}
+
+#landing-picker-slot {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+}
+
+#landing-probe {
+    width: 100%;
+    height: auto;
+    color: #8b949e;
+    padding: 0 1;
+    margin-top: 1;
+}
+
+#landing-footer {
+    width: 100%;
+    height: 1;
+    padding: 0 1;
+    margin-top: 1;
+}
+
+#landing-keys {
+    width: 1fr;
+    height: 1;
+}
+
+#landing-version {
+    width: auto;
+    height: 1;
+    color: #8b949e;
+    text-align: right;
+}
+
 /* ---------- 顶栏 ---------- */
 
 #statusbar {

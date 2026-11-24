@@ -31,7 +31,9 @@ from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
+from foam import __app_name__
 from foam.agent.scope_compiler import ScopeCompilation
+from foam.tui.banner import render_animated_wordmark
 from foam.tui.bridge import tool_call_display
 
 # ---------------------------------------------------------------------------
@@ -629,6 +631,38 @@ def _budget_text(used: int | None, budget: int) -> Text:
     text.append("▓" * filled + "░" * (cells - filled), style=style)
     text.append(f" {format_tokens(used)}/{format_tokens(budget)}", style=style)
     return text
+
+
+class AnimatedWordmark(Static):
+    """迎宾屏动态大号字标:海沫波纹扫光 + 立体投影 + 上浮微气泡。"""
+
+    def __init__(
+        self, *, id: str = "landing-logo", interval: float = 0.11
+    ) -> None:
+        super().__init__(render_animated_wordmark(__app_name__, 0), id=id)
+        self._frame = 0
+        self._interval = interval
+        self._timer = None
+
+    @property
+    def frame(self) -> int:
+        return self._frame
+
+    def on_mount(self) -> None:
+        self._timer = self.set_interval(self._interval, self.advance_frame)
+
+    def on_unmount(self) -> None:
+        self.stop_animation()
+
+    def stop_animation(self) -> None:
+        timer = self._timer
+        self._timer = None
+        if timer is not None:
+            timer.stop()
+
+    def advance_frame(self) -> None:
+        self._frame += 1
+        self.update(render_animated_wordmark(__app_name__, self._frame))
 
 
 class WelcomeBanner(Vertical):

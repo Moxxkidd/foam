@@ -1048,3 +1048,72 @@ async def test_backends_model_switching_and_list_models(monkeypatch):
     )
     assert await cl_fail.list_models() == []
     await cl_fail.aclose()
+
+
+async def test_backends_probe_connection_statuses(monkeypatch):
+    monkeypatch.setenv("FOAM_LLM_API_KEY", FAKE_OAI_KEY)
+    monkeypatch.setenv("FOAM_ANTHROPIC_API_KEY", FAKE_CLAUDE_KEY)
+
+    oai_ok = openai_compat.OpenAICompatBackend(
+        base_url="http://fake.test/v1",
+        model="init-oai",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(
+                200, json={"data": [{"id": "m2"}, {"id": "m1"}]}
+            )
+        ),
+    )
+    res_ok = await oai_ok.probe_connection()
+    assert res_ok.status == "verified"
+    assert res_ok.models == ("m1", "m2")
+    await oai_ok.aclose()
+
+    oai_404 = openai_compat.OpenAICompatBackend(
+        base_url="http://fake.test/v1",
+        model="init-oai",
+        transport=httpx.MockTransport(lambda req: httpx.Response(404)),
+    )
+    res_404 = await oai_404.probe_connection()
+    assert res_404.status == "unsupported"
+    assert res_404.models == ()
+    await oai_404.aclose()
+
+    oai_401 = openai_compat.OpenAICompatBackend(
+        base_url="http://fake.test/v1",
+        model="init-oai",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(401, text=f"bad key {FAKE_OAI_KEY}")
+        ),
+    )
+    res_401 = await oai_401.probe_connection()
+    assert res_401.status == "error"
+    assert "401" in res_401.detail
+    assert FAKE_OAI_KEY not in res_401.detail
+    await oai_401.aclose()
+
+    def _timeout_handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=req)
+
+    cl_timeout = claude.ClaudeBackend(
+        model="claude-init",
+        base_url="http://fake.test",
+        transport=httpx.MockTransport(_timeout_handler),
+    )
+    res_to = await cl_timeout.probe_connection()
+    assert res_to.status == "error"
+    assert res_to.detail == "timeout"
+    assert FAKE_CLAUDE_KEY not in res_to.detail
+    await cl_timeout.aclose()
+
+    cl_401 = claude.ClaudeBackend(
+        model="claude-init",
+        base_url="http://fake.test",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(403, text=f"forbidden {FAKE_CLAUDE_KEY}")
+        ),
+    )
+    res_cl_403 = await cl_401.probe_connection()
+    assert res_cl_403.status == "error"
+    assert "403" in res_cl_403.detail
+    assert FAKE_CLAUDE_KEY not in res_cl_403.detail
+    await cl_401.aclose()

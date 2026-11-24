@@ -142,6 +142,7 @@ from foam.tui.bridge import (
     TuiObserver,
 )
 from foam.tui.widgets import (
+    AnimatedWordmark,
     InputDock,
     KillConfirmBar,
     ModelPickerAction,
@@ -245,6 +246,7 @@ class TUIConfig:
     targets: Sequence[str] = ()
     instruction: str = ""
     operator: str = ""
+    show_landing: bool = True
     require_welcome: bool = False
     require_scope_ceremony: bool = False
     scope_text: str | None = None
@@ -516,6 +518,214 @@ class WelcomeScreen(Screen):
 
 
 # ---------------------------------------------------------------------------
+# 动效迎宾首屏(Strix 对齐:动态 3D 字标 + 提示词卡片 + 模型连通性预检)
+# ---------------------------------------------------------------------------
+
+
+class LandingScreen(Screen):
+    """默认启动迎宾首屏:海沫波纹 3D 字标 + 居中目标卡片 + 异步连通性探测。"""
+
+    BINDINGS = [
+        Binding("ctrl+c", "quit_landing", "Quit", show=False, priority=True),
+        Binding("ctrl+q", "quit_landing", "Quit", show=False, priority=True),
+        Binding("escape", "cancel_overlay", "Cancel", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._probe_state = "checking"
+        self._probe_detail = ""
+        self._probe_count = 0
+        self._status_override: tuple[str, str] | None = None
+
+    @property
+    def tui(self) -> TuiApp:
+        return self.app  # type: ignore[return-value]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="landing-shell"):
+            yield AnimatedWordmark(id="landing-logo")
+            yield Static(
+                "AI-native Kali harness for authorized pentesting",
+                id="landing-tagline",
+                markup=False,
+            )
+            with Vertical(id="landing-card"):
+                with Horizontal(id="landing-input-row"):
+                    yield Static("❯", id="landing-prompt-glyph", markup=False)
+                    yield Input(
+                        placeholder="Describe what to test, or name a target...",
+                        id="landing-input",
+                    )
+                yield Static("", id="landing-targets", markup=False)
+                with Horizontal(id="landing-model-row"):
+                    yield Static("", id="landing-model")
+            slot = Vertical(id="landing-picker-slot")
+            slot.display = False
+            yield slot
+            yield Static("", id="landing-probe")
+            with Horizontal(id="landing-footer"):
+                yield Static("", id="landing-keys")
+                yield Static(f"v{__version__}", id="landing-version", markup=False)
+
+    def on_mount(self) -> None:
+        targets = [
+            str(t).strip() for t in self.tui.config.targets if str(t).strip()
+        ]
+        target_widget = self.query_one("#landing-targets", Static)
+        if targets:
+            target_widget.update(f"targets: {', '.join(targets)}")
+            target_widget.display = True
+        else:
+            target_widget.display = False
+
+        keys = Text()
+        keys.append("enter", style="bold #e6edf3")
+        keys.append(" launch   ", style="dim")
+        keys.append("/model", style="bold #e6edf3")
+        keys.append(" switch   ", style="dim")
+        keys.append("ctrl+c", style="bold #e6edf3")
+        keys.append(" quit", style="dim")
+        self.query_one("#landing-keys", Static).update(keys)
+
+        self._render_model_badge()
+        self._render_probe_status()
+        self.query_one("#landing-input", Input).focus()
+        self.run_worker(self._run_probe(), exclusive=True)
+
+    def _render_model_badge(self) -> None:
+        model_id = self.tui._current_model_id() or "(default)"
+        provider = self.tui.config.backend.provider
+        dot_style = {
+            "verified": "#3fb950",
+            "error": "#d29922",
+        }.get(self._probe_state, "#56d4dd")
+        text = Text.assemble(
+            ("● ", dot_style),
+            (model_id, "bold #e6edf3"),
+            (" · ", "dim"),
+            (provider, "#8b949e"),
+        )
+        try:
+            self.query_one("#landing-model", Static).update(text)
+        except NoMatches:
+            pass
+
+    def _render_probe_status(self) -> None:
+        if self._status_override is not None:
+            kind, msg = self._status_override
+            style = {
+                "success": "#3fb950",
+                "error": "#f85149",
+                "warn": "#d29922",
+            }.get(kind, "dim")
+            content = Text(msg, style=style)
+        elif self._probe_state == "checking":
+            content = Text("Verifying model connection...", style="dim")
+        elif self._probe_state == "verified":
+            suffix = (
+                f" ({self._probe_count} models)" if self._probe_count > 0 else ""
+            )
+            content = Text.assemble(
+                ("Verifying model connection...\n", "dim"),
+                (f"Model connection verified{suffix}", "#3fb950"),
+            )
+        elif self._probe_state == "unsupported":
+            content = Text.assemble(
+                ("Verifying model connection...\n", "dim"),
+                ("Model endpoint ready (model listing unavailable)", "dim"),
+            )
+        else:
+            detail = f": {self._probe_detail}" if self._probe_detail else ""
+            content = Text.assemble(
+                ("Verifying model connection...\n", "dim"),
+                (f"Model connection check failed{detail}", "#d29922"),
+            )
+        try:
+            self.query_one("#landing-probe", Static).update(content)
+        except NoMatches:
+            pass
+
+    async def _run_probe(self) -> None:
+        self._probe_state = "checking"
+        self._probe_detail = ""
+        self._probe_count = 0
+        self._status_override = None
+        self._render_model_badge()
+        self._render_probe_status()
+        result = await self.tui.config.backend.probe_connection()
+        if not self.is_mounted:
+            return
+        self._probe_state = result.status
+        self._probe_detail = result.detail
+        self._probe_count = len(result.models)
+        if result.models:
+            self.tui._cached_remote_models = result.models
+        self._render_model_badge()
+        self._render_probe_status()
+
+    def refresh_model(self, *, recheck_probe: bool = False) -> None:
+        self._render_model_badge()
+        if recheck_probe:
+            self.run_worker(self._run_probe(), exclusive=True)
+
+    def show_status(self, kind: str, text: str) -> None:
+        self._status_override = (kind, text)
+        self._render_probe_status()
+
+    def mount_model_card(self, card: ModelPickerCard) -> None:
+        try:
+            slot = self.query_one("#landing-picker-slot", Vertical)
+        except NoMatches:
+            return
+        slot.display = True
+        slot.mount(card)
+
+    def clear_model_card_slot(self) -> None:
+        try:
+            slot = self.query_one("#landing-picker-slot", Vertical)
+        except NoMatches:
+            return
+        slot.display = False
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "landing-input":
+            return
+        event.stop()
+        raw = event.value.strip()
+        if raw == "/model" or raw.startswith("/model "):
+            event.input.value = ""
+            arg = raw[len("/model") :].strip()
+            if not arg:
+                self.tui.open_model_picker()
+            elif arg.startswith("@"):
+                pname = arg[1:].strip()
+                if not pname:
+                    self.show_status(
+                        "error", "用法:/model <模型ID> 或 /model @<profile名>"
+                    )
+                    return
+                self.tui.switch_profile(pname)
+            else:
+                self.tui.switch_model(arg)
+            return
+        event.input.value = ""
+        # 换屏走 worker,避免在消息处理器内直接 switch_screen 死锁。
+        self.app.run_worker(self.tui.launch_from_landing(raw))
+
+    def on_model_picker_action(self, msg: ModelPickerAction) -> None:
+        msg.stop()
+        self.tui.handle_model_picker_action(msg)
+
+    def action_cancel_overlay(self) -> None:
+        if self.tui._model_card is not None:
+            self.tui.close_model_card()
+
+    def action_quit_landing(self) -> None:
+        self.app.exit()
+
+
+# ---------------------------------------------------------------------------
 # 主界面
 # ---------------------------------------------------------------------------
 
@@ -537,6 +747,7 @@ class MainScreen(Screen):
 
     def __init__(self) -> None:
         super().__init__()
+        self.mounted_event = asyncio.Event()
         self._kill_armed = False
         self._kill_timer = None
         self._sidebar_override: bool | None = None  # None=按宽度自动(D3)
@@ -567,6 +778,7 @@ class MainScreen(Screen):
         self.input_dock.input_box.focus()
         if config.scope_text and config.scope is None and not app.ceremony_running:
             app.start_scope_ceremony(config.scope_text, mode="predeclare")
+        self.mounted_event.set()
 
     def refresh_header(self) -> None:
         """同步顶栏、欢迎条与侧栏上的模型/目标/scope 展示(单一事实源)。"""
@@ -1186,6 +1398,8 @@ class TuiApp(App[None]):
         self._scope_frozen_via_nl = False
         self._model_card: ModelPickerCard | None = None
         self._retired_backends: list[LLMBackend] = []
+        self._cached_remote_models: tuple[str, ...] | None = None
+        self._launching = False
         self._recent_models: list[str] = []
         initial_model = self._current_model_id()
         if initial_model:
@@ -1269,6 +1483,9 @@ class TuiApp(App[None]):
                 except Exception:
                     resolved = ""
             self.operator = resolved or "operator"
+            if self.config.show_landing:
+                await self.push_screen(LandingScreen())
+                return
             self._main = MainScreen()
             await self.push_screen(self._main)
             return
@@ -1287,6 +1504,19 @@ class TuiApp(App[None]):
             scope_declared=declared,
         )
         await self.push_screen(WelcomeScreen(info))
+
+    async def launch_from_landing(self, raw_text: str) -> None:
+        """迎宾首屏提交目标/任务后切换至主界面并立即启动本轮请求。"""
+        if self._launching or self._main is not None:
+            return
+        self._launching = True
+        self.close_model_card()
+        self._main = MainScreen()
+        await self.switch_screen(self._main)
+        await self._main.mounted_event.wait()
+        payload = raw_text.strip() or str(self.config.instruction or "").strip()
+        if payload:
+            self.submit_text(payload)
 
     def _scope_sha(self) -> str:
         if self.config.scope is None:
@@ -2211,9 +2441,39 @@ class TuiApp(App[None]):
                 )
         return options
 
+    @staticmethod
+    def _merge_model_options(
+        local_options: list[tuple[str, str, str]],
+        remote_models: Sequence[str],
+    ) -> tuple[list[tuple[str, str, str]], int]:
+        seen_models = {
+            val for kind, val, _lbl in local_options if kind == "model"
+        }
+        merged = list(local_options)
+        added = 0
+        for mid in remote_models:
+            if mid not in seen_models:
+                seen_models.add(mid)
+                merged.append(("model", mid, f"  {mid}  [端点发现]"))
+                added += 1
+        return merged, added
+
+    def _notify_ui(self, kind: str, text: str) -> None:
+        if self._main is not None:
+            self._main.narrative.add_notice(kind, text)
+            return
+        if isinstance(self.screen, LandingScreen):
+            self.screen.show_status(kind, text)
+
+    def _refresh_active_model_ui(self, *, recheck_probe: bool = False) -> None:
+        if self._main is not None:
+            self._main.refresh_header()
+            return
+        if isinstance(self.screen, LandingScreen):
+            self.screen.refresh_model(recheck_probe=recheck_probe)
+
     def open_model_picker(self) -> None:
-        main = self._main
-        if main is None:
+        if self._main is None and not isinstance(self.screen, LandingScreen):
             return
         if self._model_card is not None and self._model_card.is_mounted:
             try:
@@ -2223,7 +2483,10 @@ class TuiApp(App[None]):
             return
         card = ModelPickerCard()
         self._model_card = card
-        main.narrative.mount_model_card(card)
+        if self._main is not None:
+            self._main.narrative.mount_model_card(card)
+        else:
+            self.screen.mount_model_card(card)
         local_options = self._local_model_options()
         self.run_worker(self._populate_model_picker(card, local_options))
 
@@ -2234,10 +2497,20 @@ class TuiApp(App[None]):
             await card.mounted_event.wait()
             if self._model_card is not card or not card.is_mounted:
                 return
-            await card.set_options(
-                local_options,
-                status="本地模型与 profile 已就绪,正在查询后端可用模型…",
+            cached = self._cached_remote_models or ()
+            if cached:
+                merged_cached, cached_added = self._merge_model_options(
+                    local_options, cached
+                )
+            else:
+                merged_cached, cached_added = local_options, 0
+            initial_status = (
+                f"共 {len(merged_cached)} 项(从端点发现 {cached_added} 个模型)"
+                " · Enter 切换 / Esc 取消"
+                if cached_added
+                else "本地模型与 profile 已就绪,正在查询后端可用模型…"
             )
+            await card.set_options(merged_cached, status=initial_status)
             try:
                 card.query_one("#model-list").focus()
             except NoMatches:
@@ -2245,16 +2518,15 @@ class TuiApp(App[None]):
             remote_models = await self.config.backend.list_models()
             if self._model_card is not card or not card.is_mounted:
                 return
-            seen_models = {
-                val for kind, val, _lbl in local_options if kind == "model"
-            }
-            merged = list(local_options)
-            added = 0
-            for mid in remote_models:
-                if mid not in seen_models:
-                    seen_models.add(mid)
-                    merged.append(("model", mid, f"  {mid}  [端点发现]"))
-                    added += 1
+            if remote_models:
+                self._cached_remote_models = tuple(remote_models)
+                merged, added = self._merge_model_options(
+                    local_options, remote_models
+                )
+            elif cached:
+                merged, added = merged_cached, cached_added
+            else:
+                merged, added = local_options, 0
             if added:
                 status = (
                     f"共 {len(merged)} 项(从端点发现 {added} 个模型)"
@@ -2285,6 +2557,13 @@ class TuiApp(App[None]):
                 self._main.input_dock.input_box.focus()
             except NoMatches:
                 return
+            return
+        if isinstance(self.screen, LandingScreen):
+            self.screen.clear_model_card_slot()
+            try:
+                self.screen.query_one("#landing-input", Input).focus()
+            except NoMatches:
+                return
 
     def handle_model_picker_action(self, msg: ModelPickerAction) -> None:
         self.close_model_card()
@@ -2295,36 +2574,53 @@ class TuiApp(App[None]):
         elif msg.action == "select_model":
             self.switch_model(msg.value)
 
+    def _commit_model_selection(
+        self,
+        *,
+        old_provider: str,
+        old_model: str,
+        new_provider: str,
+        new_model: str,
+        notice: str,
+        profile: str | None = None,
+        recheck_probe: bool = False,
+    ) -> None:
+        self.config.model_label = new_model
+        self._remember_model(old_model)
+        self._remember_model(new_model)
+        self._refresh_active_model_ui(recheck_probe=recheck_probe)
+        self._record_model_changed(
+            old_provider=old_provider,
+            old_model=old_model,
+            new_provider=new_provider,
+            new_model=new_model,
+            profile=profile,
+        )
+        self._notify_ui("success", notice)
+
     def switch_model(self, model_name: str) -> bool:
-        main = self._main
-        if main is None:
+        if self._main is None and not isinstance(self.screen, LandingScreen):
             return False
         if self.run_handle is not None and self.active_loop is None:
-            main.narrative.add_notice("info", "run 已结束,模型不可切换")
+            self._notify_ui("info", "run 已结束,模型不可切换")
             return False
         cleaned = model_name.strip()
         if not cleaned:
-            main.narrative.add_notice("error", "模型 ID 不能为空")
+            self._notify_ui("error", "模型 ID 不能为空")
             return False
         backend = self.config.backend
         old_model = self._current_model_id()
         try:
             backend.set_model(cleaned)
         except (NotImplementedError, ValueError) as exc:
-            main.narrative.add_notice("error", f"模型切换失败:{exc}")
+            self._notify_ui("error", f"模型切换失败:{exc}")
             return False
-        self.config.model_label = cleaned
-        self._remember_model(old_model)
-        self._remember_model(cleaned)
-        main.refresh_header()
-        self._record_model_changed(
+        self._commit_model_selection(
             old_provider=backend.provider,
             old_model=old_model,
             new_provider=backend.provider,
             new_model=cleaned,
-        )
-        main.narrative.add_notice(
-            "success", f"模型已切换为: {self.backend_label}"
+            notice=f"模型已切换为: {self.backend_label}",
         )
         return True
 
@@ -2338,16 +2634,15 @@ class TuiApp(App[None]):
             _build_backend,
         )
 
-        main = self._main
-        if main is None:
+        if self._main is None and not isinstance(self.screen, LandingScreen):
             return False
         if self.run_handle is not None and self.active_loop is None:
-            main.narrative.add_notice("info", "run 已结束,不可切换 profile")
+            self._notify_ui("info", "run 已结束,不可切换 profile")
             return False
         cfg = _load_config_dict(self.config.home_path)
         profile = get_profile(cfg, profile_name)
         if profile is None:
-            main.narrative.add_notice("error", f"未找到 profile '{profile_name}'")
+            self._notify_ui("error", f"未找到 profile '{profile_name}'")
             return False
         old_backend = self.config.backend
         old_provider = old_backend.provider
@@ -2372,24 +2667,20 @@ class TuiApp(App[None]):
                 try:
                     old_backend.set_model(resolved_model)
                 except (NotImplementedError, ValueError) as exc:
-                    main.narrative.add_notice(
+                    self._notify_ui(
                         "error", f"切换 profile @{profile_name} 失败:{exc}"
                     )
                     return False
-                self.config.model_label = resolved_model
-                self._remember_model(old_model)
-                self._remember_model(resolved_model)
-                main.refresh_header()
-                self._record_model_changed(
+                self._commit_model_selection(
                     old_provider=old_provider,
                     old_model=old_model,
                     new_provider=old_provider,
                     new_model=resolved_model,
                     profile=profile_name,
-                )
-                main.narrative.add_notice(
-                    "success",
-                    f"已切换至 profile @{profile_name}: {self.backend_label}",
+                    notice=(
+                        f"已切换至 profile @{profile_name}: "
+                        f"{new_provider} · {resolved_model}"
+                    ),
                 )
                 return True
 
@@ -2406,9 +2697,7 @@ class TuiApp(App[None]):
         try:
             new_backend = _build_backend(ns)
         except ConfigError as exc:
-            main.narrative.add_notice(
-                "error", f"切换 profile @{profile_name} 失败:{exc}"
-            )
+            self._notify_ui("error", f"切换 profile @{profile_name} 失败:{exc}")
             return False
         loop = self.active_loop
         if loop is not None:
@@ -2417,20 +2706,20 @@ class TuiApp(App[None]):
             self._runtime.backend = new_backend
         self._retired_backends.append(old_backend)
         self.config.backend = new_backend
+        self._cached_remote_models = None
         resolved_label = new_backend.model or new_model
-        self.config.model_label = resolved_label
-        self._remember_model(old_model)
-        self._remember_model(resolved_label)
-        main.refresh_header()
-        self._record_model_changed(
+        shown_model = resolved_label or new_backend.provider
+        self._commit_model_selection(
             old_provider=old_provider,
             old_model=old_model,
             new_provider=new_backend.provider,
             new_model=resolved_label,
             profile=profile_name,
-        )
-        main.narrative.add_notice(
-            "success", f"已切换至 profile @{profile_name}: {self.backend_label}"
+            recheck_probe=True,
+            notice=(
+                f"已切换至 profile @{profile_name}: "
+                f"{new_backend.provider} · {shown_model}"
+            ),
         )
         return True
 

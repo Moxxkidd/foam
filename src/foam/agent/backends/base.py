@@ -462,6 +462,54 @@ def default_timeout() -> httpx.Timeout:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ConnectionProbeResult:
+    """启动期轻量连接探测结果(不触发推理、不消耗 token)。"""
+
+    status: str  # "verified" | "unsupported" | "error"
+    detail: str = ""
+    models: tuple[str, ...] = ()
+
+
+async def probe_models_endpoint(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+) -> ConnectionProbeResult:
+    """请求模型列表端点并返回统一连通性结果(不泄漏密钥)。"""
+    try:
+        response = await client.get(
+            url,
+            headers=headers,
+            timeout=httpx.Timeout(3.0),
+        )
+    except httpx.TimeoutException:
+        return ConnectionProbeResult("error", "timeout")
+    except httpx.HTTPError as exc:
+        return ConnectionProbeResult("error", exc.__class__.__name__)
+
+    code = response.status_code
+    if code == 200:
+        try:
+            payload = response.json()
+            items = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return ConnectionProbeResult("verified", "", ())
+            ids = {
+                str(item["id"]).strip()
+                for item in items
+                if isinstance(item, dict) and str(item.get("id") or "").strip()
+            }
+            return ConnectionProbeResult("verified", "", tuple(sorted(ids)))
+        except (ValueError, TypeError, KeyError):
+            return ConnectionProbeResult("verified", "", ())
+    if code in (401, 403):
+        return ConnectionProbeResult("error", f"HTTP {code} (check API key)")
+    if code in (404, 405, 501):
+        return ConnectionProbeResult("unsupported", f"HTTP {code}")
+    return ConnectionProbeResult("error", f"HTTP {code}")
+
+
 class LLMBackend(ABC):
     """统一后端接口。
 
@@ -483,6 +531,16 @@ class LLMBackend(ABC):
     async def list_models(self) -> list[str]:
         """探测当前后端可用的模型列表(默认空列表;失败不抛)。"""
         return []
+
+    async def probe_connection(self) -> ConnectionProbeResult:
+        """轻量探测后端连通性(默认尝试 list_models,不消耗 token)。"""
+        try:
+            models = await self.list_models()
+        except Exception as exc:
+            return ConnectionProbeResult("error", exc.__class__.__name__)
+        if models:
+            return ConnectionProbeResult("verified", "", tuple(models))
+        return ConnectionProbeResult("unsupported", "")
 
     @abstractmethod
     def chat(

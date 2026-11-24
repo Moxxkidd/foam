@@ -36,9 +36,10 @@ from textual.css.query import NoMatches
 from textual.widgets import Button, Input
 
 import foam.tui
-from foam import __app_name__
+from foam import __app_name__, __version__
 from foam.agent.backends import openai_compat
 from foam.agent.backends.base import (
+    ConnectionProbeResult,
     LLMBackend,
     Message,
     ReasoningDelta,
@@ -79,8 +80,14 @@ from foam.state.files import (
 from foam.tools.bash import TOOL_SCHEMAS, BashTool
 from foam.tui import TuiApp, TUIConfig, default_loop_factory
 from foam.tui.app import load_operator, save_operator
-from foam.tui.banner import GLYPH_ROWS, render_wordmark
+from foam.tui.banner import (
+    GLYPH_ROWS,
+    render_3d_wordmark,
+    render_animated_wordmark,
+    render_wordmark,
+)
 from foam.tui.widgets import (
+    AnimatedWordmark,
     InputDock,
     KillConfirmBar,
     ModelPickerCard,
@@ -155,6 +162,9 @@ def make_config(tmp_path: Path, script, **overrides) -> TUIConfig:
         # 更正当:TUI 真实默认是 True(连续对话);测试基座默认 False,
         # 让既有断言 finished 终态的用例语义不变,待命用例显式传 True。
         "wait_on_finish": False,
+        # 动效迎宾首屏真实默认 True;测试基座默认 False 保持既有主屏测试路径,
+        # 首屏专项用例显式不覆盖(测真实 TUIConfig 默认值 True)。
+        "show_landing": False,
     }
     if callable(script):
 
@@ -4397,3 +4407,247 @@ async def test_tui_statusbar_left_center_no_collision_on_narrow_terminal(tmp_pat
         right = main.query_one("#sb-right")
         assert left.region.right < center.region.x
         assert center.region.right < right.region.x
+
+
+def test_render_3d_and_animated_wordmark_wave_and_bubbles():
+    """动态 3D 字标:源自 __app_name__、立体框线投影、微气泡叠加、帧间演进且适宽。"""
+    grid = render_3d_wordmark(__app_name__)
+    assert len(grid) == GLYPH_ROWS + 1
+    assert render_3d_wordmark(__app_name__[:-1] + "Z") != grid
+
+    f0 = render_animated_wordmark(__app_name__, 0)
+    f6 = render_animated_wordmark(__app_name__, 6)
+    p0 = f0.plain
+    p6 = f6.plain
+    assert "█" in p0
+    assert any(ch in p0 for ch in ("═", "║", "╝"))
+    assert any(ch in p0 + p6 for ch in ("·", "°", "∘", "◦"))
+    assert f0 != f6 or f0.spans != f6.spans
+    assert max(len(line) for line in p0.splitlines()) <= 64
+
+    long_rendered = render_animated_wordmark("LONG-BRAND", 2)
+    assert max(len(line) for line in long_rendered.plain.splitlines()) <= 78
+
+
+class _LandingProbeBackend(_SwitchableBackend):
+    def __init__(
+        self,
+        model_name: str = "k3-init",
+        remote: list[str] = ("remote-a", "remote-b"),
+        probe_result: ConnectionProbeResult | None = None,
+    ) -> None:
+        super().__init__(model_name, remote=remote)
+        self._probe_result = probe_result or ConnectionProbeResult(
+            "verified", "", tuple(remote)
+        )
+        self.probe_calls = 0
+
+    async def probe_connection(self) -> ConnectionProbeResult:
+        self.probe_calls += 1
+        return self._probe_result
+
+
+async def test_tui_default_landing_screen_animated_logo_and_probe(tmp_path):
+    """默认 TUIConfig 先展示动效迎宾首屏、推进动画帧并异步完成连通性探测。"""
+    from foam.tui.app import LandingScreen
+
+    backend = _LandingProbeBackend("k3-256k", remote=["k3.1-pro", "remote-z"])
+    cfg = TUIConfig(
+        scope=None,
+        scope_source="",
+        backend=backend,
+        model_label="k3-256k",
+        operator="doma",
+        engagements_dir=tmp_path / "engagements",
+        config_home=tmp_path / "home",
+    )
+    assert cfg.show_landing is True
+    app = TuiApp(cfg)
+    async with app.run_test(headless=True, size=(120, 38)):
+        await wait_for(lambda: isinstance(app.screen, LandingScreen))
+        screen = app.screen
+        assert app._main is None
+        logo = screen.query_one("#landing-logo", AnimatedWordmark)
+        initial_frame = logo.frame
+        await wait_for(lambda: logo.frame >= initial_frame + 2)
+        await wait_for(lambda: backend.probe_calls == 1)
+        await wait_for(
+            lambda: "Model connection verified"
+            in str(screen.query_one("#landing-probe").content)
+        )
+        assert app._cached_remote_models == ("k3.1-pro", "remote-z")
+        assert "AI-native Kali harness" in str(
+            screen.query_one("#landing-tagline").content
+        )
+        assert f"v{__version__}" in str(screen.query_one("#landing-version").content)
+        assert "k3-256k" in str(screen.query_one("#landing-model").render())
+
+
+async def test_tui_landing_submit_launches_main_and_runs_prompt(tmp_path):
+    """迎宾屏输入任务回车无缝进入主屏、停播字标定时器并立即执行首条目标。"""
+    from foam.tui.app import LandingScreen, MainScreen
+
+    backend = _LandingProbeBackend("k3-256k", remote=["k3.1-pro"])
+    app = TuiApp(
+        TUIConfig(
+            scope=None,
+            scope_source="",
+            backend=backend,
+            model_label="k3-256k",
+            operator="doma",
+            targets=("10.0.0.1",),
+            engagements_dir=tmp_path / "engagements",
+            config_home=tmp_path / "home",
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(120, 38)) as pilot:
+        await wait_for(lambda: isinstance(app.screen, LandingScreen))
+        logo = app.screen.query_one("#landing-logo", AnimatedWordmark)
+        assert "10.0.0.1" in str(app.screen.query_one("#landing-targets").content)
+
+        await pilot.press(*"你好")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: isinstance(app.screen, MainScreen) and app._main is not None
+        )
+        assert logo._timer is None
+        await wait_for(
+            lambda: app.active_loop is not None and app.active_loop.status == "idle"
+        )
+        echo = narrative_blocks(app._main, NoticeBlock)[0]
+        assert echo.content == "❯ 你好"
+        assert any(
+            r["kind"] == KIND_TARGET_DECLARED
+            and r["payload"]["targets"] == ["10.0.0.1"]
+            for r in audit_records(app)
+        )
+
+
+async def test_tui_landing_slash_model_and_picker_propagate_to_main(tmp_path):
+    """迎宾屏 `/model <id>` 与选择器切换并同步至主屏顶栏/欢迎条/侧栏。"""
+    from foam.tui.app import LandingScreen, MainScreen
+
+    backend = _LandingProbeBackend("k3-init", remote=["remote-picked"])
+    app = TuiApp(
+        TUIConfig(
+            scope=None,
+            scope_source="",
+            backend=backend,
+            model_label="k3-init",
+            operator="doma",
+            engagements_dir=tmp_path / "engagements",
+            config_home=tmp_path / "home",
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(120, 38)) as pilot:
+        await wait_for(lambda: isinstance(app.screen, LandingScreen))
+        screen = app.screen
+
+        await pilot.press(*"/model custom-9")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: "custom-9" in str(screen.query_one("#landing-model").render())
+        )
+        assert isinstance(app.screen, LandingScreen)
+        assert backend.model == "custom-9"
+
+        # 裸 /model 在迎宾屏打开选择卡并通过自定义输入切换到 picker-model
+        await pilot.press(*"/model")
+        await pilot.press("enter")
+        await wait_for(lambda: len(screen.query(ModelPickerCard)) == 1)
+        card = screen.query_one(ModelPickerCard)
+        custom = card.query_one("#model-custom-input", Input)
+        custom.focus()
+        await pilot.press(*"picker-model")
+        await pilot.press("enter")
+        await wait_for(lambda: len(screen.query(ModelPickerCard)) == 0)
+        await wait_for(
+            lambda: "picker-model" in str(screen.query_one("#landing-model").render())
+        )
+
+        # 回车启动主屏,三处模型显示均已是切换后的 picker-model
+        inp = screen.query_one("#landing-input", Input)
+        inp.focus()
+        await pilot.press(*"go")
+        await pilot.press("enter")
+        await wait_for(lambda: isinstance(app.screen, MainScreen))
+        main = app._main
+        await wait_for(lambda: main is not None and main.mounted_event.is_set())
+        assert "picker-model" in str(main.query_one("#sb-left").content)
+        assert "picker-model" in str(main.query_one("#banner-meta").content)
+        assert "picker-model" in str(main.query_one("#side-model").render())
+
+
+async def test_tui_landing_empty_enter_ctrl_c_and_narrow_80x30_layout(tmp_path):
+    """迎宾屏空回车、Ctrl-C 退出与 80x30 窄屏紧凑布局。"""
+    from foam.tui.app import LandingScreen, MainScreen
+
+    # 场景 1:80x30 窄终端不裁切 + 带 instruction 时空回车自动开跑
+    app1 = TuiApp(
+        TUIConfig(
+            scope=None,
+            scope_source="",
+            backend=_LandingProbeBackend("k3-256k"),
+            model_label="k3-256k",
+            operator="doma",
+            instruction="inspect localhost",
+            engagements_dir=tmp_path / "e1",
+            config_home=tmp_path / "h1",
+            wait_on_finish=True,
+        )
+    )
+    async with app1.run_test(headless=True, size=(80, 30)) as pilot:
+        await wait_for(lambda: isinstance(app1.screen, LandingScreen))
+        screen = app1.screen
+        await pilot.pause(0.15)
+        for sel in ("#landing-logo", "#landing-card", "#landing-footer"):
+            region = screen.query_one(sel).region
+            assert region.x >= 0 and region.right <= 80, (sel, region)
+            assert region.y >= 0 and region.bottom <= 30, (sel, region)
+        await pilot.press("enter")
+        await wait_for(lambda: isinstance(app1.screen, MainScreen))
+        await wait_for(
+            lambda: app1.active_loop is not None and app1.active_loop.status == "idle"
+        )
+        echo = narrative_blocks(app1._main, NoticeBlock)[0]
+        assert echo.content == "❯ inspect localhost"
+
+    # 场景 2:无 instruction 空回车进空主屏(不自启动 loop)
+    app2 = TuiApp(
+        TUIConfig(
+            scope=None,
+            scope_source="",
+            backend=_LandingProbeBackend("k3-256k"),
+            model_label="k3-256k",
+            operator="doma",
+            engagements_dir=tmp_path / "e2",
+            config_home=tmp_path / "h2",
+            wait_on_finish=True,
+        )
+    )
+    async with app2.run_test(headless=True, size=(120, 38)) as pilot:
+        await wait_for(lambda: isinstance(app2.screen, LandingScreen))
+        await pilot.press("enter")
+        await wait_for(lambda: isinstance(app2.screen, MainScreen))
+        await pilot.pause(0.1)
+        assert app2.run_handle is None
+
+    # 场景 3:Ctrl-C 干净退出,返回码为 0
+    app3 = TuiApp(
+        TUIConfig(
+            scope=None,
+            scope_source="",
+            backend=_LandingProbeBackend("k3-256k"),
+            model_label="k3-256k",
+            operator="doma",
+            engagements_dir=tmp_path / "e3",
+            config_home=tmp_path / "h3",
+            wait_on_finish=True,
+        )
+    )
+    async with app3.run_test(headless=True, size=(120, 38)) as pilot:
+        await wait_for(lambda: isinstance(app3.screen, LandingScreen))
+        await pilot.press("ctrl+c")
+    assert app3._exit_code() == 0

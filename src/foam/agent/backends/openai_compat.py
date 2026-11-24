@@ -24,6 +24,7 @@ import httpx
 
 from foam.agent.backends.base import (
     BackendEvent,
+    ConnectionProbeResult,
     IncompleteResponseError,
     LLMBackend,
     Message,
@@ -42,6 +43,7 @@ from foam.agent.backends.base import (
     map_transport_error,
     parse_retry_after,
     parse_tool_arguments,
+    probe_models_endpoint,
     redact_secret,
     require_env_key,
 )
@@ -116,29 +118,17 @@ class OpenAICompatBackend(LLMBackend):
             raise ValueError("模型名不能为空")
         self._model = cleaned
 
+    async def probe_connection(self) -> ConnectionProbeResult:
+        """轻量探测 OpenAI 兼容 `/models` 端点连通性并顺带读取可用模型 id。"""
+        return await probe_models_endpoint(
+            self._client,
+            f"{self._base_url}/models",
+            {"Authorization": f"Bearer {self._api_key}"},
+        )
+
     async def list_models(self) -> list[str]:
         """探测 OpenAI 兼容 `/models` 接口可用模型 id;异常静默返回空列表。"""
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        try:
-            response = await self._client.get(
-                f"{self._base_url}/models",
-                headers=headers,
-                timeout=httpx.Timeout(3.0),
-            )
-            if response.status_code != 200:
-                return []
-            payload = response.json()
-            items = payload.get("data") if isinstance(payload, dict) else None
-            if not isinstance(items, list):
-                return []
-            ids = {
-                str(item["id"]).strip()
-                for item in items
-                if isinstance(item, dict) and str(item.get("id") or "").strip()
-            }
-            return sorted(ids)
-        except (httpx.HTTPError, ValueError, TypeError, KeyError):
-            return []
+        return list((await self.probe_connection()).models)
 
     async def aclose(self) -> None:
         await self._client.aclose()
