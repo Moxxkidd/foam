@@ -597,9 +597,9 @@ class LandingScreen(Screen):
         model_id = self.tui._current_model_id() or "(default)"
         provider = self.tui.config.backend.provider
         dot_style = {
-            "verified": "#3fb950",
+            "verified": "#38bdf8",
             "error": "#d29922",
-        }.get(self._probe_state, "#56d4dd")
+        }.get(self._probe_state, "dim #38bdf8")
         text = Text.assemble(
             ("● ", dot_style),
             (model_id, "bold #e6edf3"),
@@ -615,7 +615,7 @@ class LandingScreen(Screen):
         if self._status_override is not None:
             kind, msg = self._status_override
             style = {
-                "success": "#3fb950",
+                "success": "#38bdf8",
                 "error": "#f85149",
                 "warn": "#d29922",
             }.get(kind, "dim")
@@ -628,7 +628,7 @@ class LandingScreen(Screen):
             )
             content = Text.assemble(
                 ("Verifying model connection...\n", "dim"),
-                (f"Model connection verified{suffix}", "#3fb950"),
+                (f"Model connection verified{suffix}", "#38bdf8"),
             )
         elif self._probe_state == "unsupported":
             content = Text.assemble(

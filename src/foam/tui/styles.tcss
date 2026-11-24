@@ -92,7 +92,7 @@ LandingScreen {
 #landing-card {
     width: 100%;
     height: auto;
-    border: round #2dd4bf;
+    border: round #38bdf8;
     background: #0d1117;
     padding: 1 2;
 }
@@ -105,7 +105,7 @@ LandingScreen {
 #landing-prompt-glyph {
     width: 2;
     height: 1;
-    color: #56d4dd;
+    color: #38bdf8;
     text-style: bold;
 }
 
