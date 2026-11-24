@@ -172,9 +172,6 @@ _PLACEHOLDER_ENDED = "run 已结束;/status 回顾,Ctrl-Q 退出"
 
 #: 主环纠正原因的中文标签(叙述流警告块用)。
 _CORRECTION_LABELS = {
-    "no_tool_call_action_claim": (
-        "幻觉执行纠正:模型声称执行动作但未发 tool_call,已回灌纠正说明"
-    ),
     "malformed_tool_call": "工具参数非法 JSON:已回灌纠正(连续 3 次将终止 run)",
 }
 

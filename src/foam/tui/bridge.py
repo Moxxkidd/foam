@@ -105,7 +105,7 @@ class JobExitMsg(Message):
 
 
 class CorrectionMsg(Message):
-    """主环自动纠正(幻觉执行/非法 JSON 回灌);警告块,始终展开。"""
+    """主环自动纠正(非法 JSON 工具参数回灌等);警告块,始终展开。"""
 
     def __init__(self, reason: str) -> None:
         super().__init__()

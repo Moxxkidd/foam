@@ -12,8 +12,8 @@
   再压旧对话;system 与 ENGAGEMENT.md 消息永不压缩,objective 永不压缩。
 - 操作员面:插话队列(turn 边界注入)、pause/resume(turn 边界)、kill(立即
   cancel 当前 turn + 杀全部活动 job)。
-- 消化 WP-03 对 Kimi K3 的实测发现(见各常量注释):幻觉执行纠正、
-  MalformedToolCallError 回灌、首事件超时默认 30s(K3 实测 max 16.24s)。
+- 消化 WP-03 对 Kimi K3 的实测发现(见各常量注释):MalformedToolCallError
+  回灌、首事件超时默认 30s(K3 实测 max 16.24s)。
 - WP-09 增量(最小改动,声明见 docs/dev-logs/WP-09.md):ReasoningDelta
   透传 + on_reasoning_delta/on_phase 钩子(思考审计只记哈希;阶段来自
   ENGAGEMENT.md 字段,变化才触发);operator 呼号进 operator_interject
@@ -114,8 +114,6 @@ MAX_TOOL_RESULT_CHARS = 200_000
 PARSE_TEXT_BUDGET_BYTES = 1_048_576
 #: 连续 MalformedToolCall 回灌纠正的上限,超过判定模型无法自愈,结束 run。
 MAX_CONSECUTIVE_MALFORMED = 3
-#: 连续「幻觉执行」纠正的上限,超过接受 finish(防止纠正死循环)。
-MAX_CONSECUTIVE_CLAIM_CORRECTIONS = 2
 #: 回灌给模型的坏 JSON 原文摘录上限。
 _RAW_ARGS_ECHO_LIMIT = 4_000
 #: R06-C:run 收尾排空后台终态消费任务的有界超时(与收割上界同量级)。
@@ -138,46 +136,6 @@ KIND_LLM_RETRY = "llm_retry"
 KIND_CONTEXT_COMPRESSED = "context_compressed"
 KIND_BUDGET_LIMIT_CHANGED = "budget_limit_changed"
 KIND_BUDGET_WARNING = "budget_warning"
-
-#: 幻觉执行(K3 实测 A4:声称「已记录」却不发 tool_call)的动作声明特征。
-#: 宁宽勿严:误报只多一轮纠正(有上限),漏报会污染 engagement 记录。
-_ACTION_CLAIM_RE = re.compile(
-    r"已(?:经)?(?:执行|运行|跑完|完成|扫描|探测|记录|保存|写入|写出|创建|启动|"
-    r"获取|读取|下载|上传|收集|生成|部署)"
-    r"|(?:执行|运行|扫描|记录|保存|写入|启动)(?:完毕|完成|好了)"
-    r"|(?i:\b(?:executed|ran|scanned|saved|recorded|written|launched|created|"
-    r"downloaded|uploaded|generated)\b)"
-)
-
-_HISTORICAL_SUMMARY_RE = re.compile(
-    r"总结|汇总|执行摘要|最终结论|结论如下|结果如下|以下为|本轮成果|不声称任何新动作"
-)
-_NEW_ACTION_INTENT_RE = re.compile(
-    r"(?:接下来|下一步|现在|马上|随后|然后|我将|我会|我准备|即将)"
-    r".{0,30}(?:执行|运行|扫描|探测|记录|保存|写入|创建|启动|获取|读取|下载|上传|收集|生成|部署)"
-)
-
-
-def _is_historical_summary(text: str, messages: Sequence[Message]) -> bool:
-    if not _HISTORICAL_SUMMARY_RE.search(text) or _NEW_ACTION_INTENT_RE.search(text):
-        return False
-    for message in messages:
-        if message.role != "tool":
-            continue
-        try:
-            result = json.loads(message.content)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(result, dict) or "error" in result:
-            continue
-        if result.get("status") == "denied_by_scope_guard":
-            continue
-        exit_code = result.get("exit_code")
-        if isinstance(exit_code, int) and exit_code != 0:
-            continue
-        return True
-    return False
-
 
 _PERMISSION_FAILURE_RE = re.compile(r"operation not permitted|permission denied", re.I)
 
@@ -214,13 +172,6 @@ def _capability_command(command: str) -> dict[str, str] | None:
         }
     return None
 
-
-_CLAIM_CORRECTION_TEXT = (
-    "【主环自动纠正】你上一条回复声称执行了动作,但本轮没有检测到任何工具调用 "
-    "tool_call。在本环境中只有真正发出工具调用才会产生动作,纯文本描述不算执行。"
-    "如需执行命令/读取输出/管理 job,请现在发出对应的工具调用;如任务确已全部"
-    "完成,请直接给出最终结论,不要声称执行了未实际发出的动作。"
-)
 
 _COMPRESSED_TOOL_GENERIC = "[已压缩] 旧工具结果已移除以释放上下文(该结果无落盘路径)。"
 _COMPRESSED_ASSISTANT = "[已压缩] 历史助手消息文本已省略。"
@@ -822,7 +773,6 @@ class AgentLoop:
 
     async def _main(self) -> RunResult:
         consecutive_malformed = 0
-        consecutive_claim_corrections = 0
         while True:
             # ---- turn 边界:插话 → kill → pause ----
             self._drain_interjections()
@@ -863,24 +813,6 @@ class AgentLoop:
             )
 
             if not tool_calls:
-                # finish 或幻觉执行(K3 实测:声称完成却不发 tool_call)
-                if (
-                    _ACTION_CLAIM_RE.search(outcome.text)
-                    and not _is_historical_summary(outcome.text, self._messages)
-                    and consecutive_claim_corrections
-                    < MAX_CONSECUTIVE_CLAIM_CORRECTIONS
-                ):
-                    consecutive_claim_corrections += 1
-                    self._audit.append(
-                        KIND_LOOP_CORRECTION,
-                        {
-                            "reason": "no_tool_call_action_claim",
-                            "excerpt": outcome.text[:200],
-                        },
-                    )
-                    self._observer.on_correction("no_tool_call_action_claim")
-                    self._messages.append(Message.user(_CLAIM_CORRECTION_TEXT))
-                    continue
                 if self._wait_on_finish and not self._kill_requested:
                     # WP-09 更正当:终答不收尾,idle 待命等插话续段(run 未
                     # 结束,不写 run_finished;kill 走既有清理面)。
@@ -895,7 +827,6 @@ class AgentLoop:
                     input_tokens=self._total_input,
                     output_tokens=self._total_output,
                 )
-            consecutive_claim_corrections = 0
 
             for call in tool_calls:
                 if call.id == malformed_call_id:

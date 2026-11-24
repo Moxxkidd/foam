@@ -593,216 +593,83 @@ async def test_engagement_interface_reads_wp06_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# K3 实测消化:幻觉执行 / MalformedToolCall / 首事件超时
+# MalformedToolCall / 无 tool_call 自然结束回归
 # ---------------------------------------------------------------------------
 
 
-async def test_hallucinated_execution_gets_corrected(tmp_path):
-    env = make_loop(
-        tmp_path,
-        [
-            # K3 A4 同款:声称「已执行」却不发 tool_call
-            [TextDelta("已执行 nmap 扫描,发现 80 端口开放。"), Usage(5, 5)],
-            [ToolCall("tc-1", "run_command", {"command": "echo real"}), Usage(6, 6)],
-            [TextDelta("以上为真实输出,任务到此。"), Usage(7, 7)],
-        ],
+async def test_no_tool_call_reply_with_action_words_finishes_without_correction(
+    tmp_path,
+):
+    """自然报告措辞(如「已运行/已保存/已执行」)不再触发正则幻觉纠正。"""
+    reply = (
+        "### 本机监听服务\n"
+        "- 容器 `juice-shop` 已运行约 14 小时\n"
+        "- 完整检查记录已保存至: `outputs/check.txt`\n"
+        "已执行基础环境盘点。"
     )
-    result = await env.loop.run("扫描")
+    env = make_loop(tmp_path, [[TextDelta(reply), Usage(5, 5)]])
+    result = await env.loop.run("报告当前状态")
     assert result.status == "finished"
-    corrections = [
-        m for m in env.loop.messages if m.role == "user" and "主环自动纠正" in m.content
-    ]
-    assert len(corrections) == 1
-    records = [
-        r
-        for r in audit_records(env)
-        if r["kind"] == "loop_correction"
-        and r["payload"]["reason"] == "no_tool_call_action_claim"
-    ]
-    assert len(records) == 1
-    assert "已执行" in records[0]["payload"]["excerpt"]
-    assert "exec_request" in audit_kinds(env)  # 纠正后真的执行了
-    assert result.summary == "以上为真实输出,任务到此。"
+    assert result.rounds == 1
+    assert env.backend.chat_count == 1
+    assert result.summary == reply
+    assert not any(
+        m.role == "user" and "主环自动纠正" in m.content for m in env.loop.messages
+    )
+    assert "loop_correction" not in audit_kinds(env)
     assert verify(env.audit_path)
 
 
-async def test_hallucination_correction_budget_then_accept(tmp_path):
-    """模型坚持空口声称:纠正 2 次后接受 finish(防纠正死循环)。"""
+async def test_tool_run_followed_by_natural_report_never_retriggers(tmp_path):
+    """工具执行后自然文本报告(即使不含「总结/结论如下」关键词)直接收尾或进入待命。"""
+    report = (
+        "### 检查情况\n"
+        "- 目标服务已运行并开放 3000 端口\n"
+        "- 本次检查结果已保存至: `outputs/recon.txt`"
+    )
     env = make_loop(
         tmp_path,
         [
-            [TextDelta("已执行扫描,结果良好。"), Usage(1, 1)],
-            [TextDelta("已记录发现。"), Usage(1, 1)],
-            [TextDelta("已完成全部工作。"), Usage(1, 1)],
+            [ToolCall("tc-1", "run_command", {"command": "echo ok"}), Usage(4, 3)],
+            [TextDelta(report), Usage(5, 4)],
         ],
     )
-    result = await env.loop.run("扫描")
+    result = await env.loop.run("检查本机环境")
     assert result.status == "finished"
-    corrections = [r for r in audit_records(env) if r["kind"] == "loop_correction"]
-    assert len(corrections) == 2  # 预算用尽后不再纠正
-    assert "exec_request" not in audit_kinds(env)  # 全程无真实执行
-
-
-# ---------------------------------------------------------------------------
-# R14-B:纯历史总结与真实工具证据
-# ---------------------------------------------------------------------------
-
-
-async def test_summary_does_not_trigger_action_claim(tmp_path):
-    """known-issues ②:真实执行后的历史总结不再多要求一次执行。"""
-    summary = "渗透任务已完成。总结如下:\n\n## 执行结果\n\n目标 127.0.0.1 侦察完毕。"
-    env = make_loop(
-        tmp_path,
-        [
-            [
-                ToolCall(
-                    "tc-history",
-                    "run_command",
-                    {"command": "echo recon 127.0.0.1"},
-                ),
-                Usage(1, 1),
-            ],
-            [TextDelta(summary), Usage(2, 2)],
-        ],
-    )
-    result = await env.loop.run("总结历史侦察")
-    assert result.status == "finished"
-    assert result.summary == summary
     assert result.rounds == 2
     assert env.backend.chat_count == 2
-    corrections = [
-        r
-        for r in audit_records(env)
-        if r["kind"] == "loop_correction"
-        and r["payload"]["reason"] == "no_tool_call_action_claim"
-    ]
-    assert corrections == []
+    assert result.summary == report
+    assert "loop_correction" not in audit_kinds(env)
     assert verify(env.audit_path)
 
+    idle_dir = tmp_path / "idle_case"
+    idle_dir.mkdir()
+    idle_event = asyncio.Event()
 
-async def test_summary_without_tool_still_triggers_action_claim(tmp_path):
-    """总结措辞不能替代执行:无工具历史仍纠正两次后按原预算收尾。"""
-    final_text = "以下为最终结论:已完成全部工作。"
-    env = make_loop(
-        tmp_path,
+    class _IdleObserver(LoopObserver):
+        def on_status(self, status: str) -> None:
+            if status == "idle":
+                idle_event.set()
+
+    idle_env = make_loop(
+        idle_dir,
         [
-            [TextDelta("总结:已执行扫描。"), Usage(1, 1)],
-            [TextDelta("最终结论:已记录发现。"), Usage(1, 1)],
-            [TextDelta(final_text), Usage(1, 1)],
+            [ToolCall("tc-2", "run_command", {"command": "echo ok"}), Usage(4, 3)],
+            [TextDelta(report), Usage(5, 4)],
         ],
+        loop_kw={"wait_on_finish": True, "observer": _IdleObserver()},
     )
-    result = await env.loop.run("无工具总结对照")
-    assert result.status == "finished"
-    assert result.summary == final_text
-    assert result.rounds == 3
-    assert env.backend.chat_count == 3
-    corrections = [
-        r
-        for r in audit_records(env)
-        if r["kind"] == "loop_correction"
-        and r["payload"]["reason"] == "no_tool_call_action_claim"
-    ]
-    assert len(corrections) == 2
-    assert "exec_request" not in audit_kinds(env)
-
-
-async def test_scope_denial_does_not_support_summary(tmp_path):
-    """scope denial 是失败反馈,不能作为历史总结的成功工具证据。"""
-    env = make_loop(
-        tmp_path,
-        [
-            [
-                ToolCall("tc-denied", "run_command", {"command": "nmap 8.8.8.8"}),
-                Usage(1, 1),
-            ],
-            [TextDelta("总结:已执行扫描并记录结果。"), Usage(1, 1)],
-            [TextDelta("核实后给出结论。"), Usage(1, 1)],
-        ],
-    )
-    result = await env.loop.run("拒绝结果对照")
-    assert result.status == "finished"
-    assert result.summary == "核实后给出结论。"
-    assert result.rounds == 3
-    assert env.backend.chat_count == 3
-    corrections = [
-        r
-        for r in audit_records(env)
-        if r["kind"] == "loop_correction"
-        and r["payload"]["reason"] == "no_tool_call_action_claim"
-    ]
-    assert len(corrections) == 1
-    assert "exec_denied" in audit_kinds(env)
-    assert "exec_request" not in audit_kinds(env)
-
-
-@pytest.mark.parametrize("failure_kind", ["malformed", "unknown_tool", "nonzero_exit"])
-async def test_failed_tool_results_do_not_support_summary(tmp_path, failure_kind):
-    """malformed/error/非零退出都不是支持历史总结的成功工具证据。"""
-    if failure_kind == "malformed":
-        first = (
-            [TextDelta("尝试执行。")],
-            MalformedToolCallError(
-                "bad",
-                provider="fake",
-                tool_name="run_command",
-                call_id="tc-failed",
-                raw_arguments="{",
-            ),
-        )
-    elif failure_kind == "unknown_tool":
-        first = [ToolCall("tc-failed", "nonsense_tool", {}), Usage(1, 1)]
-    else:
-        first = [
-            ToolCall("tc-failed", "run_command", {"command": "bash -c 'exit 1'"}),
-            Usage(1, 1),
-        ]
-    env = make_loop(
-        tmp_path,
-        [
-            first,
-            [TextDelta("总结:已执行扫描并记录结果。"), Usage(1, 1)],
-            [TextDelta("核实后给出结论。"), Usage(1, 1)],
-        ],
-    )
-    result = await env.loop.run("失败结果对照")
-    assert result.status == "finished"
-    assert result.summary == "核实后给出结论。"
-    assert result.rounds == 3
-    assert env.backend.chat_count == 3
-    corrections = [
-        r
-        for r in audit_records(env)
-        if r["kind"] == "loop_correction"
-        and r["payload"]["reason"] == "no_tool_call_action_claim"
-    ]
-    assert len(corrections) == 1
-
-
-async def test_new_action_after_success_still_triggers_action_claim(tmp_path):
-    """带总结措辞的新动作意图不属于纯历史总结,仍须核实工具调用。"""
-    env = make_loop(
-        tmp_path,
-        [
-            [
-                ToolCall("tc-old", "run_command", {"command": "echo old"}),
-                Usage(1, 1),
-            ],
-            [TextDelta("总结如上。下一步执行完毕后再写入报告。"), Usage(1, 1)],
-            [TextDelta("核实后给出结论。"), Usage(1, 1)],
-        ],
-    )
-    result = await env.loop.run("新动作对照")
-    assert result.status == "finished"
-    assert result.summary == "核实后给出结论。"
-    assert result.rounds == 3
-    assert env.backend.chat_count == 3
-    corrections = [
-        r
-        for r in audit_records(env)
-        if r["kind"] == "loop_correction"
-        and r["payload"]["reason"] == "no_tool_call_action_claim"
-    ]
-    assert len(corrections) == 1
+    task = asyncio.create_task(idle_env.loop.run("检查本机环境"))
+    try:
+        await asyncio.wait_for(idle_event.wait(), timeout=5)
+        assert idle_env.loop.status == "idle"
+        assert idle_env.backend.chat_count == 2
+        assert "loop_correction" not in audit_kinds(idle_env)
+    finally:
+        idle_env.loop.kill("test done")
+        res_idle = await asyncio.wait_for(task, timeout=5)
+        idle_env.audit.close()
+    assert res_idle.status == "killed"
 
 
 # ---------------------------------------------------------------------------
