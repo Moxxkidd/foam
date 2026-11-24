@@ -1337,7 +1337,7 @@ class TuiApp(App[None]):
             )
             return
         if self.run_handle is None:
-            main.narrative.add_notice("objective", f"❯ {text}")
+            main.narrative.add_notice("objective", text)
             if self.config.scope is None:
                 if (
                     self.config.execution_mode == "protected"
@@ -1372,7 +1372,7 @@ class TuiApp(App[None]):
                 main.narrative.add_notice("info", _PLACEHOLDER_ENDED)
             return
         loop.interject(text)
-        main.narrative.add_notice("interject", f"❯ {text}")
+        main.narrative.add_notice("interject", text)
 
     def _append_file_scope_confirm(self) -> None:
         """Q8:file 流在 ``start_run`` 内、run task 创建前且仍持锁时补写

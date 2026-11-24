@@ -93,6 +93,8 @@ from foam.tui.widgets import (
     ToolCard,
     WelcomeBanner,
     _budget_text,
+    _render_thinking_header,
+    _thinking_preview_lines,
     format_bytes,
     format_duration_ms,
     format_tokens,
@@ -3919,7 +3921,7 @@ async def test_tui_default_strix_target_mode_no_welcome_and_slash_target(tmp_pat
         assert scope_card(main) is None
         assert notices_containing(main, "执行模式:legacy") == []
         echo = narrative_blocks(main, NoticeBlock)[0]
-        assert "❯ 你好" in echo.content
+        assert echo.content == "❯ 你好"
 
         records = audit_records(app)
         assert any(
@@ -4002,3 +4004,125 @@ async def test_tui_target_mode_can_opt_in_scope_later(tmp_path):
         await wait_for(
             lambda: any(r["kind"] == KIND_EXEC_DENIED for r in audit_records(app))
         )
+
+
+def test_thinking_helpers_spinner_preview_and_markup_safety():
+    """纯函数单测:动态思考头(无静态🧠)、尾部3行实时预览、Rich markup 免疫。"""
+    preview = _thinking_preview_lines("第一行\n\n第二行\n第三行\n第四行")
+    assert "第一行" not in preview
+    assert preview.splitlines() == ["  第二行", "  第三行", "↳ 第四行"]
+    long_line = "A" * 120
+    clipped = _thinking_preview_lines(long_line, max_chars=20)
+    assert clipped.startswith("↳ …") and len(clipped) == 22
+
+    h0 = str(
+        _render_thinking_header(
+            done=False,
+            expanded=False,
+            elapsed=0.4,
+            chars=12,
+            tick=0,
+            text="分析中",
+        )
+    )
+    h1 = str(
+        _render_thinking_header(
+            done=False,
+            expanded=False,
+            elapsed=0.6,
+            chars=24,
+            tick=1,
+            text="分析中",
+        )
+    )
+    assert "🧠" not in h0 and "🧠" not in h1
+    assert "思考中" in h0 and h0[0] != h1[0]
+
+    done_collapsed = str(
+        _render_thinking_header(
+            done=True,
+            expanded=False,
+            elapsed=1.2,
+            chars=30,
+            tick=5,
+            text="核对 [red]literal[/red] 目标端口",
+        )
+    )
+    assert "🧠" not in done_collapsed
+    assert done_collapsed.startswith("▸ ")
+    assert "[red]literal[/red]" in done_collapsed
+
+    done_expanded = str(
+        _render_thinking_header(
+            done=True,
+            expanded=True,
+            elapsed=1.2,
+            chars=30,
+            tick=5,
+            text="核对端口",
+        )
+    )
+    assert done_expanded.startswith("▾ ") and "[Enter 收起]" in done_expanded
+
+
+async def test_thinking_block_live_animation_preview_and_collapse(tmp_path):
+    """流式思考期:active 类 + 旋转计时推进 + 尾部预览可见;收尾后折叠为单行。"""
+    gate = asyncio.Event()
+
+    class _StreamingThinkingBackend(LLMBackend):
+        provider = "fake-think"
+
+        async def aclose(self) -> None:
+            pass
+
+        def chat(self, messages, tools=None):
+            async def _stream():
+                yield ReasoningDelta("步骤 1:探测主机连通性\n")
+                yield ReasoningDelta("步骤 2:分析 [cyan]banner[/cyan] 特征")
+                await gate.wait()
+                yield TextDelta("分析完毕。")
+                yield Usage(4, 2)
+
+            return _stream()
+
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [],
+            scope=None,
+            scope_source="",
+            backend=_StreamingThinkingBackend(),
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        await pilot.press(*"hello")
+        await pilot.press("enter")
+
+        await wait_for(lambda: len(narrative_blocks(main, ThinkingBlock)) == 1)
+        thinking = narrative_blocks(main, ThinkingBlock)[0]
+        await wait_for(
+            lambda: thinking._tick >= 2
+            and thinking.query_one(".thinking-preview").display is True
+        )
+        assert thinking.done is False
+        assert thinking.has_class("active")
+        assert "🧠" not in str(thinking.query_one(".thinking-header").content)
+        preview_content = str(thinking.query_one(".thinking-preview").content)
+        assert "↳ 步骤 2:分析 [cyan]banner[/cyan] 特征" in preview_content
+
+        gate.set()
+        await wait_for(lambda: app._final_result is not None and thinking.done)
+        await pilot.pause(0.1)
+        assert thinking.has_class("done")
+        assert not thinking.has_class("active")
+        assert thinking.query_one(".thinking-preview").display is False
+        assert thinking.size.height <= 2
+        header_done = str(thinking.query_one(".thinking-header").content)
+        assert header_done.startswith("▸ ") and "🧠" not in header_done
+
+        thinking.action_toggle()
+        await pilot.pause(0.05)
+        assert thinking.expanded is True
+        assert thinking.query_one(".thinking-body").display is True
+        assert str(thinking.query_one(".thinking-header").content).startswith("▾ ")

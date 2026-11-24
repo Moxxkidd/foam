@@ -5,7 +5,8 @@
 - 工具卡紧凑流(Q2):运行中 spinner + 命令一行;完成折叠为
   「文字标记 + 命令 + 状态摘要」一行;Enter/点击展开 WP-01 head+tail 截断视图;
   护栏拒绝 / 非零退出 / 错误 / 待输入提示一律自动展开。
-- 思考块(Q6):灰色可折叠,默认折叠为「🧠 思考 Ns · M 字符」。
+- 思考块(Q6):动态旋转指示 + 流式微缩预览(最多 3 行),完成后默认折叠为
+  「▸ 思考 Ns · M 字符 · 摘要」,Enter/点击展开原文。
 - 语义色 + 文字标记双通道(D4):不只靠颜色传达状态。
 - 模型文本一律 ``markup=False`` 渲染(方括号等内容不得被当作 console 标记)。
 
@@ -97,8 +98,88 @@ class StreamBlock(Static):
         self.update(self._text)  # update 在挂载前调用安全(只写内容置脏)
 
 
+_THINKING_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_THINKING_TICK_SECONDS = 0.10
+
+
+def _thinking_preview_lines(
+    text: str, *, max_lines: int = 3, max_chars: int = 76
+) -> str:
+    """提取思考流尾部最多 ``max_lines`` 非空行供实时预览;末行附 `↳` 前缀。"""
+    if not text.strip():
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    tail = lines[-max_lines:]
+    rendered: list[str] = []
+    for idx, line in enumerate(tail):
+        if idx == len(tail) - 1:
+            clipped = (
+                "…" + line[-(max_chars - 1) :]
+                if len(line) > max_chars
+                else line
+            )
+            rendered.append(f"↳ {clipped}")
+        else:
+            clipped = (
+                line[: max_chars - 1] + "…"
+                if len(line) > max_chars
+                else line
+            )
+            rendered.append(f"  {clipped}")
+    return "\n".join(rendered)
+
+
+def _thinking_summary_excerpt(text: str, max_chars: int = 28) -> str:
+    """将思考内容压成单行短摘要供完成折叠态头部展示。"""
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return ""
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max_chars - 1] + "…"
+
+
+def _render_thinking_header(
+    *,
+    done: bool,
+    expanded: bool,
+    elapsed: float,
+    chars: int,
+    tick: int,
+    text: str,
+) -> Text:
+    """渲染 ThinkingBlock 标题行(全程用 Text.append 免疫 Rich markup 注入)。"""
+    out = Text()
+    if not done:
+        spinner = _THINKING_SPINNER[tick % len(_THINKING_SPINNER)]
+        out.append(f"{spinner} ", style="bold #56d4dd")
+        wave = tick % 6
+        for i, ch in enumerate("思考中"):
+            if i == wave:
+                style = "bold #e6edf3"
+            elif abs(i - wave) == 1:
+                style = "#56d4dd"
+            else:
+                style = "#8b949e"
+            out.append(ch, style=style)
+        dots = "." * ((tick // 3) % 4)
+        out.append(f"{dots:<3}", style="#56d4dd")
+        out.append(f" {elapsed:.1f}s · {chars} 字符", style="#8b949e")
+        out.append("  [Enter 收起]" if expanded else "  [Enter 展开全文]", style="dim")
+        return out
+
+    out.append("▾ " if expanded else "▸ ", style="#56d4dd")
+    out.append(f"思考 {elapsed:.1f}s · {chars} 字符", style="#8b949e")
+    if not expanded:
+        excerpt = _thinking_summary_excerpt(text, 28)
+        if excerpt:
+            out.append(f" · {excerpt}", style="dim italic")
+    out.append("  [Enter 收起]" if expanded else "  [Enter 展开]", style="dim")
+    return out
+
+
 class ThinkingBlock(Vertical):
-    """折叠思考块(Q6):默认折叠为一行摘要,Enter/点击展开原文。
+    """动态思考块:生成期显示旋转指示与实时尾部预览,结束后折叠为摘要一行。
 
     内容只进界面与 loop 的审计哈希,不落任何明文文件。
     """
@@ -107,23 +188,34 @@ class ThinkingBlock(Vertical):
     BINDINGS = [Binding("enter", "toggle", "展开/折叠思考", show=False)]
 
     def __init__(self) -> None:
-        super().__init__(classes="thinking")
+        super().__init__(classes="thinking active")
         self._text = ""
         self._started = time.monotonic()
         self._elapsed = 0.0
         self._done = False
         self._expanded = False
         self._ready = False
+        self._tick = 0
         self._timer = None
 
     def compose(self):
         yield Static(classes="thinking-header")
+        yield Static("", markup=False, classes="thinking-preview")
         yield Static("", markup=False, classes="thinking-body")
 
     def on_mount(self) -> None:
         self._ready = True
-        self._timer = self.set_interval(0.5, self._redraw)
+        if not self._done:
+            self._timer = self.set_interval(_THINKING_TICK_SECONDS, self._on_tick)
+        else:
+            self.remove_class("active", "pulse")
+            self.add_class("done")
         self._redraw()
+
+    def on_unmount(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
 
     @property
     def text(self) -> str:
@@ -137,6 +229,16 @@ class ThinkingBlock(Vertical):
     def expanded(self) -> bool:
         return self._expanded
 
+    def _on_tick(self) -> None:
+        if self._done:
+            if self._timer is not None:
+                self._timer.stop()
+                self._timer = None
+            return
+        self._tick += 1
+        self.set_class((self._tick // 5) % 2 == 1, "pulse")
+        self._redraw()
+
     def feed(self, delta: str) -> None:
         self._text += delta
         self._redraw()
@@ -149,6 +251,9 @@ class ThinkingBlock(Vertical):
         self._elapsed = time.monotonic() - self._started
         if self._timer is not None:
             self._timer.stop()
+            self._timer = None
+        self.remove_class("active", "pulse")
+        self.add_class("done")
         self._redraw()
 
     def _redraw(self) -> None:
@@ -157,11 +262,24 @@ class ThinkingBlock(Vertical):
         elapsed = (
             self._elapsed if self._done else time.monotonic() - self._started
         )
-        state = "思考" if self._done else "思考中…"
-        hint = "" if self._expanded else "  [Enter 展开]"
         self.query_one(".thinking-header", Static).update(
-            f"🧠 {state} {elapsed:.0f}s · {len(self._text)} 字符{hint}"
+            _render_thinking_header(
+                done=self._done,
+                expanded=self._expanded,
+                elapsed=elapsed,
+                chars=len(self._text),
+                tick=self._tick,
+                text=self._text,
+            )
         )
+        preview_text = (
+            _thinking_preview_lines(self._text)
+            if not self._done and not self._expanded
+            else ""
+        )
+        preview = self.query_one(".thinking-preview", Static)
+        preview.update(preview_text)
+        preview.display = bool(preview_text)
         body = self.query_one(".thinking-body", Static)
         body.update(self._text)
         body.display = self._expanded
@@ -192,7 +310,7 @@ _NOTICE_KINDS: dict[str, tuple[str, str]] = {
     "info": ("ℹ", "dim"),
     "help": ("?", "phase"),
     "success": ("✓", "ok"),
-    "objective": ("◆", "blue"),
+    "objective": ("❯", "blue"),
     "interject": ("❯", "blue"),
     "final": ("─", "phase"),
 }
@@ -440,6 +558,7 @@ class NarrativeView(VerticalScroll):
             self.thinking = ThinkingBlock()
             self._mount_block(self.thinking)
         self.thinking.feed(delta)
+        self.call_after_refresh(self._scroll_to_end)
 
     def open_card(self, name: str, arguments: dict[str, Any]) -> ToolCard:
         self.stream = None

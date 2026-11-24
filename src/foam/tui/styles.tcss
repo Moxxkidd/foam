@@ -172,12 +172,32 @@ WelcomeScreen {
     height: auto;
 }
 
+.thinking.active {
+    border-left: solid #56d4dd;
+}
+
+.thinking.active.pulse {
+    border-left: solid #58a6ff;
+}
+
+.thinking.done {
+    border-left: solid #30363d;
+}
+
 .thinking:focus {
     border-left: solid #8b949e;
 }
 
 .thinking-header {
     color: #8b949e;
+    height: auto;
+}
+
+.thinking-preview {
+    color: #8b949e;
+    text-style: italic;
+    padding-left: 2;
+    max-height: 3;
     height: auto;
 }
 
