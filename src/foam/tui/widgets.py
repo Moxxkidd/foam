@@ -647,11 +647,18 @@ class WelcomeBanner(Vertical):
         self._hint = hint
 
     def compose(self):
-        yield Static(self._title, id="banner-title")
-        if self._meta:
-            yield Static(self._meta, id="banner-meta")
+        yield Static(self._title, id="banner-title", markup=False)
+        meta = Static(self._meta, id="banner-meta", markup=False)
+        meta.display = bool(self._meta)
+        yield meta
         if self._hint:
-            yield Static(self._hint, id="banner-hint")
+            yield Static(self._hint, id="banner-hint", markup=False)
+
+    def set_meta(self, meta: str) -> None:
+        self._meta = meta
+        widget = self.query_one("#banner-meta", Static)
+        widget.update(meta)
+        widget.display = bool(meta)
 
 
 class SidebarPane(VerticalScroll):
@@ -659,6 +666,7 @@ class SidebarPane(VerticalScroll):
 
     def __init__(self) -> None:
         super().__init__(id="sidebar")
+        self.model_label = ""
         self.phase = ""
         self.targets: list[str] = []
         self.instruction = ""
@@ -667,6 +675,8 @@ class SidebarPane(VerticalScroll):
         self.sessions: list[dict[str, Any]] = []
 
     def compose(self):
+        yield Static("模型", classes="side-title")
+        yield Static(Text("—", style="dim"), id="side-model")
         yield Static("目标", classes="side-title")
         yield Static(Text("—", style="dim"), id="side-targets")
         yield Static("阶段", classes="side-title")
@@ -679,6 +689,24 @@ class SidebarPane(VerticalScroll):
         yield Static(Text("—", style="dim"), id="side-jobs")
         yield Static("sessions", classes="side-title")
         yield Static(Text("—", style="dim"), id="side-sessions")
+
+    def set_model(self, label: str) -> None:
+        self.model_label = label
+        widget = self.query_one("#side-model", Static)
+        if not label:
+            widget.update(Text("—", style="dim"))
+            return
+        if " · " in label:
+            provider, model_id = label.split(" · ", 1)
+            widget.update(
+                Text.assemble(
+                    (_clip(model_id, 27), "bold cyan"),
+                    "\n",
+                    (_clip(provider, 27), "dim"),
+                )
+            )
+            return
+        widget.update(Text(_clip(label, 27), style="bold cyan"))
 
     def set_targets(self, targets: list[str], instruction: str = "") -> None:
         self.targets = [t.strip() for t in targets if t and t.strip()]

@@ -3942,6 +3942,7 @@ async def test_tui_default_strix_target_mode_no_welcome_and_slash_target(tmp_pat
         await pilot.press("enter")
         await wait_for(lambda: notices_containing(main, "目标已更新") != [])
         assert "10.0.0.9" in str(main.query_one("#side-targets").render())
+        assert "10.0.0.9" in str(main.query_one("#banner-meta").content)
         meta = json.loads(
             (app.engagement.paths.metadata).read_text(encoding="utf-8")
         )
@@ -3999,6 +4000,7 @@ async def test_tui_target_mode_can_opt_in_scope_later(tmp_path):
         await wait_for(lambda: notices_containing(main, "scope 已确认冻结") != [])
         assert app.config.scope is not None
         assert app.config.scope.rules == ("127.0.0.0/8",)
+        assert "scope: 1 条规则" in str(main.query_one("#banner-meta").content)
 
         # 下一条插话尝试访问 8.8.8.8 -> 触发 scope 拒绝审计
         await pilot.press(*"继续测试 8.8.8.8")
@@ -4191,6 +4193,8 @@ async def test_tui_slash_model_direct_switch_status_and_audit(tmp_path):
         assert backend.model == "gpt-4o-mini"
         assert app.config.model_label == "gpt-4o-mini"
         assert "gpt-4o-mini" in str(main.query_one("#sb-left").content)
+        assert "gpt-4o-mini" in str(main.query_one("#banner-meta").content)
+        assert "gpt-4o-mini" in str(main.query_one("#side-model").render())
         assert any(
             r["kind"] == KIND_MODEL_CHANGED
             and r["payload"]["old_model"] == "k3-init"
@@ -4280,6 +4284,21 @@ async def test_tui_model_picker_interactive_discovery_custom_and_esc(tmp_path):
         await wait_for(lambda: len(main.narrative.query(ModelPickerCard)) == 0)
         await wait_for(lambda: notices_containing(main, "模型已切换为") != [])
         assert backend.model == "custom-model-9"
+        assert "custom-model-9" in str(main.query_one("#sb-left").content)
+        assert "custom-model-9" in str(main.query_one("#banner-meta").content)
+        assert "custom-model-9" in str(main.query_one("#side-model").render())
+
+        # 再次打开 /model,先前的 k3-init 保留在「最近使用」可切回
+        await pilot.press(*"/model")
+        await pilot.press("enter")
+        await wait_for(lambda: len(main.narrative.query(ModelPickerCard)) == 1)
+        card3 = main.narrative.query_one(ModelPickerCard)
+        await wait_for(lambda: len(list(card3.query("#model-list > *"))) >= 2)
+        labels3 = [
+            str(item.query_one("Label").content)
+            for item in card3.query("#model-list > *")
+        ]
+        assert any("k3-init" in lbl and "[最近使用]" in lbl for lbl in labels3)
 
 
 async def test_tui_slash_model_switch_profile_same_and_cross_provider(
@@ -4352,4 +4371,29 @@ async def test_tui_slash_model_switch_profile_same_and_cross_provider(
         assert app.config.backend.model == "claude-sonnet-5"
         assert app.active_loop._backend is app.config.backend
         assert "claude · claude-sonnet-5" in str(main.query_one("#sb-left").content)
+        assert "claude · claude-sonnet-5" in str(main.query_one("#banner-meta").content)
+        assert "claude-sonnet-5" in str(main.query_one("#side-model").render())
         assert backend in app._retired_backends
+
+
+async def test_tui_statusbar_left_center_no_collision_on_narrow_terminal(tmp_path):
+    """窄终端(80 列)顶栏左/中/右三区保持清晰间距,避免文字粘连。"""
+    backend = _SwitchableBackend("k3.1-pro")
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [[TextDelta("ok"), Usage(2, 1)]],
+            scope=None,
+            scope_source="",
+            backend=backend,
+            model_label="k3.1-pro",
+        )
+    )
+    async with app.run_test(headless=True, size=(80, 30)) as pilot:
+        main = await enter_main(app, pilot)
+        await start_run_and_wait(app, pilot, objective="hi")
+        left = main.query_one("#sb-left")
+        center = main.query_one("#sb-center")
+        right = main.query_one("#sb-right")
+        assert left.region.right < center.region.x
+        assert center.region.right < right.region.x

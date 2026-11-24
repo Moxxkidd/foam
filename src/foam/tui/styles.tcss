@@ -71,19 +71,26 @@ WelcomeScreen {
 
 #sb-left {
     width: auto;
-    color: #8b949e;
+    margin-right: 2;
+    color: #e6edf3;
     text-style: bold;
+    text-wrap: nowrap;
 }
 
 #sb-center {
     width: 1fr;
+    padding: 0 1;
     text-align: center;
     color: #8b949e;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
 }
 
 #sb-right {
     width: auto;
+    margin-left: 2;
     text-align: right;
+    text-wrap: nowrap;
 }
 
 /* ---------- 主区/侧栏布局 ---------- */

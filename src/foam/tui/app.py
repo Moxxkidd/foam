@@ -557,32 +557,29 @@ class MainScreen(Screen):
         self._apply_sidebar_visibility()
         app = self.tui
         config = app.config
-        self.sidebar.set_targets(list(config.targets), config.instruction)
-        if config.scope is not None:
-            meta_items = [
-                app.backend_label,
-                f"scope: {len(config.scope.rules)} 条规则",
-            ]
-        elif config.targets:
-            meta_items = [
-                app.backend_label,
-                f"目标: {', '.join(config.targets)}",
-            ]
-        else:
-            meta_items = [app.backend_label, "自由交互模式"]
-        if config.execution_mode == "protected":
-            meta_items.append("protected")
-        if config.instruction.strip():
-            meta_items.append("已附加指令")
         banner = WelcomeBanner(
             title=f"{__app_name__} v{__version__}",
-            meta=" · ".join(meta_items),
-            hint="/help 命令 · /target 设定目标 · /scope 可选护栏",
+            meta=app.banner_meta,
+            hint="/help 命令 · /model 切换模型 · /target 设定目标 · /scope 可选护栏",
         )
         self.narrative.mount(banner)
+        self.refresh_header()
         self.input_dock.input_box.focus()
         if config.scope_text and config.scope is None and not app.ceremony_running:
             app.start_scope_ceremony(config.scope_text, mode="predeclare")
+
+    def refresh_header(self) -> None:
+        """同步顶栏、欢迎条与侧栏上的模型/目标/scope 展示(单一事实源)。"""
+        app = self.tui
+        self.statusbar.set_left(app.status_line)
+        self.sidebar.set_model(app.backend_label)
+        self.sidebar.set_targets(
+            list(app.config.targets), str(app.config.instruction or "")
+        )
+        try:
+            self.query_one("#welcome-banner", WelcomeBanner).set_meta(app.banner_meta)
+        except NoMatches:
+            pass
 
     # ---------- 部件速取 ----------
 
@@ -886,6 +883,7 @@ class MainScreen(Screen):
         loop = app.active_loop
         if loop is not None:
             loop.interject(f"[目标更新] 当前关注目标已更新为: {', '.join(new_targets)}")
+        self.refresh_header()
         self.narrative.add_notice(
             "success", f"目标已更新: {', '.join(new_targets)}"
         )
@@ -1188,6 +1186,10 @@ class TuiApp(App[None]):
         self._scope_frozen_via_nl = False
         self._model_card: ModelPickerCard | None = None
         self._retired_backends: list[LLMBackend] = []
+        self._recent_models: list[str] = []
+        initial_model = self._current_model_id()
+        if initial_model:
+            self._recent_models.append(initial_model)
 
     # ---------- 展示数据 ----------
 
@@ -1200,6 +1202,28 @@ class TuiApp(App[None]):
     @property
     def status_line(self) -> str:
         return f"{__app_name__} v{__version__} · {self.backend_label}"
+
+    @property
+    def banner_meta(self) -> str:
+        """欢迎条状态行(单一事实源:模型/模式/目标/scope 变更后同步刷新)。"""
+        config = self.config
+        if config.scope is not None:
+            meta_items = [
+                self.backend_label,
+                f"scope: {len(config.scope.rules)} 条规则",
+            ]
+        elif config.targets:
+            meta_items = [
+                self.backend_label,
+                f"目标: {', '.join(config.targets)}",
+            ]
+        else:
+            meta_items = [self.backend_label, "自由交互模式"]
+        if config.execution_mode == "protected":
+            meta_items.append("protected")
+        if str(config.instruction or "").strip():
+            meta_items.append("已附加指令")
+        return " · ".join(meta_items)
 
     @property
     def active_loop(self) -> AgentLoop | None:
@@ -1824,6 +1848,7 @@ class TuiApp(App[None]):
                 f"canonical sha256:{frozen_sha[:12]}"
             )
             if mode == "startup":
+                main.refresh_header()
                 main.narrative.add_notice("success", summary)
                 # D9 两段结构:冻结完成后才调 start_run;幂等复开同参目录
                 # (objective/scope meta 已由冻结写齐),仪式锁移交正式 run。
@@ -1837,10 +1862,12 @@ class TuiApp(App[None]):
                 self.config.scope_source = meta_scope["path"]
                 self.config.scope_bytes = compilation.canonical_text.encode("utf-8")
                 self._scope_frozen_via_nl = True
+                main.refresh_header()
                 main.narrative.add_notice(
                     "success", summary + "(下一条命令即生效)"
                 )
             else:  # predeclare:不启动 loop
+                main.refresh_header()
                 main.narrative.add_notice(
                     "success", summary + ";发送首条消息启动 run"
                 )
@@ -2137,6 +2164,11 @@ class TuiApp(App[None]):
                 payload["profile"] = profile
             self._audit.append(KIND_MODEL_CHANGED, payload)
 
+    def _remember_model(self, model_id: str) -> None:
+        cleaned = model_id.strip()
+        if cleaned and cleaned not in self._recent_models:
+            self._recent_models.append(cleaned)
+
     def _local_model_options(self) -> list[tuple[str, str, str]]:
         from foam.cli import DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL
 
@@ -2167,6 +2199,10 @@ class TuiApp(App[None]):
             else:
                 desc = f"  @{pname} · {p_backend}/{p_model}"
             options.append(("profile", pname, desc))
+        for recent in self._recent_models:
+            if recent not in seen_models:
+                seen_models.add(recent)
+                options.append(("model", recent, f"  {recent}  [最近使用]"))
         for candidate in (DEFAULT_OPENAI_MODEL, DEFAULT_CLAUDE_MODEL):
             if candidate not in seen_models:
                 seen_models.add(candidate)
@@ -2278,7 +2314,9 @@ class TuiApp(App[None]):
             main.narrative.add_notice("error", f"模型切换失败:{exc}")
             return False
         self.config.model_label = cleaned
-        main.statusbar.set_left(self.status_line)
+        self._remember_model(old_model)
+        self._remember_model(cleaned)
+        main.refresh_header()
         self._record_model_changed(
             old_provider=backend.provider,
             old_model=old_model,
@@ -2339,7 +2377,9 @@ class TuiApp(App[None]):
                     )
                     return False
                 self.config.model_label = resolved_model
-                main.statusbar.set_left(self.status_line)
+                self._remember_model(old_model)
+                self._remember_model(resolved_model)
+                main.refresh_header()
                 self._record_model_changed(
                     old_provider=old_provider,
                     old_model=old_model,
@@ -2379,7 +2419,9 @@ class TuiApp(App[None]):
         self.config.backend = new_backend
         resolved_label = new_backend.model or new_model
         self.config.model_label = resolved_label
-        main.statusbar.set_left(self.status_line)
+        self._remember_model(old_model)
+        self._remember_model(resolved_label)
+        main.refresh_header()
         self._record_model_changed(
             old_provider=old_provider,
             old_model=old_model,
