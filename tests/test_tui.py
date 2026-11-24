@@ -4651,3 +4651,35 @@ async def test_tui_landing_empty_enter_ctrl_c_and_narrow_80x30_layout(tmp_path):
         await wait_for(lambda: isinstance(app3.screen, LandingScreen))
         await pilot.press("ctrl+c")
     assert app3._exit_code() == 0
+
+
+async def test_tui_two_chinese_sessions_same_day_do_not_collide(tmp_path):
+    """同日连续两条不同中文目标(如「你好」与「检查一下本机的网络环境」)不再撞目录报错。"""
+    from datetime import UTC, datetime
+
+    eng_dir = tmp_path / "engagements"
+    legacy_id = f"{datetime.now(UTC).strftime('%Y%m%d')}-engagement"
+    Engagement.create(eng_dir, "你好", engagement_id=legacy_id).close()
+
+    for idx, prompt_text in enumerate(("你好", "检查一下本机的网络环境")):
+        app = TuiApp(
+            make_config(
+                tmp_path,
+                [[TextDelta(f"ok-{idx}"), Usage(2, 1)]],
+                scope=None,
+                scope_source="",
+                engagements_dir=eng_dir,
+            )
+        )
+        async with app.run_test(headless=True, size=(140, 40)) as pilot:
+            main = await enter_main(app, pilot)
+            await pilot.press(*prompt_text)
+            await pilot.press("enter")
+            await wait_for(lambda cur=app: cur._final_result is not None)
+            assert app._final_result.status == "finished"
+            assert notices_containing(main, "engagement 创建失败") == []
+            assert app.engagement.metadata()["objective"] == prompt_text
+
+    dirs = sorted(p.name for p in eng_dir.iterdir() if p.is_dir())
+    assert len(dirs) == 3
+    assert legacy_id in dirs

@@ -189,7 +189,46 @@ def acquire_engagement_lock(root: str | Path) -> EngagementLock:
 
 def _default_engagement_id(objective: str) -> str:
     date = datetime.now(UTC).strftime("%Y%m%d")
-    return f"{date}-{_slugify(objective)}"
+    normalized = " ".join(objective.split())
+    if not normalized:
+        return f"{date}-engagement"
+    lowered = normalized.lower()
+    raw_slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
+    slug = raw_slug[:24].strip("-") or "engagement"
+    # 纯 ASCII 且无截断的短目标保留 YYYYMMDD-<slug>(如 recon lab / recon   lab);
+    # 含非 ASCII(中文等)、符号或超 24 字符截断的目标附带 6 位摘要避免同日撞车。
+    lossy = (
+        not raw_slug
+        or raw_slug != slug
+        or bool(re.search(r"[^a-z0-9\s-]", lowered))
+    )
+    if lossy:
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:6]
+        return f"{date}-{slug}-{digest}"
+    return f"{date}-{slug}"
+
+
+def _resolve_auto_engagement_id(base_dir: str | Path, objective: str) -> str:
+    """为未显式指定 id 的目标解析无冲突目录名:同目标幂等复用,异目标自动顺延。"""
+    base = Path(base_dir)
+    stem = _default_engagement_id(objective)
+    seq = 1
+    while True:
+        candidate = stem if seq == 1 else f"{stem}-{seq}"
+        meta_path = base / candidate / "engagement.json"
+        if not meta_path.exists():
+            return candidate
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return candidate
+        if (
+            not isinstance(meta, dict)
+            or not objective
+            or meta.get("objective") == objective
+        ):
+            return candidate
+        seq += 1
 
 
 def _scope_meta_conflict(
@@ -299,7 +338,9 @@ class Engagement:
         不二次读盘——消灭「解析用旧字节、落盘用新字节」的 TOCTOU 窗口;
         给定时跳过文件存在性检查(调用方既已读出字节,文件必存在过)。
         """
-        engagement_id = engagement_id or _default_engagement_id(objective)
+        engagement_id = engagement_id or _resolve_auto_engagement_id(
+            base_dir, objective
+        )
         root = Path(base_dir) / engagement_id
         cleaned_targets = [t.strip() for t in targets if t and t.strip()]
         cleaned_instruction = instruction.strip()

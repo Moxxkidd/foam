@@ -117,6 +117,7 @@ from foam.state.files import (
     Engagement,
     EngagementLockedError,
     _default_engagement_id,
+    _resolve_auto_engagement_id,
     acquire_engagement_lock,
 )
 from foam.state.heartbeat import HeartbeatWriter
@@ -1554,10 +1555,11 @@ class TuiApp(App[None]):
         create: bool = False,
     ) -> Engagement:
         """打开/创建目录并在后续审计或修订写入前取得同一单写者锁。"""
-        root = Path(self.config.engagements_dir) / (
-            engagement_id or _default_engagement_id(objective)
-        )
         held = self._engagement_lock
+        resolved_id = engagement_id or _resolve_auto_engagement_id(
+            self.config.engagements_dir, objective
+        )
+        root = Path(self.config.engagements_dir) / resolved_id
         if held is not None and held.path.parent.resolve() != root.resolve():
             raise RuntimeError("TUI 当前持有另一个 engagement 的写者锁")
         guard_mode = (
@@ -1570,7 +1572,7 @@ class TuiApp(App[None]):
                 self.config.engagements_dir,
                 objective,
                 scope_path=scope_path,
-                engagement_id=engagement_id,
+                engagement_id=resolved_id,
                 scope_bytes=scope_bytes,
                 targets=self.config.targets,
                 instruction=self.config.instruction,
@@ -1583,7 +1585,7 @@ class TuiApp(App[None]):
                 self.config.engagements_dir,
                 objective,
                 scope_path=scope_path,
-                engagement_id=engagement_id,
+                engagement_id=resolved_id,
                 scope_bytes=scope_bytes,
                 targets=self.config.targets,
                 instruction=self.config.instruction,
@@ -1720,13 +1722,16 @@ class TuiApp(App[None]):
         main = self._main
         if scope is None or main is None:
             return
-        root = Path(self.config.engagements_dir) / _default_engagement_id(text)
+        resolved_id = _resolve_auto_engagement_id(self.config.engagements_dir, text)
+        root = Path(self.config.engagements_dir) / resolved_id
         existed = (root / "engagement.json").exists()
         engagement: Engagement
         sha256 = ""
         try:
             engagement = self._open_engagement_locked(
-                text, scope_path=self.config.scope_source
+                text,
+                engagement_id=resolved_id,
+                scope_path=self.config.scope_source,
             )
             if existed:
                 old_scope_meta = engagement.metadata().get("scope") or {}
@@ -1816,11 +1821,15 @@ class TuiApp(App[None]):
         # meta 落盘口径(Gap B 收口):resolve 后绝对路径;审计/展示渠道仍用
         # config.scope_source as-given——meta_path 只是局部变量,不回写 config
         meta_path = str(Path(self.config.scope_source).resolve())
-        root = Path(self.config.engagements_dir) / _default_engagement_id(text)
+        resolved_id = _resolve_auto_engagement_id(self.config.engagements_dir, text)
+        root = Path(self.config.engagements_dir) / resolved_id
         existed = (root / "engagement.json").exists()
         try:
             engagement = self._open_engagement_locked(
-                text, scope_path=meta_path, scope_bytes=data
+                text,
+                engagement_id=resolved_id,
+                scope_path=meta_path,
+                scope_bytes=data,
             )
             if existed:
                 old_scope_meta = engagement.metadata().get("scope") or {}
@@ -1902,7 +1911,7 @@ class TuiApp(App[None]):
         engagement_id = (
             _default_engagement_id(f"scope-predeclare-{text}")
             if predeclare
-            else None
+            else _default_engagement_id(text)
         )
         try:
             return self._open_engagement_locked(

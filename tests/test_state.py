@@ -129,6 +129,38 @@ def test_create_conflict_raises(tmp_path, scope_file):
         )
 
 
+def test_default_engagement_id_disambiguates_chinese_and_long_objectives(tmp_path):
+    """未显式指定 id 时,中文/混排/长英文目标不再同日撞入同一 engagement 目录。"""
+    id_fn = files_module._default_engagement_id
+    id_hi = id_fn("你好")
+    id_net = id_fn("检查一下本机的网络环境")
+    assert id_hi != id_net
+    assert id_fn("检查 10.0.0.1") != id_fn("扫描 10.0.0.1")
+    long_a = "enumerate internal staging cluster services alpha"
+    long_b = "enumerate internal staging cluster services beta"
+    assert id_fn(long_a) != id_fn(long_b)
+    # 纯 ASCII 短目标保持同日可预测 slug,空白归一化一致
+    assert id_fn("recon lab") == id_fn("recon   lab")
+
+    base = tmp_path / "engagements"
+    e_hi = Engagement.create(base, "你好")
+    e_net = Engagement.create(base, "检查一下本机的网络环境")
+    assert e_hi.paths.root != e_net.paths.root
+    assert e_hi.metadata()["objective"] == "你好"
+    assert e_net.metadata()["objective"] == "检查一下本机的网络环境"
+
+    # ASCII 同 slug 异目标("recon lab" vs "recon-lab")自动顺延 -2,同目标仍幂等复用
+    e_space = Engagement.create(base, "recon lab")
+    e_dash = Engagement.create(base, "recon-lab")
+    assert e_dash.paths.root.name == f"{e_space.paths.root.name}-2"
+    e_space_reopen = Engagement.create(base, "recon lab")
+    assert e_space_reopen.paths.root == e_space.paths.root
+
+    # 显式 engagement_id 仍保持严格 fail-closed 冲突检查
+    with pytest.raises(ValueError, match="参数冲突"):
+        Engagement.create(base, "其它目标", engagement_id=e_hi.paths.root.name)
+
+
 def test_create_missing_scope_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="scope 文件不存在"):
         Engagement.create(
