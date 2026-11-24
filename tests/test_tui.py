@@ -59,6 +59,7 @@ from foam.cli import main as cli_main
 from foam.guard.audit import (
     KIND_EXEC_DENIED,
     KIND_KILL_SWITCH,
+    KIND_MODEL_CHANGED,
     KIND_OPERATOR_INTERJECT,
     KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
@@ -82,6 +83,7 @@ from foam.tui.banner import GLYPH_ROWS, render_wordmark
 from foam.tui.widgets import (
     InputDock,
     KillConfirmBar,
+    ModelPickerCard,
     NarrativeView,
     NoticeBlock,
     PhaseDivider,
@@ -870,10 +872,10 @@ async def test_slash_commands_and_completion_popup(tmp_path):
         dock = main.query_one("#inputdock", InputDock)
         popup = dock.popup
 
-        # 输入 "/" → 弹层出 10 条候选(含 /target)
+        # 输入 "/" → 弹层出 11 条候选(含 /model 与 /target)
         await pilot.press("/")
         await wait_for(lambda: dock.popup_visible)
-        assert len(popup.children) == 10
+        assert len(popup.children) == 11
         # 继续输入 "sta" → 过滤到 /status;Enter 接受高亮(不直接提交)
         await pilot.press("s", "t", "a")
         await wait_for(lambda: len(popup.children) == 1)
@@ -4126,3 +4128,228 @@ async def test_thinking_block_live_animation_preview_and_collapse(tmp_path):
         assert thinking.expanded is True
         assert thinking.query_one(".thinking-body").display is True
         assert str(thinking.query_one(".thinking-header").content).startswith("▾ ")
+
+
+class _SwitchableBackend(LLMBackend):
+    provider = "openai_compat"
+
+    def __init__(self, model_name: str = "k3-init", remote: list[str] = ()) -> None:
+        self._model = model_name
+        self._base_url = "https://example.com/v1"
+        self._remote = list(remote)
+        self.aclose_calls = 0
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def set_model(self, model: str) -> None:
+        cleaned = model.strip()
+        if not cleaned:
+            raise ValueError("模型名不能为空")
+        self._model = cleaned
+
+    async def list_models(self) -> list[str]:
+        return list(self._remote)
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+    def chat(self, messages, tools=None):
+        async def _stream():
+            yield TextDelta(f"reply from {self._model}")
+            yield Usage(2, 1)
+
+        return _stream()
+
+
+async def test_tui_slash_model_direct_switch_status_and_audit(tmp_path):
+    """直接 `/model <id>` 切换后端模型、更新顶栏与审计,终态后拒绝变更。"""
+    backend = _SwitchableBackend("k3-init")
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [],
+            scope=None,
+            scope_source="",
+            backend=backend,
+            model_label="k3-init",
+            wait_on_finish=True,
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        await pilot.press(*"你好")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: app.active_loop is not None and app.active_loop.status == "idle"
+        )
+
+        await pilot.press(*"/model gpt-4o-mini")
+        await pilot.press("enter")
+        await wait_for(lambda: notices_containing(main, "模型已切换为") != [])
+        assert backend.model == "gpt-4o-mini"
+        assert app.config.model_label == "gpt-4o-mini"
+        assert "gpt-4o-mini" in str(main.query_one("#sb-left").content)
+        assert any(
+            r["kind"] == KIND_MODEL_CHANGED
+            and r["payload"]["old_model"] == "k3-init"
+            and r["payload"]["new_model"] == "gpt-4o-mini"
+            for r in audit_records(app)
+        )
+
+        # 终态 run 后 /model 修改被安全拒绝,裸 /model 仅只读展示
+        app.active_loop.kill("done")
+        await wait_for(lambda: app._final_result is not None)
+        await pilot.press(*"/model blocked-model")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: notices_containing(main, "run 已结束,模型不可切换") != []
+        )
+        assert backend.model == "gpt-4o-mini"
+
+        await pilot.press(*"/model")
+        await pilot.press("enter")
+        await wait_for(lambda: notices_containing(main, "run 已结束,不可切换") != [])
+
+
+async def test_tui_model_picker_interactive_discovery_custom_and_esc(tmp_path):
+    """裸 `/model` 弹出交互选择器:本地/profile/端点发现、自定义输入与 Esc 取消。"""
+    from foam.tui.app import save_operator
+
+    home = tmp_path / "home"
+    save_operator(home, "nightowl")
+    (home / "config.json").write_text(
+        json.dumps(
+            {
+                "operator": "nightowl",
+                "profiles": {
+                    "k3fast": {
+                        "backend": "openai_compat",
+                        "model": "k3-turbo",
+                        "base_url": "https://example.com/v1",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = _SwitchableBackend("k3-init", remote=["remote-x1"])
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [],
+            scope=None,
+            scope_source="",
+            backend=backend,
+            model_label="k3-init",
+        )
+    )
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        await pilot.press(*"/model")
+        await pilot.press("enter")
+        await wait_for(lambda: len(main.narrative.query(ModelPickerCard)) == 1)
+        card = main.narrative.query_one(ModelPickerCard)
+        await wait_for(
+            lambda: "端点发现 1 个模型"
+            in str(card.query_one("#model-card-status").content)
+        )
+        assert card.size.height <= 20
+        labels = [
+            str(item.query_one("Label").content)
+            for item in card.query("#model-list > *")
+        ]
+        assert any("@k3fast" in lbl for lbl in labels)
+        assert any("remote-x1" in lbl for lbl in labels)
+
+        # Esc 关闭卡片并归还焦点,不改当前模型
+        await pilot.press("escape")
+        await wait_for(lambda: len(main.narrative.query(ModelPickerCard)) == 0)
+        assert backend.model == "k3-init"
+
+        # 再次打开并用自定义输入框切换模型
+        await pilot.press(*"/model")
+        await pilot.press("enter")
+        await wait_for(lambda: len(main.narrative.query(ModelPickerCard)) == 1)
+        card2 = main.narrative.query_one(ModelPickerCard)
+        custom = card2.query_one("#model-custom-input", Input)
+        custom.focus()
+        await pilot.press(*"custom-model-9")
+        await pilot.press("enter")
+        await wait_for(lambda: len(main.narrative.query(ModelPickerCard)) == 0)
+        await wait_for(lambda: notices_containing(main, "模型已切换为") != [])
+        assert backend.model == "custom-model-9"
+
+
+async def test_tui_slash_model_switch_profile_same_and_cross_provider(
+    tmp_path, monkeypatch
+):
+    """支持 `/model @profile` 同后端与跨后端切换,缺 key 时保持现状不崩溃。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(
+        json.dumps(
+            {
+                "profiles": {
+                    "same_p": {
+                        "backend": "openai_compat",
+                        "model": "k3-256k",
+                        "base_url": "https://example.com/v1",
+                    },
+                    "claude_p": {
+                        "backend": "claude",
+                        "model": "claude-sonnet-5",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = _SwitchableBackend("k3-init")
+    app = TuiApp(
+        make_config(
+            tmp_path,
+            [],
+            scope=None,
+            scope_source="",
+            backend=backend,
+            model_label="k3-init",
+            wait_on_finish=True,
+        )
+    )
+    monkeypatch.delenv("FOAM_ANTHROPIC_API_KEY", raising=False)
+    async with app.run_test(headless=True, size=(140, 40)) as pilot:
+        main = await enter_main(app, pilot)
+        await pilot.press(*"你好")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: app.active_loop is not None and app.active_loop.status == "idle"
+        )
+
+        # 同后端同 URL profile 直接切模型
+        await pilot.press(*"/model @same_p")
+        await pilot.press("enter")
+        await wait_for(lambda: notices_containing(main, "@same_p") != [])
+        assert backend.model == "k3-256k"
+
+        # 跨后端 profile 缺 key 时干净报错,不改当前后端
+        await pilot.press(*"/model @claude_p")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: notices_containing(main, "切换 profile @claude_p 失败") != []
+        )
+        assert app.config.backend is backend
+
+        # 补上合成 key 后成功热切换主环后端与顶栏
+        monkeypatch.setenv("FOAM_ANTHROPIC_API_KEY", "sk-ant-TESTONLY-000")
+        await pilot.press(*"/model @claude_p")
+        await pilot.press("enter")
+        await wait_for(
+            lambda: notices_containing(main, "已切换至 profile @claude_p") != []
+        )
+        assert app.config.backend.provider == "claude"
+        assert app.config.backend.model == "claude-sonnet-5"
+        assert app.active_loop._backend is app.config.backend
+        assert "claude · claude-sonnet-5" in str(main.query_one("#sb-left").content)
+        assert backend in app._retired_backends

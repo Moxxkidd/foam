@@ -34,6 +34,7 @@ from foam.guard.audit import (
     KIND_EXEC_RESULT_META,
     KIND_KILL_SWITCH,
     KIND_LLM_EXCHANGE_META,
+    KIND_MODEL_CHANGED,
     KIND_OPERATOR_INTERJECT,
     KIND_REFUSAL_DETECTED,
     KIND_SCOPE_CONFIRMED,
@@ -288,6 +289,14 @@ def format_record(record: dict[str, Any]) -> str:
         inst = str(payload.get("instruction") or "").strip()
         suffix = f" 指示={_clip(inst, 60)}" if inst else ""
         return head + f"目标声明:targets={targets}{suffix}"
+    if kind == KIND_MODEL_CHANGED:
+        old_p = payload.get("old_provider") or "?"
+        old_m = payload.get("old_model") or "?"
+        new_p = payload.get("new_provider") or "?"
+        new_m = payload.get("new_model") or "?"
+        profile = payload.get("profile")
+        suffix = f" (profile={profile})" if profile else ""
+        return head + f"模型切换:{old_p}/{old_m} → {new_p}/{new_m}{suffix}"
     # 未知 kind(KNOWN_KINDS 允许后续 WP 扩展):通用摘要,不炸。
     summary = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return head + f"{kind}:{_clip(summary)}"

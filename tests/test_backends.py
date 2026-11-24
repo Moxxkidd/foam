@@ -991,3 +991,60 @@ async def test_claude_max_tokens_overridable(harness: Harness):
     await collect(harness.make("claude", max_tokens=1024))
     body = json.loads(REQUESTS[-1].content)
     assert body["max_tokens"] == 1024
+
+
+async def test_backends_model_switching_and_list_models(monkeypatch):
+    monkeypatch.setenv("FOAM_LLM_API_KEY", FAKE_OAI_KEY)
+    monkeypatch.setenv("FOAM_ANTHROPIC_API_KEY", FAKE_CLAUDE_KEY)
+
+    def _oai_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "model-b"}, {"id": "model-a"}, {"id": ""}]},
+            )
+        return httpx.Response(500, text="err")
+
+    oai = openai_compat.OpenAICompatBackend(
+        base_url="http://fake.test/v1",
+        model="init-oai",
+        transport=httpx.MockTransport(_oai_handler),
+    )
+    assert oai.model == "init-oai"
+    oai.set_model("  next-oai  ")
+    assert oai.model == "next-oai"
+    with pytest.raises(ValueError):
+        oai.set_model("   ")
+    assert await oai.list_models() == ["model-a", "model-b"]
+    await oai.aclose()
+
+    def _claude_fail_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    cl_ok = claude.ClaudeBackend(
+        model="claude-init",
+        base_url="http://fake.test",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(
+                200,
+                json={"data": [{"id": "claude-z"}, {"id": "claude-a"}]},
+            )
+            if req.url.path == "/v1/models"
+            else httpx.Response(404)
+        ),
+    )
+    assert cl_ok.model == "claude-init"
+    cl_ok.set_model("claude-next")
+    assert cl_ok.model == "claude-next"
+    with pytest.raises(ValueError):
+        cl_ok.set_model("")
+    assert await cl_ok.list_models() == ["claude-a", "claude-z"]
+    await cl_ok.aclose()
+
+    cl_fail = claude.ClaudeBackend(
+        model="claude-init",
+        base_url="http://fake.test",
+        transport=httpx.MockTransport(_claude_fail_handler),
+    )
+    assert await cl_fail.list_models() == []
+    await cl_fail.aclose()

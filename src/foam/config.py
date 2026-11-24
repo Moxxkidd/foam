@@ -428,3 +428,18 @@ def active_profile(config: dict) -> dict | None:
     if not isinstance(name, str) or not name:
         return None
     return get_profile(config, name)
+
+
+def list_profiles(config: dict) -> dict[str, dict]:
+    """列出 config["profiles"] 中所有合法非空 profile(白名单化副本)。"""
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict):
+        return {}
+    result: dict[str, dict] = {}
+    for name, raw in profiles.items():
+        if not isinstance(name, str) or not isinstance(raw, dict):
+            continue
+        cleaned = _whitelist(raw)
+        if cleaned:
+            result[name] = cleaned
+    return result

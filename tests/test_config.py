@@ -1133,3 +1133,28 @@ def test_r29_release_migration_rollback_public_contract():
         assert "--break-system-packages" not in block
         assert "chmod 777" not in block
         assert "chown " not in block
+
+
+def test_list_profiles_whitelists_and_skips_invalid():
+    from foam.config import list_profiles
+
+    raw = {
+        "profiles": {
+            "k3": {
+                "backend": "openai_compat",
+                "model": "k3-256k",
+                "base_url": "https://example.com/v1",
+                "api_key": "sk-TESTONLY-LEAK",
+            },
+            "empty": {"api_key": "sk-TESTONLY-ONLY"},
+            "bad_type": "not-a-dict",
+        }
+    }
+    listed = list_profiles(raw)
+    assert list(listed) == ["k3"]
+    assert listed["k3"] == {
+        "backend": "openai_compat",
+        "model": "k3-256k",
+        "base_url": "https://example.com/v1",
+    }
+    assert "api_key" not in listed["k3"]

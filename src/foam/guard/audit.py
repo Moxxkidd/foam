@@ -64,6 +64,8 @@ KIND_SESSION_OP = "session_op"
 KIND_SESSION_PROMPT = "session_prompt"
 # 2026-11-24 UX 整改:Strix 对齐的 Target + Instruction 声明事件。
 KIND_TARGET_DECLARED = "target_declared"
+# 2026-11-24 TUI `/model` 运行期切换模型/profile 事件。
+KIND_MODEL_CHANGED = "model_changed"
 
 KNOWN_KINDS = frozenset(
     {
@@ -81,6 +83,7 @@ KNOWN_KINDS = frozenset(
         KIND_SESSION_OP,
         KIND_SESSION_PROMPT,
         KIND_TARGET_DECLARED,
+        KIND_MODEL_CHANGED,
     }
 )
 

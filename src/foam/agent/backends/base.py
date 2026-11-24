@@ -471,6 +471,19 @@ class LLMBackend(ABC):
 
     provider: str = "unknown"
 
+    @property
+    def model(self) -> str:
+        """当前使用的模型 id(未知时返回空串)。"""
+        return ""
+
+    def set_model(self, model: str) -> None:
+        """运行期切换模型 id;默认不支持。"""
+        raise NotImplementedError("当前后端不支持动态切换模型")
+
+    async def list_models(self) -> list[str]:
+        """探测当前后端可用的模型列表(默认空列表;失败不抛)。"""
+        return []
+
     @abstractmethod
     def chat(
         self,

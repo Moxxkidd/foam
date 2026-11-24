@@ -987,3 +987,24 @@ def test_audit_stats_counts_capability_failures_and_blocked():
     assert legacy["capability_retry_blocked"] == 0
     assert not any(key.startswith("capability_failure:") for key in legacy)
     assert not any(key.startswith("capability_retry_blocked:") for key in legacy)
+
+
+def test_format_record_renders_model_changed():
+    from foam.guard.audit import KIND_MODEL_CHANGED
+    from foam.replay import format_record
+
+    line = format_record(
+        {
+            "seq": 3,
+            "ts": "2026-11-24T00:00:00+00:00",
+            "kind": KIND_MODEL_CHANGED,
+            "payload": {
+                "old_provider": "openai_compat",
+                "old_model": "k3",
+                "new_provider": "claude",
+                "new_model": "claude-sonnet-5",
+                "profile": "anthro",
+            },
+        }
+    )
+    assert "模型切换:openai_compat/k3 → claude/claude-sonnet-5 (profile=anthro)" in line

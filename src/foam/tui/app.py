@@ -47,6 +47,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import getpass
 import hashlib
@@ -63,6 +64,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Input, Static
@@ -92,8 +94,10 @@ from foam.agent.scope_compiler import (
     scope_event_payload,
 )
 from foam.agent.toolmap import render_tool_map, scan_tools
+from foam.config import get_profile, list_profiles, sanitize_url
 from foam.evidence import write_manifest
 from foam.guard.audit import (
+    KIND_MODEL_CHANGED,
     KIND_SCOPE_CONFIRMED,
     KIND_SCOPE_LOADED,
     KIND_SCOPE_UPDATED,
@@ -140,6 +144,8 @@ from foam.tui.bridge import (
 from foam.tui.widgets import (
     InputDock,
     KillConfirmBar,
+    ModelPickerAction,
+    ModelPickerCard,
     NarrativeView,
     ScopeCardAction,
     ScopeConfirmCard,
@@ -181,6 +187,7 @@ _HELP_TEXT = """斜杠命令(输入 / 有补全):
   /status   run 状态与索引摘要
   /budget   裸命令=查看总预算;/budget <维度> <N> 显式变更(0=累计不限)
             维度:context / tokens / rounds / wall-time(秒)
+  /model    裸命令=打开模型/profile 选择器;/model <id> 或 @<profile> 直接切换
   /target   裸命令=查看目标与指示;/target <t1> [t2...] 设置/更新目标
   /scope    裸命令=查看授权 scope;/scope <描述> 可选启用参数级护栏
 快捷键:
@@ -359,13 +366,18 @@ def default_loop_factory(ctx: RunContext) -> RunHandle:
 _CONFIG_FILENAME = "config.json"
 
 
-def load_operator(home: Path) -> str:
-    """读本地配置里的呼号;任何读取/解析问题都按「无预填」处理。"""
+def _load_config_dict(home: Path) -> dict[str, Any]:
+    """安全读取 home/config.json 完整字典;缺失或损坏按 {} 处理。"""
     try:
         data = json.loads((home / _CONFIG_FILENAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return ""
-    value = data.get("operator")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_operator(home: Path) -> str:
+    """读本地配置里的呼号;任何读取/解析问题都按「无预填」处理。"""
+    value = _load_config_dict(home).get("operator")
     return value.strip() if isinstance(value, str) else ""
 
 
@@ -775,6 +787,10 @@ class MainScreen(Screen):
                         f"{shown(change['old_limit'])} → {shown(change['new_limit'])}"
                         "(已写 operator 审计)",
                     )
+        elif command == "/model":
+            parts = raw.split(maxsplit=1)
+            argument = parts[1].strip() if len(parts) > 1 else ""
+            self._handle_model_command(argument)
         elif command == "/target":
             parts = raw.split(maxsplit=1)
             argument = parts[1].strip() if len(parts) > 1 else ""
@@ -790,6 +806,32 @@ class MainScreen(Screen):
             self.narrative.add_notice(
                 "error", f"未知命令 {command};/help 查看可用命令"
             )
+
+    def _handle_model_command(self, argument: str) -> None:
+        """/model 处理:裸命令打开交互选择器,带参切换模型 ID 或 @profile。"""
+        app = self.tui
+        if argument:
+            if argument.startswith("@"):
+                pname = argument[1:].strip()
+                if not pname:
+                    self.narrative.add_notice(
+                        "error", "用法:/model <模型ID> 或 /model @<profile名>"
+                    )
+                    return
+                app.switch_profile(pname)
+            else:
+                app.switch_model(argument)
+            return
+        if app.run_handle is not None and app.active_loop is None:
+            self.narrative.add_notice(
+                "info", f"当前模型: {app.backend_label}(run 已结束,不可切换)"
+            )
+            return
+        app.open_model_picker()
+
+    def on_model_picker_action(self, msg: ModelPickerAction) -> None:
+        """模型选择器动作 → 交给 TuiApp 处理。"""
+        self.tui.handle_model_picker_action(msg)
 
     def _handle_target_command(self, argument: str) -> None:
         """查看或设置/更新目标(-t)与附加指示。"""
@@ -1046,9 +1088,12 @@ class MainScreen(Screen):
             self._kill_timer = None
 
     def action_dismiss(self) -> None:
-        """Esc:优先解除 kill 武装(补全弹层已由输入框先拦)。"""
+        """Esc:优先解除 kill 武装,其次关闭模型选择器(补全由输入框先拦)。"""
         if self._kill_armed:
             self._disarm_kill()
+            return
+        if self.tui._model_card is not None:
+            self.tui.close_model_card()
 
     def action_pause_toggle(self) -> None:
         """Ctrl-P:暂停/继续切换(以 loop 当前状态为准)。"""
@@ -1141,17 +1186,16 @@ class TuiApp(App[None]):
         # scope 来源谱系(D10 配套):NL 仪式冻结过 → 未启动时可再 /scope 重声明
         # (file 流未启动带参 /scope 一律拒并指引,见 _request_scope_change)。
         self._scope_frozen_via_nl = False
+        self._model_card: ModelPickerCard | None = None
+        self._retired_backends: list[LLMBackend] = []
 
     # ---------- 展示数据 ----------
 
     @property
     def backend_label(self) -> str:
         provider = self.config.backend.provider
-        return (
-            f"{provider} · {self.config.model_label}"
-            if self.config.model_label
-            else provider
-        )
+        model = self.config.model_label or getattr(self.config.backend, "model", "")
+        return f"{provider} · {model}" if model else provider
 
     @property
     def status_line(self) -> str:
@@ -1995,6 +2039,7 @@ class TuiApp(App[None]):
             if warning and self._main is not None:
                 self._main.narrative.add_notice("error", warning)
             self._audit = None
+        await self._close_retired_backends()
         # R09:终态证据 manifest(close_run 之后,纯读源;失败只上屏,
         # 不反转 run 结果;无 run_finished 不写、不补造)
         if self.engagement is not None:
@@ -2034,6 +2079,14 @@ class TuiApp(App[None]):
         await self._cleanup_resources()
         self.exit(self._exit_code())
 
+    async def _close_retired_backends(self) -> None:
+        while self._retired_backends:
+            backend = self._retired_backends.pop()
+            try:
+                await backend.aclose()
+            except (OSError, RuntimeError):
+                pass
+
     async def _cleanup_resources(self, *, reason: str = "退出 TUI") -> None:
         """R03/R28:退出及 run 装配失败的统一关闭面(close_run 幂等)。
 
@@ -2047,6 +2100,7 @@ class TuiApp(App[None]):
                 self._main.narrative.add_notice("error", warning)
             self._audit = None
             self._engagement_lock = None
+            await self._close_retired_backends()
             return
         self._release_engagement_lock()
         # 未开跑(迎宾即退):runtime 未建,其余句柄不存在,只关后端
@@ -2054,6 +2108,289 @@ class TuiApp(App[None]):
             await self.config.backend.aclose()
         except (OSError, RuntimeError):
             pass
+        await self._close_retired_backends()
+
+    # ---------- /model 选择器与运行期切换 ----------
+
+    def _current_model_id(self) -> str:
+        return str(
+            getattr(self.config.backend, "model", "") or self.config.model_label or ""
+        ).strip()
+
+    def _record_model_changed(
+        self,
+        *,
+        old_provider: str,
+        old_model: str,
+        new_provider: str,
+        new_model: str,
+        profile: str | None = None,
+    ) -> None:
+        if self._audit is not None and not self.runtime_closed:
+            payload: dict[str, Any] = {
+                "old_provider": old_provider,
+                "old_model": old_model,
+                "new_provider": new_provider,
+                "new_model": new_model,
+            }
+            if profile:
+                payload["profile"] = profile
+            self._audit.append(KIND_MODEL_CHANGED, payload)
+
+    def _local_model_options(self) -> list[tuple[str, str, str]]:
+        from foam.cli import DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL
+
+        provider = self.config.backend.provider
+        current_model = self._current_model_id()
+        options: list[tuple[str, str, str]] = []
+        seen_models: set[str] = set()
+        if current_model:
+            seen_models.add(current_model)
+            options.append(
+                (
+                    "model",
+                    current_model,
+                    f"● {provider} / {current_model}  [当前]",
+                )
+            )
+        cfg = _load_config_dict(self.config.home_path)
+        for pname, pdata in list_profiles(cfg).items():
+            p_backend = pdata.get("backend") or provider
+            p_model = pdata.get("model") or "(默认)"
+            raw_url = pdata.get("base_url") or ""
+            if raw_url:
+                try:
+                    url_note = sanitize_url(raw_url)
+                except ValueError:
+                    url_note = "<已脱敏>"
+                desc = f"  @{pname} · {p_backend}/{p_model} ({url_note})"
+            else:
+                desc = f"  @{pname} · {p_backend}/{p_model}"
+            options.append(("profile", pname, desc))
+        for candidate in (DEFAULT_OPENAI_MODEL, DEFAULT_CLAUDE_MODEL):
+            if candidate not in seen_models:
+                seen_models.add(candidate)
+                options.append(
+                    ("model", candidate, f"  {candidate}  [内置默认]")
+                )
+        return options
+
+    def open_model_picker(self) -> None:
+        main = self._main
+        if main is None:
+            return
+        if self._model_card is not None and self._model_card.is_mounted:
+            try:
+                self._model_card.query_one("#model-list").focus()
+            except NoMatches:
+                return
+            return
+        card = ModelPickerCard()
+        self._model_card = card
+        main.narrative.mount_model_card(card)
+        local_options = self._local_model_options()
+        self.run_worker(self._populate_model_picker(card, local_options))
+
+    async def _populate_model_picker(
+        self, card: ModelPickerCard, local_options: list[tuple[str, str, str]]
+    ) -> None:
+        try:
+            await card.mounted_event.wait()
+            if self._model_card is not card or not card.is_mounted:
+                return
+            await card.set_options(
+                local_options,
+                status="本地模型与 profile 已就绪,正在查询后端可用模型…",
+            )
+            try:
+                card.query_one("#model-list").focus()
+            except NoMatches:
+                pass  # 卡片已被移除
+            remote_models = await self.config.backend.list_models()
+            if self._model_card is not card or not card.is_mounted:
+                return
+            seen_models = {
+                val for kind, val, _lbl in local_options if kind == "model"
+            }
+            merged = list(local_options)
+            added = 0
+            for mid in remote_models:
+                if mid not in seen_models:
+                    seen_models.add(mid)
+                    merged.append(("model", mid, f"  {mid}  [端点发现]"))
+                    added += 1
+            if added:
+                status = (
+                    f"共 {len(merged)} 项(从端点发现 {added} 个模型)"
+                    " · Enter 切换 / Esc 取消"
+                )
+            else:
+                status = (
+                    f"共 {len(merged)} 个本地项(可下方输入任意模型 ID)"
+                    " · Enter 切换 / Esc 取消"
+                )
+            await card.set_options(merged, status=status)
+        except Exception as exc:
+            if self._model_card is card and card.is_mounted:
+                try:
+                    card.query_one("#model-card-status").update(
+                        f"端点模型查询失败({exc!r});可从列表选择或直接输入模型 ID"
+                    )
+                except NoMatches:
+                    return
+
+    def close_model_card(self) -> None:
+        card = self._model_card
+        self._model_card = None
+        if card is not None and card.is_mounted:
+            self.run_worker(card.remove())
+        if self._main is not None:
+            try:
+                self._main.input_dock.input_box.focus()
+            except NoMatches:
+                return
+
+    def handle_model_picker_action(self, msg: ModelPickerAction) -> None:
+        self.close_model_card()
+        if msg.action == "cancel":
+            return
+        if msg.action == "select_profile":
+            self.switch_profile(msg.value)
+        elif msg.action == "select_model":
+            self.switch_model(msg.value)
+
+    def switch_model(self, model_name: str) -> bool:
+        main = self._main
+        if main is None:
+            return False
+        if self.run_handle is not None and self.active_loop is None:
+            main.narrative.add_notice("info", "run 已结束,模型不可切换")
+            return False
+        cleaned = model_name.strip()
+        if not cleaned:
+            main.narrative.add_notice("error", "模型 ID 不能为空")
+            return False
+        backend = self.config.backend
+        old_model = self._current_model_id()
+        try:
+            backend.set_model(cleaned)
+        except (NotImplementedError, ValueError) as exc:
+            main.narrative.add_notice("error", f"模型切换失败:{exc}")
+            return False
+        self.config.model_label = cleaned
+        main.statusbar.set_left(self.status_line)
+        self._record_model_changed(
+            old_provider=backend.provider,
+            old_model=old_model,
+            new_provider=backend.provider,
+            new_model=cleaned,
+        )
+        main.narrative.add_notice(
+            "success", f"模型已切换为: {self.backend_label}"
+        )
+        return True
+
+    def switch_profile(self, profile_name: str) -> bool:
+        from foam.cli import (
+            DEFAULT_BASE_URL,
+            DEFAULT_CLAUDE_MODEL,
+            DEFAULT_OPENAI_MODEL,
+            ENV_BASE_URL,
+            ENV_MODEL,
+            _build_backend,
+        )
+
+        main = self._main
+        if main is None:
+            return False
+        if self.run_handle is not None and self.active_loop is None:
+            main.narrative.add_notice("info", "run 已结束,不可切换 profile")
+            return False
+        cfg = _load_config_dict(self.config.home_path)
+        profile = get_profile(cfg, profile_name)
+        if profile is None:
+            main.narrative.add_notice("error", f"未找到 profile '{profile_name}'")
+            return False
+        old_backend = self.config.backend
+        old_provider = old_backend.provider
+        old_model = self._current_model_id()
+        new_provider = profile.get("backend") or old_provider
+        new_model = profile.get("model") or ""
+        new_base_url = profile.get("base_url") or ""
+
+        if new_provider == old_provider:
+            cur_url = str(getattr(old_backend, "_base_url", "") or "").rstrip("/")
+            target_url = new_base_url.rstrip("/")
+            if not target_url or target_url == cur_url:
+                resolved_model = (
+                    new_model
+                    or os.environ.get(ENV_MODEL)
+                    or (
+                        DEFAULT_CLAUDE_MODEL
+                        if new_provider == "claude"
+                        else DEFAULT_OPENAI_MODEL
+                    )
+                )
+                try:
+                    old_backend.set_model(resolved_model)
+                except (NotImplementedError, ValueError) as exc:
+                    main.narrative.add_notice(
+                        "error", f"切换 profile @{profile_name} 失败:{exc}"
+                    )
+                    return False
+                self.config.model_label = resolved_model
+                main.statusbar.set_left(self.status_line)
+                self._record_model_changed(
+                    old_provider=old_provider,
+                    old_model=old_model,
+                    new_provider=old_provider,
+                    new_model=resolved_model,
+                    profile=profile_name,
+                )
+                main.narrative.add_notice(
+                    "success",
+                    f"已切换至 profile @{profile_name}: {self.backend_label}",
+                )
+                return True
+
+        resolved_base = (
+            new_base_url
+            or os.environ.get(ENV_BASE_URL)
+            or (DEFAULT_BASE_URL if new_provider == "claude" else None)
+        )
+        ns = argparse.Namespace(
+            backend=new_provider,
+            model=new_model or None,
+            base_url=resolved_base,
+        )
+        try:
+            new_backend = _build_backend(ns)
+        except ConfigError as exc:
+            main.narrative.add_notice(
+                "error", f"切换 profile @{profile_name} 失败:{exc}"
+            )
+            return False
+        loop = self.active_loop
+        if loop is not None:
+            loop.set_backend(new_backend)
+        if self._runtime is not None:
+            self._runtime.backend = new_backend
+        self._retired_backends.append(old_backend)
+        self.config.backend = new_backend
+        resolved_label = new_backend.model or new_model
+        self.config.model_label = resolved_label
+        main.statusbar.set_left(self.status_line)
+        self._record_model_changed(
+            old_provider=old_provider,
+            old_model=old_model,
+            new_provider=new_backend.provider,
+            new_model=resolved_label,
+            profile=profile_name,
+        )
+        main.narrative.add_notice(
+            "success", f"已切换至 profile @{profile_name}: {self.backend_label}"
+        )
+        return True
 
     def _exit_code(self) -> int:
         """与 headless 对齐:finished/未开始 0,killed 130,stopped/error 1。"""
@@ -2137,7 +2474,12 @@ def main(args) -> int:
         scope=scope,
         scope_source=scope_source,
         backend=backend,
-        model_label=getattr(args, "model", None) or os.environ.get(ENV_MODEL) or "",
+        model_label=(
+            getattr(args, "model", None)
+            or os.environ.get(ENV_MODEL)
+            or getattr(backend, "model", "")
+            or ""
+        ),
         execution_mode=args.execution_mode,
         engagements_dir=getattr(args, "workdir", None) or DEFAULT_ENGAGEMENTS_DIR,
         max_rounds=getattr(args, "max_rounds", 0) or 0,

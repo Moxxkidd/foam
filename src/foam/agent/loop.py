@@ -650,6 +650,12 @@ class AgentLoop:
         if task is not None and not task.done():
             task.cancel()
 
+    def set_backend(self, backend: LLMBackend) -> None:
+        """运行期(非终态)原子替换主环后端实例(TUI `/model @profile` 跨后端切换用)。"""
+        if self._status in ("finished", "stopped", "killed", "error", "cancelled"):
+            raise RuntimeError("run 已终态,不可切换后端")
+        self._backend = backend
+
     async def replace_scope(
         self, scope: Scope, *, digest: str = "", dns: str | None = None
     ) -> None:

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -601,6 +602,12 @@ class NarrativeView(VerticalScroll):
         self._close_thinking()
         self._mount_block(card)
 
+    def mount_model_card(self, card: ModelPickerCard) -> None:
+        """挂载模型选择器卡(与正文/思考块互斥)。"""
+        self.stream = None
+        self._close_thinking()
+        self._mount_block(card)
+
 
 # ---------------------------------------------------------------------------
 # 侧栏(D3):阶段 → 索引计数 → token 预算 → jobs → sessions
@@ -799,6 +806,10 @@ class StatusBar(Horizontal):
         # run 前初始态写死「待机」;loop 的 idle 是待命态(_STATUS_STYLES)。
         yield Static(Text("○ 待机", style="dim"), id="sb-right")
 
+    def set_left(self, left: str) -> None:
+        self._left = left
+        self.query_one("#sb-left", Static).update(left)
+
     def set_engagement(self, engagement_id: str, operator: str) -> None:
         self._engagement = engagement_id
         self._operator = operator
@@ -978,6 +989,108 @@ class ScopeConfirmCard(Vertical):
 
 
 # ---------------------------------------------------------------------------
+# 模型选择器卡(/model 交互选择与自定义模型 ID 输入)
+# ---------------------------------------------------------------------------
+
+
+class ModelPickerAction(Message):
+    """模型选择器回传给 MainScreen 的动作。"""
+
+    def __init__(self, action: str, value: str = "") -> None:
+        super().__init__()
+        self.action = action
+        self.value = value
+
+
+class ModelOptionItem(ListItem):
+    """模型选择列表单条候选项(`kind`: 'model' 或 'profile')。"""
+
+    def __init__(self, kind: str, value: str, label: str) -> None:
+        super().__init__(Label(label, markup=False))
+        self.kind = kind
+        self.value = value
+
+
+class ModelPickerCard(Vertical):
+    """内联交互式模型/profile 选择卡;支持方向键选择、自定义输入与 Esc 取消。"""
+
+    BINDINGS = [Binding("escape", "cancel", "取消", show=False)]
+
+    def __init__(self) -> None:
+        super().__init__(id="modelcard")
+        self.mounted_event = asyncio.Event()
+
+    def on_mount(self) -> None:
+        self.mounted_event.set()
+
+    def compose(self):
+        yield Static("模型与 Profile 选择", id="model-card-title")
+        yield Static(
+            "正在读取本地与后端模型列表…", id="model-card-status", markup=False
+        )
+        yield ListView(id="model-list")
+        yield Input(
+            placeholder="或直接输入模型 ID / @profile 回车切换",
+            id="model-custom-input",
+        )
+        with Horizontal(id="model-card-buttons"):
+            yield Button("切换", id="model-apply", variant="primary")
+            yield Button("取消", id="model-cancel")
+
+    async def set_options(
+        self, options: list[tuple[str, str, str]], *, status: str
+    ) -> None:
+        self.query_one("#model-card-status", Static).update(status)
+        lv = self.query_one("#model-list", ListView)
+        await lv.clear()
+        if options:
+            await lv.extend(
+                ModelOptionItem(kind, value, label) for kind, value, label in options
+            )
+            lv.index = 0
+
+    def _emit_selection(self, item: ModelOptionItem) -> None:
+        action = "select_profile" if item.kind == "profile" else "select_model"
+        self.post_message(ModelPickerAction(action, item.value))
+
+    def _emit_raw(self, raw: str) -> None:
+        cleaned = raw.strip()
+        if not cleaned:
+            return
+        if cleaned.startswith("@") and len(cleaned) > 1:
+            self.post_message(ModelPickerAction("select_profile", cleaned[1:].strip()))
+        else:
+            self.post_message(ModelPickerAction("select_model", cleaned))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        event.stop()
+        if isinstance(event.item, ModelOptionItem):
+            self._emit_selection(event.item)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "model-custom-input":
+            event.stop()
+            self._emit_raw(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "model-cancel":
+            self.action_cancel()
+            return
+        if event.button.id == "model-apply":
+            custom = self.query_one("#model-custom-input", Input).value.strip()
+            if custom:
+                self._emit_raw(custom)
+                return
+            child = self.query_one("#model-list", ListView).highlighted_child
+            if isinstance(child, ModelOptionItem):
+                self._emit_selection(child)
+
+    def action_cancel(self) -> None:
+        self.post_message(ModelPickerAction("cancel", ""))
+
+
+# ---------------------------------------------------------------------------
 # 输入坞:斜杠命令补全 + 输入框(Q4 双通道)
 # ---------------------------------------------------------------------------
 
@@ -991,6 +1104,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/sessions", "列出 PTY 会话"),
     ("/status", "run 状态与索引摘要"),
     ("/budget", "查看/显式修改总预算"),
+    ("/model", "查看/切换模型或 profile"),
     ("/target", "查看/设定授权目标(-t)"),
     ("/scope", "查看/启用可选 scope 护栏"),
 ]

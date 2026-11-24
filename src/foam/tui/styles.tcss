@@ -298,6 +298,53 @@ WelcomeScreen {
     border: solid #56d4dd;
 }
 
+/* ---------- 模型选择器卡(/model) ---------- */
+
+#modelcard {
+    border: solid #56d4dd;
+    padding: 0 1;
+    margin: 1 0;
+    height: auto;
+}
+
+#model-card-title {
+    text-style: bold;
+    color: #56d4dd;
+    height: auto;
+}
+
+#model-card-status {
+    color: #8b949e;
+    height: auto;
+}
+
+#model-list {
+    max-height: 10;
+    height: auto;
+    background: #161b22;
+    border: solid #30363d;
+    margin: 1 0;
+}
+
+#model-custom-input {
+    border: solid #30363d;
+    background: #161b22;
+    height: auto;
+}
+
+#model-custom-input:focus {
+    border: solid #56d4dd;
+}
+
+#model-card-buttons {
+    height: auto;
+    margin-top: 1;
+}
+
+#model-card-buttons Button {
+    margin-right: 2;
+}
+
 /* ---------- kill 确认条 ---------- */
 
 #killbar {
