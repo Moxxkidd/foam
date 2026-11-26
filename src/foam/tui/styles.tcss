@@ -257,6 +257,20 @@ LandingScreen {
 .notice.phase { color: #56d4dd; }
 .notice.blue { color: #58a6ff; }
 
+.history-load-bar {
+    height: auto;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    background: #161b22;
+    color: #56d4dd;
+    border: dashed #30363d;
+}
+
+.history-load-bar:focus {
+    border: solid #56d4dd;
+    text-style: bold;
+}
+
 /* ---------- 内联欢迎条(Strix 对齐) ---------- */
 
 #welcome-banner {

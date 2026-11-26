@@ -20,7 +20,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from rich.text import Text
@@ -35,6 +38,8 @@ from foam import __app_name__
 from foam.agent.scope_compiler import ScopeCompilation
 from foam.tui.banner import render_animated_wordmark
 from foam.tui.bridge import tool_call_display
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 展示辅助
@@ -88,9 +93,9 @@ def _clip(text: str, limit: int) -> str:
 class StreamBlock(Static):
     """模型正文流式块:增量累积,纯文本渲染(markup 关闭)。"""
 
-    def __init__(self) -> None:
-        super().__init__("", markup=False, classes="stream")
-        self._text = ""
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text, markup=False, classes="stream")
+        self._text = text
 
     @property
     def text(self) -> str:
@@ -190,13 +195,21 @@ class ThinkingBlock(Vertical):
     can_focus = True
     BINDINGS = [Binding("enter", "toggle", "展开/折叠思考", show=False)]
 
-    def __init__(self) -> None:
-        super().__init__(classes="thinking active")
-        self._text = ""
+    def __init__(
+        self,
+        *,
+        text: str = "",
+        done: bool = False,
+        elapsed: float = 0.0,
+        expanded: bool = False,
+    ) -> None:
+        classes = "thinking done" if done else "thinking active"
+        super().__init__(classes=classes)
+        self._text = text
         self._started = time.monotonic()
-        self._elapsed = 0.0
-        self._done = False
-        self._expanded = False
+        self._elapsed = elapsed
+        self._done = done
+        self._expanded = expanded
         self._ready = False
         self._tick = 0
         self._timer = None
@@ -207,6 +220,8 @@ class ThinkingBlock(Vertical):
         yield Static("", markup=False, classes="thinking-body")
 
     def on_mount(self) -> None:
+        if self._pruning:
+            return
         self._ready = True
         if not self._done:
             self._timer = self.set_interval(_THINKING_TICK_SECONDS, self._on_tick)
@@ -215,10 +230,14 @@ class ThinkingBlock(Vertical):
             self.add_class("done")
         self._redraw()
 
-    def on_unmount(self) -> None:
+    def stop_timers(self) -> None:
+        """停止思考流定时器（卸载与窗口裁剪前调用）。"""
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
+
+    def on_unmount(self) -> None:
+        self.stop_timers()
 
     @property
     def text(self) -> str:
@@ -229,14 +248,16 @@ class ThinkingBlock(Vertical):
         return self._done
 
     @property
+    def elapsed(self) -> float:
+        return self._elapsed
+
+    @property
     def expanded(self) -> bool:
         return self._expanded
 
     def _on_tick(self) -> None:
         if self._done:
-            if self._timer is not None:
-                self._timer.stop()
-                self._timer = None
+            self.stop_timers()
             return
         self._tick += 1
         self.set_class((self._tick // 5) % 2 == 1, "pulse")
@@ -252,15 +273,13 @@ class ThinkingBlock(Vertical):
             return
         self._done = True
         self._elapsed = time.monotonic() - self._started
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
+        self.stop_timers()
         self.remove_class("active", "pulse")
         self.add_class("done")
         self._redraw()
 
     def _redraw(self) -> None:
-        if not self._ready:
+        if not self._ready or self._pruning:
             return
         elapsed = (
             self._elapsed if self._done else time.monotonic() - self._started
@@ -453,19 +472,68 @@ class ToolCard(Vertical):
         self._ready = False
         self._timer = None
         self._frame = 0
+        self._tone = "running"
+        self._output_path: str | None = None
+        self._sha256: str | None = None
         self.summary = ""
         self._header = f"⠋ {self.card_display}"
         self._body = ""
+
+    @classmethod
+    def from_archive(
+        cls,
+        *,
+        name: str,
+        display: str,
+        tone: str,
+        summary: str,
+        header: str,
+        body: str,
+        expanded: bool,
+        force_expand: bool = False,
+        output_path: str | None = None,
+        sha256: str | None = None,
+    ) -> ToolCard:
+        """从归档记录重建已完成工具卡（不启动 spinner 定时器）。"""
+        card = cls.__new__(cls)
+        classes = f"toolcard {tone}" + (" expanded" if expanded else "")
+        Vertical.__init__(card, classes=classes)
+        card.tool_name = name
+        card.card_display = display
+        card._spinning = False
+        card._expanded = expanded
+        card.force_expand = force_expand
+        card._ready = False
+        card._timer = None
+        card._frame = 0
+        card._tone = tone
+        card._output_path = output_path
+        card._sha256 = sha256
+        card.summary = summary
+        card._header = header
+        card._body = body
+        return card
 
     def compose(self):
         yield Static(self._header, classes="card-header")
         yield Static("", markup=False, classes="card-body")
 
     def on_mount(self) -> None:
+        if self._pruning:
+            return
         self._ready = True
         self._redraw()
         if self._spinning:
             self._timer = self.set_interval(0.12, self._spin)
+
+    def stop_timers(self) -> None:
+        """停止卡片旋转定时器（卸载与窗口裁剪前调用）。"""
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+    def on_unmount(self) -> None:
+        self.stop_timers()
 
     @property
     def running(self) -> bool:
@@ -476,7 +544,7 @@ class ToolCard(Vertical):
         return self._expanded
 
     def _redraw(self) -> None:
-        if not self._ready:
+        if not self._ready or self._pruning:
             return
         self.query_one(".card-header", Static).update(self._header)
         body = self.query_one(".card-body", Static)
@@ -494,10 +562,14 @@ class ToolCard(Vertical):
     def finalize(self, result: dict[str, Any]) -> None:
         """收卡:停 spinner、折叠为一行摘要,异常自动展开。"""
         self._spinning = False
-        if self._timer is not None:
-            self._timer.stop()
+        self.stop_timers()
         marker, tone, summary, auto_expand = summarize_result(self.tool_name, result)
+        self._tone = tone
         self.summary = summary
+        self._output_path = (
+            str(result["output_path"]) if result.get("output_path") else None
+        )
+        self._sha256 = str(result["sha256"]) if result.get("sha256") else None
         self.remove_class("running")
         self.add_class(tone)
         self._header = f"{marker} {self.card_display} — {summary}"
@@ -518,26 +590,307 @@ class ToolCard(Vertical):
 
 
 # ---------------------------------------------------------------------------
-# 叙述流容器
+# 叙述流容器（R20-A: 有界 UI 实例窗口 + 按需向前加载）
 # ---------------------------------------------------------------------------
+
+#: 叙述流默认保留的最近受管块数量上限。
+DEFAULT_MAX_MOUNTED_BLOCKS = 200
+#: 按需向前加载历史时的默认单页条数。
+DEFAULT_HISTORY_PAGE_SIZE = 100
+
+
+@dataclass
+class NarrativeEntry:
+    """叙述流中单条受管块的内存归档记录（思考文本绝不落明文盘）。"""
+
+    seq: int
+    kind: str  # "stream" | "thinking" | "tool" | "phase" | "notice"
+    text: str = ""
+    done: bool = True
+    elapsed: float = 0.0
+    expanded: bool = False
+    tool_name: str = ""
+    display: str = ""
+    tone: str = "running"
+    summary: str = ""
+    header: str = ""
+    body: str = ""
+    running: bool = False
+    force_expand: bool = False
+    output_path: str | None = None
+    sha256: str | None = None
+    phase: str = ""
+    notice_kind: str = "info"
+
+
+class HistoryLoadBar(Static):
+    """归档历史按需加载栏:显示已归档条数,Enter 或点击向前加载一页。"""
+
+    can_focus = True
+    BINDINGS = [Binding("enter", "load_older", "加载更早历史", show=False)]
+
+    def __init__(self) -> None:
+        super().__init__("", markup=False, classes="history-load-bar")
+
+    def update_counts(
+        self, hidden: int, page_size: int, max_mounted: int
+    ) -> None:
+        next_batch = min(hidden, page_size)
+        self.update(
+            f"▲ 另有 {hidden} 条更早记录已归档"
+            f"（视图保留最近 {max_mounted} 条；"
+            f"Enter / 点击加载前 {next_batch} 条）"
+        )
+
+    def action_load_older(self) -> None:
+        if isinstance(self.parent, NarrativeView):
+            self.parent.load_older()
+
+    def on_click(self, event: Click) -> None:
+        event.stop()
+        self.action_load_older()
 
 
 class NarrativeView(VerticalScroll):
-    """主区叙述流:管理「当前正文块 / 当前思考块 / 在飞工具卡」的开闭。
+    """主区叙述流:管理「当前正文块 / 当前思考块 / 在飞工具卡」与有界 DOM 窗口。
 
     loop 单线程语义保证任何时刻至多一张在飞工具卡(逐个执行);思考块与
-    正文块互斥——任一其他事件到达都会为思考块收尾。
+    正文块互斥——任一其他事件到达都会为思考块收尾。受管块超出窗口上限时
+    自动从顶部卸载旧 UI 实例并保留内存归档记录，可通过顶部提示栏按需加载；
+    裁剪绝不删除底层审计或落盘工具产物，也不把思考文本落盘。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_mounted: int = DEFAULT_MAX_MOUNTED_BLOCKS,
+        history_page_size: int = DEFAULT_HISTORY_PAGE_SIZE,
+    ) -> None:
+        if max_mounted < 1:
+            raise ValueError("max_mounted 必须大于等于 1")
+        if history_page_size < 1:
+            raise ValueError("history_page_size 必须大于等于 1")
         super().__init__(id="narrative")
+        self._max_mounted = int(max_mounted)
+        self._history_page_size = int(history_page_size)
+        self._live_window_limit = self._max_mounted
+        self._entries: list[NarrativeEntry] = []
+        self._mounted: deque[tuple[NarrativeEntry, Widget]] = deque()
+        self._window_start = 0
+        self._next_seq = 1
+        self._history_bar: HistoryLoadBar | None = None
+        self._pending_removals: list[Widget] = []
+        self._inflight_remove_tasks: set[asyncio.Task[None]] = set()
+
         self.stream: StreamBlock | None = None
         self.thinking: ThinkingBlock | None = None
         self.pending_card: ToolCard | None = None
+        self._stream_entry: NarrativeEntry | None = None
+        self._thinking_entry: NarrativeEntry | None = None
+        self._pending_entry: NarrativeEntry | None = None
+
+    def on_mount(self) -> None:
+        if self._pending_removals:
+            self._dispatch_removals()
+
+    @property
+    def max_mounted(self) -> int:
+        return self._max_mounted
+
+    @property
+    def history_page_size(self) -> int:
+        return self._history_page_size
+
+    @property
+    def mounted_block_count(self) -> int:
+        return len(self._mounted)
+
+    @property
+    def archived_older_count(self) -> int:
+        return self._window_start
+
+    @property
+    def total_entry_count(self) -> int:
+        return len(self._entries)
+
+    @property
+    def entries(self) -> list[NarrativeEntry]:
+        return list(self._entries)
+
+    @property
+    def mounted_blocks(self) -> list[Widget]:
+        return [widget for _, widget in self._mounted]
+
+    @property
+    def history_bar(self) -> HistoryLoadBar | None:
+        return self._history_bar
+
+    def _new_entry(self, kind: str, **fields: Any) -> NarrativeEntry:
+        entry = NarrativeEntry(seq=self._next_seq, kind=kind, **fields)
+        self._next_seq += 1
+        return entry
 
     def _mount_block(self, widget: Widget) -> None:
         self.mount(widget)
         self.call_after_refresh(self._scroll_to_end)
+
+    def _mount_managed(self, entry: NarrativeEntry, widget: Widget) -> None:
+        self._entries.append(entry)
+        self._mounted.append((entry, widget))
+        self._mount_block(widget)
+        self._trim_mounted()
+
+    @staticmethod
+    def _sync_entry_from_widget(entry: NarrativeEntry, widget: Widget) -> None:
+        if isinstance(widget, StreamBlock):
+            entry.text = widget.text
+        elif isinstance(widget, ThinkingBlock):
+            entry.text = widget.text
+            entry.done = widget.done
+            entry.elapsed = widget.elapsed
+            entry.expanded = widget.expanded
+        elif isinstance(widget, ToolCard):
+            entry.tool_name = widget.tool_name
+            entry.display = widget.card_display
+            entry.tone = widget._tone
+            entry.summary = widget.summary
+            entry.header = widget._header
+            entry.body = widget._body
+            entry.running = widget.running
+            entry.expanded = widget.expanded
+            entry.force_expand = widget.force_expand
+            entry.output_path = widget._output_path
+            entry.sha256 = widget._sha256
+
+    @staticmethod
+    def _build_widget(entry: NarrativeEntry) -> Widget:
+        if entry.kind == "stream":
+            return StreamBlock(entry.text)
+        if entry.kind == "thinking":
+            return ThinkingBlock(
+                text=entry.text,
+                done=entry.done,
+                elapsed=entry.elapsed,
+                expanded=entry.expanded,
+            )
+        if entry.kind == "tool":
+            return ToolCard.from_archive(
+                name=entry.tool_name,
+                display=entry.display,
+                tone=entry.tone,
+                summary=entry.summary,
+                header=entry.header,
+                body=entry.body,
+                expanded=entry.expanded,
+                force_expand=entry.force_expand,
+                output_path=entry.output_path,
+                sha256=entry.sha256,
+            )
+        if entry.kind == "phase":
+            return PhaseDivider(entry.phase)
+        return NoticeBlock(entry.notice_kind, entry.text)
+
+    def _dispatch_removals(self) -> None:
+        if not self.is_mounted or not self._pending_removals:
+            return
+        batch = [w for w in self._pending_removals if w.parent is self]
+        self._pending_removals.clear()
+        if not batch:
+            return
+        await_remove = self.remove_children(batch)
+        try:
+            task = asyncio.create_task(self._await_remove(await_remove))
+        except RuntimeError:
+            return
+        self._inflight_remove_tasks.add(task)
+        task.add_done_callback(self._inflight_remove_tasks.discard)
+
+    @staticmethod
+    async def _await_remove(await_remove: Any) -> None:
+        try:
+            await await_remove
+        except Exception as exc:
+            logger.debug("卸载归档组件收尾异常: %r", exc)
+
+    async def flush_pruning(self) -> None:
+        """等待所有待卸载旧卡片与历史提示栏从 DOM 移除完成。"""
+        self._dispatch_removals()
+        while self._inflight_remove_tasks:
+            tasks = list(self._inflight_remove_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._dispatch_removals()
+
+    def _sync_history_bar(self) -> None:
+        hidden = self._window_start
+        if hidden > 0:
+            if self._history_bar is None:
+                if not self._mounted:
+                    return
+                bar = HistoryLoadBar()
+                self._history_bar = bar
+                self.mount(bar, before=self._mounted[0][1])
+            self._history_bar.update_counts(
+                hidden, self._history_page_size, self._max_mounted
+            )
+            return
+        if self._history_bar is not None:
+            old_bar = self._history_bar
+            self._history_bar = None
+            self._pending_removals.append(old_bar)
+            self._dispatch_removals()
+
+    def _trim_mounted(self) -> int:
+        removed = 0
+        while len(self._mounted) > self._live_window_limit:
+            oldest_entry, oldest_widget = self._mounted[0]
+            if oldest_widget in (self.stream, self.thinking, self.pending_card):
+                break
+            self._mounted.popleft()
+            self._window_start += 1
+            self._sync_entry_from_widget(oldest_entry, oldest_widget)
+            if hasattr(oldest_widget, "stop_timers"):
+                oldest_widget.stop_timers()
+            self._pending_removals.append(oldest_widget)
+            removed += 1
+        if removed:
+            self._dispatch_removals()
+        self._sync_history_bar()
+        return removed
+
+    def load_older(self, limit: int | None = None) -> int:
+        """从内存归档向前加载一页已卸载块到顶部历史栏下方，返回加载条数。"""
+        if self._window_start <= 0:
+            return 0
+        page = (
+            self._history_page_size
+            if limit is None
+            else max(1, int(limit))
+        )
+        new_start = max(0, self._window_start - page)
+        slice_entries = self._entries[new_start : self._window_start]
+        if not slice_entries:
+            return 0
+        restored = [
+            (entry, self._build_widget(entry)) for entry in slice_entries
+        ]
+        widgets = [widget for _, widget in restored]
+        if self._mounted:
+            self.mount(*widgets, before=self._mounted[0][1])
+        else:
+            self.mount(*widgets)
+        for entry, widget in reversed(restored):
+            self._mounted.appendleft((entry, widget))
+        self._window_start = new_start
+        self._live_window_limit = max(
+            self._live_window_limit, len(self._mounted)
+        )
+        self._sync_history_bar()
+        return len(restored)
+
+    def collapse_history(self) -> int:
+        """将已展开的历史窗口重新收窄到默认最近上限，返回卸载条数。"""
+        self._live_window_limit = self._max_mounted
+        return self._trim_mounted()
 
     def _scroll_to_end(self) -> None:
         self.scroll_end(animate=False)
@@ -545,68 +898,101 @@ class NarrativeView(VerticalScroll):
     def _close_thinking(self) -> None:
         if self.thinking is not None:
             self.thinking.finish()
+            if self._thinking_entry is not None:
+                self._sync_entry_from_widget(self._thinking_entry, self.thinking)
             self.thinking = None
+            self._thinking_entry = None
 
     def feed_text(self, delta: str) -> None:
         self._close_thinking()
         if self.stream is None:
             self.stream = StreamBlock()
-            self._mount_block(self.stream)
+            entry = self._new_entry("stream")
+            self._stream_entry = entry
+            self._mount_managed(entry, self.stream)
         self.stream.feed(delta)
+        if self._stream_entry is not None:
+            self._stream_entry.text = self.stream.text
         self.call_after_refresh(self._scroll_to_end)
 
     def feed_thinking(self, delta: str) -> None:
         self.stream = None
+        self._stream_entry = None
         if self.thinking is None:
             self.thinking = ThinkingBlock()
-            self._mount_block(self.thinking)
+            entry = self._new_entry("thinking", done=False)
+            self._thinking_entry = entry
+            self._mount_managed(entry, self.thinking)
         self.thinking.feed(delta)
+        if self._thinking_entry is not None:
+            self._thinking_entry.text = self.thinking.text
         self.call_after_refresh(self._scroll_to_end)
 
     def open_card(self, name: str, arguments: dict[str, Any]) -> ToolCard:
         self.stream = None
+        self._stream_entry = None
         self._close_thinking()
         card = ToolCard(name, tool_call_display(name, arguments))
-        self._mount_block(card)
+        entry = self._new_entry(
+            "tool",
+            tool_name=name,
+            display=card.card_display,
+            header=card._header,
+            running=True,
+        )
         self.pending_card = card
+        self._pending_entry = entry
+        self._mount_managed(entry, card)
         return card
 
     def close_card(self, name: str, result: dict[str, Any]) -> ToolCard | None:
         card = self.pending_card
+        entry = self._pending_entry
         self.pending_card = None
+        self._pending_entry = None
         if card is None:
             return None  # 契约外序列(如无卡结果):调用方落通知块,不炸渲染
         card.finalize(result)
+        if entry is not None:
+            self._sync_entry_from_widget(entry, card)
         self.call_after_refresh(self._scroll_to_end)
         return card
 
     def mark_pending_denied(self) -> None:
         if self.pending_card is not None:
             self.pending_card.force_expand = True
+        if self._pending_entry is not None:
+            self._pending_entry.force_expand = True
 
     def add_phase(self, phase: str) -> PhaseDivider:
         self.stream = None
+        self._stream_entry = None
         self._close_thinking()
         divider = PhaseDivider(phase)
-        self._mount_block(divider)
+        entry = self._new_entry("phase", phase=phase)
+        self._mount_managed(entry, divider)
         return divider
 
     def add_notice(self, kind: str, text: str) -> NoticeBlock:
         self.stream = None
+        self._stream_entry = None
         self._close_thinking()
         block = NoticeBlock(kind, text)
-        self._mount_block(block)
+        entry = self._new_entry("notice", notice_kind=kind, text=text)
+        self._mount_managed(entry, block)
         return block
 
     def mount_scope_card(self, card: ScopeConfirmCard) -> None:
         """挂载 scope 确认卡(WP-14c:仪式 worker 唯一挂载点;与正文/思考块互斥)。"""
         self.stream = None
+        self._stream_entry = None
         self._close_thinking()
         self._mount_block(card)
 
     def mount_model_card(self, card: ModelPickerCard) -> None:
         """挂载模型选择器卡(与正文/思考块互斥)。"""
         self.stream = None
+        self._stream_entry = None
         self._close_thinking()
         self._mount_block(card)
 
@@ -981,7 +1367,7 @@ class ScopeConfirmCard(Vertical):
         return hashlib.sha256(data).hexdigest()[:12]
 
     def _redraw(self) -> None:
-        if not self._ready:
+        if not self._ready or self._pruning:
             return
         title = self.query_one("#scope-card-title", Static)
         body = self.query_one("#scope-card-body", Static)

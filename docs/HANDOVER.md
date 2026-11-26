@@ -1441,3 +1441,15 @@ WP-13(整合)依赖全部
   - **R20**：明确会话内向前加载不把思考明文落盘（守住不落明文盘红线），重启找回指已持久化成果；R20-A 性能基线锚定 `d13ecbc` 后的最新 TUI。
 - 文档验证：已检查上述 10 份文档相对链接、格式、不可见字符与 `git diff --check`（纯文档变更，未跑产品 pytest）。
 - 下一步：待用户明确授权开工后，先在 `d13ecbc` 基础上采集 `R20-A` 性能基线，再按 `R20-A 基线 → R15 ∥ R16-A/B → R17 → R16-C → R18 → R19 → R20-B/C` 推进。根目录调试 zip 继续排除，未提交/未推送。
+
+
+## 当前状态（2026-11-26：R20-A 基线与有界视图完成）
+
+- 已完成 v0.3.0 首个分片 **[R20-A](items/R20.md)**（R20-AC01、R20-AC02 核销；R20-B/C 待 R19 后推进）：
+  - 在修改任何 TUI 源码前（`8b80dd2`）采集 10,000 合成事件无界基线，随后落地 [widgets.py](../src/foam/tui/widgets.py) `NarrativeView` 200/100 有界 DOM 窗口、`HistoryLoadBar` 按需加载（`load_older` / `collapse_history`）、`NarrativeEntry` 内存归档（守住思考明文不落盘红线）、立即 `remove_children` 派发及 `ThinkingBlock`/`ToolCard` `_pruning` 竞态防护，并在 [styles.tcss](../src/foam/tui/styles.tcss) 补齐 `.history-load-bar` 样式。
+  - 新增 [test_tui_performance.py](../tests/test_tui_performance.py)（含可独立运行的 10,000 事件基准脚本与 4 项离线回归）。
+- 10,000 事件实测对比（macOS 26.3 arm64 / Python 3.12.14 / Textual 8.2.8 / 120×40）：
+  - 无界基线（`8b80dd2`）：耗时 `37.7721s`、结束内存 `203.958 MB`、峰值内存 `284.335 MB`、DOM `4021` 节点（`4020` 受管块）、输入延迟 `p50=602.402ms / p95=614.287ms`。
+  - 有界视图（R20-A）：耗时 `22.413s`（-40.7%）、结束内存 `26.749 MB`（-86.9%）、峰值内存 `170.279 MB`（-40.1%）、DOM `202` 节点（`200` 受管块 + `3820` 归档）、输入延迟 `p50=78.433ms`（-87.0%）`/ p95=223.432ms`（-63.6%）。
+- 验证：失败对照（`_trim_mounted` 置空）捕获 `assert 520 == 200` 后还原通过；最终代码 `ruff check .` 与 `git diff --check` 全绿；沙盒外（macOS 标准沙盒拦截 setuid `/bin/ps` 影响既有 3 项 R13-C 用例）执行全量 `.venv/bin/python -m pytest -q` 通过 **`1033 passed, 41 skipped in 257.84s (0:04:17)`**（41 skip 为既有环境/opt-in，R20-A 零跳过）。
+- 下一步：按 [v0.3.0 清单](releases/v0.3.0.md) 既定序列推进 **R15**（新建/最近任务/恢复统一入口）与 **R16-A/B**（状态事件投影与确认/失败呈现）；根目录调试 zip 继续排除。
