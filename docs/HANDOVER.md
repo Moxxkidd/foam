@@ -1422,3 +1422,22 @@ WP-13(整合)依赖全部
   **1019 passed, 41 skipped in 200.10s**（含 Textual 折叠高度、Strix `-t`/
   `-n`/`--protected` 端到端与 `/target`/`/scope` 增量回归），`ruff check .`
   与 `git diff --check` 全绿；历史 `v0.2.0` tag 不动，根目录调试 zip 继续排除。
+
+
+## 当前状态（2026-11-25：v0.3.0 实施前代码复核与契约对齐）
+
+- 补记 `f3831e8` 之后已合入 `main` 至 `d13ecbc` 的 7 个 UX/loop/state 提交摘要：
+  - `5408e29`：TUI `ThinkingBlock` 改为动态旋转指示与最多 3 行实时尾部预览；
+  - `e18e9f8` / `bd98929`：新增 `/model` 命令与 `ModelPickerCard` 交互选择器（`KIND_MODEL_CHANGED`），模型/目标/scope 切换统一经 `refresh_header()` 刷新欢迎条与侧栏；
+  - `45c814e` / `ed4f85f`：新增海沫 3D 字标 `LandingScreen` 与异步模型连通性预检（`probe_connection()`），统一海蓝系视觉；
+  - `bc05891`：移除基于正则的幻觉执行自动纠正，保留协议级 `malformed_tool_call` 错误纠正；
+  - `d13ecbc`：`state/files.py` `_default_engagement_id` 与 `_resolve_auto_engagement_id` 支持中文/长目标 6 位哈希去重与异目标自动顺延。
+- 已基于 `d13ecbc` 完成 [v0.3.0 清单](releases/v0.3.0.md)、[R15](items/R15.md)–[R20](items/R20.md)、[路线图 §14](roadmap/2026-09-25-release-roadmap.md) 与 [开发文档索引](items/README.md) 的纯文档代码复核与契约冲突修订（未修改产品代码，未重跑产品 pytest）：
+  - **R15**：与 `LandingScreen` 协同，完整支持 `target_only`/`scope_guard` 双模式；要求向上兼容扩展 `StatusResult`（暴露 `targets`/`guard_mode`）、统一 `--workdir` 精确目录与 `--workdir-parent`（拟议）语义、抽出无终端副作用的公共恢复 preflight 服务。
+  - **R16**：核实 `loop.pause()` 当前无 observer 事件与 `bc05891` 移除正则纠正后的基线；补齐 `pause_requested`/等待原因投影及双模式 `/scope` 仪式提示。
+  - **R17**：核实 `build_report` 调 `Engagement.open`/`Index` 会写权限与迁移备份，强制 R17 只读浏览复用 `open_index_ro()` 与 `_relocate()`；核实 `vulns` 表无 `severity` 列且 `QUERY_KINDS` 缺 `verification_status`/`source`，明确缺 `severity` 显式标 `unknown` 并在只读查询层补齐筛选。
+  - **R18**：核实 TUI 默认 `wait_on_finish=True` 下 `AgentLoop` 缺正常结束方法且 `Ctrl-Q` 走 `loop.kill`（rc=130），明确新增带等待上界的 `finish()`/`/finish` 并保留 `Ctrl-C`/`Ctrl-X` 紧急终止，复用 `_run_to_end` 与 `_close_retired_backends()`。
+  - **R19**：对齐 `AGENTS.md §4.1` 不恢复阻塞式呼号迎宾门，保留自动解析并在 `/status`/`/help` 说明审计用途；验收覆盖 `LandingScreen` 与 `MainScreen` 双输入。
+  - **R20**：明确会话内向前加载不把思考明文落盘（守住不落明文盘红线），重启找回指已持久化成果；R20-A 性能基线锚定 `d13ecbc` 后的最新 TUI。
+- 文档验证：已检查上述 10 份文档相对链接、格式、不可见字符与 `git diff --check`（纯文档变更，未跑产品 pytest）。
+- 下一步：待用户明确授权开工后，先在 `d13ecbc` 基础上采集 `R20-A` 性能基线，再按 `R20-A 基线 → R15 ∥ R16-A/B → R17 → R16-C → R18 → R19 → R20-B/C` 推进。根目录调试 zip 继续排除，未提交/未推送。

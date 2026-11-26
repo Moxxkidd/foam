@@ -368,3 +368,10 @@ v0.1.3 后即可让使用者看到更可靠的成果登记和核验；v0.2 交�
 ### 13.4 依赖调整摘要
 
 R15 增加 R28，任务列表复用 R13 status；R16-A/B 不再依赖 R15；R18、R21 的已交付验收改为引用既有证据；R22 增加真实 Kali 环境前提与执行模式声明；R23 扩展 R13 doctor，对 R22 只依赖实机验证；R27 增加 R28。
+
+## 14. 2026-11-25 v0.3.0 实施前代码复核修订（基线 `d13ecbc`）
+
+依据最新 `main`（`d13ecbc`）复核（纯文档，不改产品代码、未跑产品测试）。v0.2.0 与 R29 真 Kali 验收已交付，11-24 已落地 `AGENTS.md §4.1`（Target + Instruction 模式、直入 `LandingScreen`、自动解析呼号、`/model` 选择器、动态思考块预览等）。本节追加修订，不回改 §1–§13 历史时点表述：
+
+- **修订 §11 用户验收任务 #1（第一次启动）**：试用者验收覆盖「默认 Target+Instruction 直入」与「显式 `--scope` / `/scope` 确认」两条路径；不恢复阻塞式呼号迎宾门（呼号维持自动解析并在 `/status`/`/help` 说明审计用途）；所有试用者须能准确区分「未启用参数级硬护栏（Target+Instruction）」与「已冻结 scope 硬护栏」，不得误认授权状态。
+- **R15–R20 契约修订索引**：详见各条目文档 §2.1 与 §7——[R15](../items/R15.md)（`LandingScreen` 协同、`StatusResult` 向上兼容扩展、`--workdir` 精确/父目录参数、公共恢复 preflight）、[R16](../items/R16.md)（`pause_requested`/等待原因投影、双模式 `/scope` 仪式提示、移除正则纠正后基线）、[R17](../items/R17.md)（强制 `open_index_ro()`、无 `severity` 列显式标 `unknown`、补齐只读筛选与 `_relocate` 复用）、[R18](../items/R18.md)（`wait_on_finish=True` 下新增 `AgentLoop.finish()`/`/finish` 正常结束路径）、[R19](../items/R19.md)（不恢复阻塞式呼号门、覆盖 `LandingScreen` 与 `MainScreen` 双输入及 80/110/160 列布局）、[R20](../items/R20.md)（不违背思考明文不落盘红线、R20-A 性能基线锚定 `d13ecbc`）。
